@@ -1,19 +1,32 @@
 from __future__ import annotations
 
-import logging
-import os
 import time
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple
+from typing import Literal, TYPE_CHECKING
 
-from .floor_state import FloorState, FloorStateError
+from bot.floor_state import FloorStateError, FloorStateStore
+from bot.safety import SafetyStop
 
-logger = logging.getLogger(__name__)
+if TYPE_CHECKING:
+    from bot.adb_controller import ADBController
+    from bot.config import Config
+    from bot.knowledge import KnowledgeBase
+    from bot.profiles import Profile
+    from bot.safety import SafetyService
+    from bot.screenshot import ScreenshotService
+    from bot.vision import Frame, Match, VisionService
+
+
+class FloorExploreError(Exception):
+    ...
+
+
+FloorStatus = Literal["completed", "stopped", "failed"]
 
 
 @dataclass(frozen=True)
 class FloorResult:
-    status: str
+    status: FloorStatus
     rooms_cleared: int
     rooms_skipped: int
     rooms_failed: int
@@ -28,9 +41,9 @@ class FloorExplorer:
         vision: "VisionService",
         knowledge: "KnowledgeBase",
         safety: "SafetyService",
-        teacher_ui: "TeacherUI",
-        config: "AppConfig",
-        profile: "ProfileConfig",
+        teacher_ui,
+        config: "Config",
+        profile: "Profile",
     ) -> None:
         self.adb = adb
         self.screenshot = screenshot
@@ -40,215 +53,184 @@ class FloorExplorer:
         self.teacher_ui = teacher_ui
         self.config = config
         self.profile = profile
+        if not hasattr(teacher_ui, "pause_requested") or not hasattr(teacher_ui, "show_and_label"):
+            raise FloorExploreError("teacher_ui must provide pause_requested and show_and_label")
 
     def run(self, floor_number: int) -> FloorResult:
-        self._pause_guard_stable_only("start_step")
-        state = self._create_floor_state(floor_number)
-        state.load()
-        entry_node_id = state.ensure_entry_node()
-        if state.current_node_id is None:
-            state.set_current_node(entry_node_id)
-        state.save()
-
-        templates = self.knowledge.get_templates(profile=self.profile.name, enabled_only=True)
-        map_templates = self._filter_templates(templates, ["door_marker", "party_marker", "room_open_big_icon", "next_floor", "danger"])
-        screen_templates = self._filter_templates(templates, ["room_screen", "passage_screen", "event_screen", "mob", "boss", "loot", "exit", "auto_battle", "next_floor", "danger"])
+        store = FloorStateStore(self.config, self.profile.name, floor_number)
+        graph = store.load()
+        rooms_cleared = 0
+        rooms_skipped = 0
+        rooms_failed = 0
 
         while True:
-            self._pause_guard_stable_only("loop_start")
-            stable_map_frame = self._capture_stable_frame_or_teach("map_scan")
-            self._check_danger(stable_map_frame, templates)
-            self._update_floor_state_from_map(state, stable_map_frame, map_templates)
-            open_icon_excluded_ids = self._map_open_icons_to_door_ids(stable_map_frame, state, map_templates)
-            target_door_id = state.get_next_target_door_id(exclude_open_room_icon_ids=open_icon_excluded_ids)
+            self._pause_check()
+            frame = self._wait_stable()
+            self._check_danger(frame)
+            self._scan_map(store, graph, frame)
 
-            if target_door_id is None:
-                if self._tap_next_floor(stable_map_frame, templates):
-                    return self._make_result(state, "completed", "next_floor_reached")
-                return self._make_result(state, "stopped", "no_target_and_no_next_floor")
+            target = store.next_target(graph)
+            if target is None:
+                next_floor = self._find_best(frame, "next_floor")
+                if next_floor is None:
+                    self._teach_if_unknown(frame)
+                    next_floor = self._find_best(self._wait_stable(), "next_floor")
+                if next_floor is None:
+                    return FloorResult("failed", rooms_cleared, rooms_skipped, rooms_failed, "next_floor not found")
+                self.safety.ensure_action_allowed("next_floor")
+                self._tap_match(next_floor)
+                self._wait_stable()
+                return FloorResult("completed", rooms_cleared, rooms_skipped, rooms_failed, "floor completed")
 
-            door = state.get_door(target_door_id)
-            state.increment_attempt(target_door_id)
-            state.save()
-            self._tap_point(door.tap_point)
-            entered_frame = self._wait_after_action("door_enter")
-            state.mark_in_progress(target_door_id)
-            self._check_danger(entered_frame, templates)
-            self._handle_entered_screen(state, target_door_id, entered_frame, screen_templates)
-            state.save()
+            self.safety.ensure_action_allowed("enter_room")
+            self._tap_door(target)
+            entered_frame = self._wait_stable()
+            store.mark_in_progress_and_save(graph, target.door_id, notes="entered")
+            self._check_danger(entered_frame)
+            self._pause_check()
 
-    def _create_floor_state(self, floor_number: int) -> FloorState:
-        path = os.path.join(self.config.state_dir, self.config.floor_state_file_pattern.format(floor_number=floor_number))
-        return FloorState(path=path, floor_number=floor_number, profile=self.profile.name)
+            screen = self._classify(entered_frame)
+            if screen is None:
+                self._teach_if_unknown(entered_frame)
+                entered_frame = self._wait_stable()
+                screen = self._classify(entered_frame)
 
-    def _filter_templates(self, templates, categories: Sequence[str]):
-        category_set = set(categories)
-        return [template for template in templates if template.category in category_set]
+            if screen == "event_screen":
+                exit_match = self._find_best(entered_frame, "exit")
+                if exit_match is None:
+                    store.set_status(graph, target.door_id, "failed", notes="event exit not found")
+                    store.save(graph)
+                    rooms_failed += 1
+                    continue
+                self._tap_match(exit_match)
+                self._wait_stable()
+                store.set_status(graph, target.door_id, "skipped", notes="event skipped by exit")
+                store.save(graph)
+                rooms_skipped += 1
+                continue
 
-    def _capture_frame(self):
-        return self.screenshot.capture(self.adb)
+            if screen == "passage_screen":
+                store.set_status(graph, target.door_id, "passage", notes="passage")
+                store.save(graph)
+                continue
 
-    def _pause_guard_stable_only(self, reason: str) -> None:
-        if not self.teacher_ui.pause_requested():
-            return
-        frame = self._capture_stable_frame_or_teach(reason)
-        self.teacher_ui.show_and_label(frame, self.knowledge)
+            if screen == "room_screen":
+                if self._find_best(entered_frame, "mob") is not None or self._find_best(entered_frame, "boss") is not None:
+                    auto_battle = self._find_best(entered_frame, "auto_battle")
+                    if auto_battle is None:
+                        store.set_status(graph, target.door_id, "failed", notes="auto_battle not found")
+                        store.save(graph)
+                        rooms_failed += 1
+                        continue
+                    self._tap_match(auto_battle)
+                    entered_frame = self._wait_battle_end()
+                loot = self._find_best(entered_frame, "loot")
+                if loot is not None:
+                    self._tap_match(loot)
+                    entered_frame = self._wait_stable()
+                exit_match = self._find_best(entered_frame, "exit")
+                if exit_match is None:
+                    store.set_status(graph, target.door_id, "failed", notes="room exit not found")
+                    store.save(graph)
+                    rooms_failed += 1
+                    continue
+                self._tap_match(exit_match)
+                self._wait_stable()
+                store.set_status(graph, target.door_id, "cleared", notes="room cleared")
+                store.save(graph)
+                rooms_cleared += 1
+                continue
 
-    def _capture_stable_frame_or_teach(self, reason: str):
-        motion = self.config.motion
-        last_frame = None
-        for _ in range(int(motion.max_stable_retries) + 1):
-            self.teacher_ui.pause_requested()
-            frame, is_stable = self.vision.wait_until_stable(
-                capture_fn=self._capture_frame,
-                stable_frames=int(motion.stable_frames),
-                stable_diff_threshold=float(motion.stable_diff_threshold),
-                stable_poll_ms=int(motion.stable_poll_ms),
-                stable_timeout_s=float(motion.stable_timeout_s),
-                downscale_size=tuple(motion.downscale_size),
-                pause_requested_fn=self.teacher_ui.pause_requested,
+            store.set_status(graph, target.door_id, "failed", notes="screen not recognized")
+            store.save(graph)
+            rooms_failed += 1
+
+    def _scan_map(self, store: FloorStateStore, graph, frame: "Frame") -> None:
+        door_matches = self._find_all(frame, "door_marker")
+        open_matches = self._find_all(frame, "room_open_big_icon")
+        for index, match in enumerate(door_matches, start=1):
+            cx, cy = self.vision.center_of(match.rect)
+            is_open = any(self._overlaps(match.rect, icon.rect) for icon in open_matches)
+            store.upsert_door(
+                graph,
+                door_id=f"d_{index:04d}",
+                map_x=cx,
+                map_y=cy,
+                bbox_x=match.rect.x,
+                bbox_y=match.rect.y,
+                bbox_w=match.rect.w,
+                bbox_h=match.rect.h,
+                is_room_open_big_icon=is_open,
             )
+        store.save(graph)
+
+    def _classify(self, frame: "Frame") -> str | None:
+        return self.vision.classify_screen(frame, self.knowledge.get_templates_for_screen_classification())
+
+    def _find_all(self, frame: "Frame", category: str):
+        templates = self.knowledge.get_templates_for_category(category)
+        return self.vision.find_all(frame, templates, category=category)
+
+    def _find_best(self, frame: "Frame", category: str):
+        matches = self._find_all(frame, category)
+        return matches[0] if matches else None
+
+    def _tap_match(self, match: "Match") -> None:
+        self.safety.ensure_action_allowed("tap")
+        x, y = self.vision.center_of(match.rect)
+        self.adb.tap(x, y)
+
+    def _tap_door(self, node) -> None:
+        self.safety.ensure_action_allowed("tap")
+        x = node.bbox_x + node.bbox_w // 2
+        y = node.bbox_y + node.bbox_h // 2
+        self.adb.tap(x, y)
+
+    def _wait_stable(self) -> "Frame":
+        retries = int(self.config.get("motion.max_stable_retries", 0))
+        last_frame = None
+        for _ in range(retries + 1):
+            self._pause_check()
+            frame, stable = self.vision.wait_until_stable(self.screenshot.capture)
             last_frame = frame
-            if is_stable:
+            if stable:
                 return frame
-        self.teacher_ui.show_and_label(last_frame, self.knowledge)
+        if bool(self.config.get("teaching.allow_teach_on_unstable_timeout", True)) and last_frame is not None:
+            self._pause_check(last_frame)
+        if last_frame is None:
+            raise FloorExploreError("failed to capture frame")
         return last_frame
 
-    def _check_danger(self, frame, templates) -> None:
-        danger_templates = self._filter_templates(templates, ["danger"])
-        self.safety.check_danger(frame, self.vision, danger_templates)
-
-    def _best_match(self, frame, templates, category: str):
-        relevant = self._filter_templates(templates, [category])
-        return self.vision.best_match_by_category(frame, relevant, category)
-
-    def _find_all_category(self, frame, templates, category: str):
-        relevant = self._filter_templates(templates, [category])
-        return self.vision.find_all(frame, relevant, categories=[category])
-
-    def _update_floor_state_from_map(self, state: FloorState, frame, templates):
-        current_node_id = state.current_node_id or state.ensure_entry_node()
-        for match in self._find_all_category(frame, templates, "door_marker"):
-            state.upsert_door(current_node_id, tuple(int(v) for v in match.bbox), (int(match.center[0]), int(match.center[1])))
-        state.save()
-
-    def _map_open_icons_to_door_ids(self, frame, state: FloorState, templates):
-        open_matches = self._find_all_category(frame, templates, "room_open_big_icon")
-        excluded = []
-        for open_match in open_matches:
-            ox, oy = int(open_match.center[0]), int(open_match.center[1])
-            nearest_id = None
-            nearest_dist = None
-            for door in state.list_doors():
-                dx = int(door.tap_point[0]) - ox
-                dy = int(door.tap_point[1]) - oy
-                dist = (dx * dx + dy * dy) ** 0.5
-                if nearest_dist is None or dist < nearest_dist:
-                    nearest_dist = dist
-                    nearest_id = door.id
-            if nearest_id is not None:
-                excluded.append(nearest_id)
-        return excluded
-
-    def _tap_point(self, point: Tuple[int, int]) -> None:
-        self.safety.validate_tap(int(point[0]), int(point[1]), allowed_rois=None)
-        self.adb.tap(int(point[0]), int(point[1]))
-
-    def _wait_after_action(self, reason: str):
-        return self._capture_stable_frame_or_teach(reason)
-
-    def _handle_entered_screen(self, state: FloorState, door_id: str, frame, templates) -> None:
-        current_screen = self.vision.classify_screen(frame, templates)
-        if current_screen is None:
-            if not self.vision.find_all(frame, templates):
-                self.teacher_ui.show_and_label(frame, self.knowledge)
-            raise FloorStateError("screen_classification_failed")
-        if current_screen == "passage_screen":
-            node_id = state.add_node(kind="passage", screen_ref=None)
-            state.mark_passage(door_id, to_node_id=node_id)
-            state.set_current_node(node_id)
-            return
-        if current_screen == "event_screen":
-            self._exit_room(frame, templates)
-            after_exit = self._wait_after_action("event_exit")
-            self._check_danger(after_exit, templates)
-            node_id = state.add_node(kind="event", screen_ref=None)
-            state.mark_skipped(door_id, to_node_id=node_id)
-            state.set_meta_counts(state.progress["rooms_cleared"], state.progress["rooms_skipped"], state.progress["rooms_failed"])
-            return
-        if current_screen == "room_screen":
-            room_kind = "room"
-            if self._best_match(frame, templates, "boss") is not None:
-                room_kind = "boss"
-                self._handle_auto_battle(templates)
-            elif self._best_match(frame, templates, "mob") is not None:
-                self._handle_auto_battle(templates)
-            elif self._best_match(frame, templates, "loot") is not None:
-                self._collect_loot(frame, templates)
-            self._exit_room(frame, templates)
-            after_exit = self._wait_after_action("room_exit")
-            self._check_danger(after_exit, templates)
-            node_id = state.add_node(kind=room_kind, screen_ref=None)
-            state.mark_cleared(door_id, to_node_id=node_id)
-            state.set_meta_counts(state.progress["rooms_cleared"], state.progress["rooms_skipped"], state.progress["rooms_failed"])
-            return
-        raise FloorStateError(f"unsupported_screen: {current_screen}")
-
-    def _handle_auto_battle(self, templates) -> None:
-        frame = self._capture_stable_frame_or_teach("before_auto_battle")
-        auto_match = self._best_match(frame, templates, "auto_battle")
-        if auto_match is not None:
-            self._tap_point((int(auto_match.center[0]), int(auto_match.center[1])))
-        else:
-            action = self.profile.actions.get("auto_battle_tap")
-            if action is None:
-                raise FloorStateError("auto_battle control not found")
-            self._tap_point((int(action.x), int(action.y)))
-        deadline = time.time() + float(self.profile.timings.get("battle_settle_timeout_s", 120.0))
+    def _wait_battle_end(self) -> "Frame":
+        timeout_s = float(self.config.get("timings.battle_timeout_s", 180))
+        poll_s = int(self.config.get("timings.auto_battle_check_interval_ms", 500)) / 1000.0
+        deadline = time.monotonic() + timeout_s
+        frame = self._wait_stable()
         while True:
-            self.teacher_ui.pause_requested()
-            stable_frame = self._capture_stable_frame_or_teach("battle_wait")
-            self._check_danger(stable_frame, templates)
-            if self._best_match(stable_frame, templates, "mob") is None and self._best_match(stable_frame, templates, "boss") is None:
-                return
-            if time.time() >= deadline:
-                raise FloorStateError("battle_timeout")
+            self._pause_check(frame)
+            if self._find_best(frame, "mob") is None and self._find_best(frame, "boss") is None:
+                return frame
+            if time.monotonic() >= deadline:
+                raise FloorExploreError("battle timeout")
+            time.sleep(poll_s)
+            frame = self._wait_stable()
+            self._check_danger(frame)
 
-    def _collect_loot(self, frame, templates) -> None:
-        loot_match = self._best_match(frame, templates, "loot")
-        if loot_match is None:
-            raise FloorStateError("loot_not_found")
-        self._tap_point((int(loot_match.center[0]), int(loot_match.center[1])))
-        self._wait_after_action("loot_tap")
+    def _check_danger(self, frame: "Frame") -> None:
+        self.safety.check_danger(frame, self.vision, self.knowledge.get_templates_for_category("danger"))
 
-    def _exit_room(self, frame, templates) -> None:
-        exit_match = self._best_match(frame, templates, "exit")
-        if exit_match is not None:
-            self._tap_point((int(exit_match.center[0]), int(exit_match.center[1])))
-            return
-        action = self.profile.actions.get("exit_tap")
-        if action is None:
-            raise FloorStateError("exit control not found")
-        self._tap_point((int(action.x), int(action.y)))
+    def _teach_if_unknown(self, frame: "Frame") -> None:
+        if self.knowledge.list_templates(enabled_only=True):
+            self.teacher_ui.show_and_label(frame, self.knowledge)
+        else:
+            self.teacher_ui.show_and_label(frame, self.knowledge)
 
-    def _tap_next_floor(self, frame, templates) -> bool:
-        next_match = self._best_match(frame, templates, "next_floor")
-        if next_match is not None:
-            self._tap_point((int(next_match.center[0]), int(next_match.center[1])))
-            self._wait_after_action("next_floor_tap")
-            return True
-        action = self.profile.actions.get("next_floor_tap")
-        if action is None:
-            return False
-        self._tap_point((int(action.x), int(action.y)))
-        self._wait_after_action("next_floor_profile_tap")
-        return True
+    def _pause_check(self, frame: "Frame" | None = None) -> None:
+        if self.teacher_ui.pause_requested():
+            if frame is None:
+                frame, _ = self.vision.wait_until_stable(self.screenshot.capture)
+            self.teacher_ui.show_and_label(frame, self.knowledge)
 
-    def _make_result(self, state: FloorState, status: str, reason: str) -> FloorResult:
-        return FloorResult(
-            status=status,
-            rooms_cleared=int(state.meta.get("rooms_cleared", 0)),
-            rooms_skipped=int(state.meta.get("rooms_skipped", 0)),
-            rooms_failed=int(state.meta.get("rooms_failed", 0)),
-            reason=reason,
-        )
+    @staticmethod
+    def _overlaps(a, b) -> bool:
+        return not (a.x + a.w <= b.x or b.x + b.w <= a.x or a.y + a.h <= b.y or b.y + b.h <= a.y)
