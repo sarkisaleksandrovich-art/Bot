@@ -268,3 +268,25 @@ def _run_adb_checked(
 
 
 ADBController._run_adb = _run_adb_checked
+# --- Совместимость с main.py ---
+ADBCommandError = ADBError
+ADBConnectionError = DeviceNotFoundError
+
+_orig_init = ADBController.__init__
+
+
+def _init_compat(self, *args, **kwargs):
+    if args and hasattr(args[0], "raw"):
+        section = args[0].raw.get("adb", {})
+        adb_path = section.get("adb_path") or "adb"
+        serial = section.get("device_serial") or None
+        if isinstance(serial, str) and serial.strip().lower() in ("", "auto"):
+            serial = None
+        timeout = float(section.get("command_timeout_s", 15.0))
+        _orig_init(self, adb_path, serial, timeout)
+    else:
+        _orig_init(self, *args, **kwargs)
+
+
+ADBController.__init__ = _init_compat
+ADBController.screen_size = ADBController.get_screen_size

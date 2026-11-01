@@ -9,7 +9,7 @@ app:
 
 adb:
   adb_path: "C:/LDPlayer/LDPlayer9/adb.exe"
-  device_serial: "127.0.0.1:5555"
+  device_serial: "auto"
   serial: "127.0.0.1:5555"
   command_timeout_s: 10.0
   post_input_delay_ms: 150

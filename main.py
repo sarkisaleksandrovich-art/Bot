@@ -197,14 +197,22 @@ def _make_core_objects(config: BotConfig, logger: Any, profile: str) -> dict[str
     }
 
 
-def _adb_executable_status() -> tuple[bool, str]:
-    adb_candidates = ["adb.exe", "adb"]
-    for candidate in adb_candidates:
-        found = shutil.which(candidate)
+def _adb_executable_status(config=None) -> tuple[bool, str]:
+    candidates = []
+    if config is not None:
+        configured = get_path(config, "adb", "adb_path")
+        if configured:
+            candidates.append(str(configured))
+    for name in ("adb.exe", "adb"):
+        found = shutil.which(name)
         if found:
-            return True, found
-    return False, "adb.exe не найден в PATH"
-
+            candidates.append(found)
+    for base in (r"C:\LDPlayer\LDPlayer9", r"C:\LDPlayer\LDPlayer4.0", r"C:\Program Files\LDPlayer\LDPlayer9"):
+        candidates.append(base + r"\adb.exe")
+    for path in candidates:
+        if Path(path).is_file():
+            return True, path
+    return False, "adb.exe не найден (ни в config.yaml, ни в PATH, ни в папках LDPlayer)"
 
 def _adb_version_text() -> str:
     for candidate in ("adb.exe", "adb"):
@@ -274,7 +282,7 @@ def _run_check(config: BotConfig, logger: Any, profile: str) -> int:
     knowledge_ok = False
     errors: list[str] = []
 
-    adb_exists, adb_path_msg = _adb_executable_status()
+    adb_exists, adb_path_msg = _adb_executable_status(config)
     print(f"[1/7] adb.exe: {'OK' if adb_exists else 'ОШИБКА'} - {adb_path_msg}")
     if not adb_exists:
         errors.append("adb.exe не найден. Добавьте папку с adb в PATH или установите Android Platform Tools / LDPlayer adb.")
