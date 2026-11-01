@@ -3,42 +3,28 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from bot.config import Config
+from .config import BotConfig, get_path
 
 
-def _resolve_path(config: Config, value: str) -> Path:
-    path = Path(value).expanduser()
-    if not path.is_absolute():
-        path = (config.path.parent / path).resolve()
-    return path
-
-
-def setup_logging(config: Config) -> logging.Logger:
+def setup_logging(config: "BotConfig") -> logging.Logger:
     """
-    Настраивает корневой логгер приложения.
-    Возвращает:
-        logging.Logger
-    Исключения:
-        - ValueError: если log_level неизвестен
-        - OSError: если невозможно создать лог-файлы/директории при реализации с файлами
+    Настраивает root logger и возвращает логгер приложения.
+
+    :param config: BotConfig
+    :return: logging.Logger
+    :raises OSError: если нельзя создать каталог/файл лога
     """
-    log_level_name = str(config.get("app.log_level", "INFO")).upper()
-    log_level = getattr(logging, log_level_name, None)
-    if not isinstance(log_level, int):
-        raise ValueError(f"unknown log level: {log_level_name}")
+    log_dir = config.log_dir
+    log_dir.mkdir(parents=True, exist_ok=True)
 
-    app_name = str(config.get("app.name", "app"))
-    temp_dir = _resolve_path(config, str(config.get("app.temp_dir")))
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    log_file = temp_dir / f"{app_name}.log"
-
-    formatter = logging.Formatter(
-        fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    log_file = log_dir / "bot.log"
+    level_name = config.log_level
+    level = getattr(logging, level_name, None)
+    if not isinstance(level, int):
+        level = logging.INFO
 
     root_logger = logging.getLogger()
-    root_logger.setLevel(log_level)
+    root_logger.setLevel(level)
 
     for handler in list(root_logger.handlers):
         root_logger.removeHandler(handler)
@@ -47,18 +33,25 @@ def setup_logging(config: Config) -> logging.Logger:
         except Exception:
             pass
 
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(log_level)
+    console_handler.setLevel(level)
     console_handler.setFormatter(formatter)
 
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_handler.setLevel(log_level)
+    file_handler.setLevel(level)
     file_handler.setFormatter(formatter)
 
     root_logger.addHandler(console_handler)
     root_logger.addHandler(file_handler)
 
-    logger = logging.getLogger(app_name)
-    logger.setLevel(log_level)
-    logger.debug("Logging initialized")
-    return logger
+    logger_name = str(get_path(config, "app", "name")) if "name" in config.raw.get("app", {}) else "bot"
+    app_logger = logging.getLogger(logger_name)
+    app_logger.setLevel(level)
+    app_logger.propagate = True
+    app_logger.debug("Logging initialized: level=%s, file=%s", level_name, Path(log_file))
+    return app_logger
