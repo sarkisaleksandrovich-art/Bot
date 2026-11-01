@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shutil
@@ -8,12 +7,14 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 import cv2
 import numpy as np
 
-from bot.vision import Rect, Template
+
+Frame = np.ndarray
 
 
 class KnowledgeError(Exception):
@@ -24,570 +25,556 @@ class UnknownCategoryError(KnowledgeError):
     pass
 
 
-@dataclass
-class _PendingAction:
-    kind: str
-    payload: dict[str, Any]
+_ALLOWED_CATEGORIES: tuple[str, ...] = (
+    "door_marker",
+    "party_marker",
+    "room_open_big_icon",
+    "room_screen",
+    "passage_screen",
+    "event_screen",
+    "mob",
+    "boss",
+    "loot",
+    "exit",
+    "auto_battle",
+    "next_floor",
+    "danger",
+)
+
+
+@dataclass(frozen=True)
+class TemplateRecord:
+    id: str
+    category: str
+    file: str
+    width: int
+    height: int
+    source_screen_size: tuple[int, int]
+    selected_rect: tuple[int, int, int, int]
+    roi_hint: tuple[int, int, int, int]
+    created_at: str
+    enabled: bool
+    tags: tuple[str, ...]
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _normalize_rect(rect: tuple[int, int, int, int] | list[int]) -> tuple[int, int, int, int]:
+    if len(rect) != 4:
+        raise KnowledgeError("Rect must contain exactly 4 integers.")
+    x1, y1, x2, y2 = (int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3]))
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+    return x1, y1, x2, y2
+
+
+def _validate_positive_size(width: int, height: int) -> None:
+    if width <= 0 or height <= 0:
+        raise KnowledgeError(f"Invalid size: width={width}, height={height}.")
+
+
+def _ensure_frame(frame: Frame) -> None:
+    if not isinstance(frame, np.ndarray):
+        raise KnowledgeError("Frame must be numpy.ndarray.")
+    if frame.ndim not in (2, 3):
+        raise KnowledgeError("Frame must be 2D or 3D numpy.ndarray.")
+    if frame.shape[0] <= 0 or frame.shape[1] <= 0:
+        raise KnowledgeError("Frame must have positive width and height.")
+
+
+def _frame_size(frame: Frame) -> tuple[int, int]:
+    _ensure_frame(frame)
+    height, width = frame.shape[:2]
+    return int(width), int(height)
+
+
+def _rect_inside_screen(rect: tuple[int, int, int, int], width: int, height: int) -> bool:
+    x1, y1, x2, y2 = rect
+    return 0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height
+
+
+def _clamp_rect(rect: tuple[int, int, int, int], width: int, height: int) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = rect
+    x1 = max(0, min(x1, width))
+    x2 = max(0, min(x2, width))
+    y1 = max(0, min(y1, height))
+    y2 = max(0, min(y2, height))
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+    return x1, y1, x2, y2
+
+
+def _atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding=encoding, newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
 
 
 class KnowledgeBase:
-    CATEGORIES: tuple[str, ...] = (
-        "door_marker",
-        "party_marker",
-        "room_open_big_icon",
-        "room_screen",
-        "passage_screen",
-        "event_screen",
-        "mob",
-        "boss",
-        "loot",
-        "exit",
-        "auto_battle",
-        "next_floor",
-        "danger",
-    )
+    def __init__(self, config: "BotConfig", profile: str, logger: "logging.Logger") -> None:
+        self.config = config
+        self.profile = str(profile)
+        self.logger = logger
+        self._lock = RLock()
 
-    _SCREEN_CATEGORIES: tuple[str, ...] = (
-        "room_screen",
-        "passage_screen",
-        "event_screen",
-    )
+        raw = getattr(config, "raw", None)
+        if not isinstance(raw, dict):
+            raise KnowledgeError("config.raw must be a dict.")
 
-    def __init__(self, config: "Config", profile: str) -> None:
-        self._config = config
-        self.profile = profile
-        self._rules_path = Path(self._config.get("storage.rules_file", "./data/rules.json"))
-        self._features_path = Path(self._config.get("storage.features_file", "./data/features.json"))
-        self._knowledge_dir = Path(self._config.get("storage.knowledge_dir", "./data/knowledge"))
-        self._atomic_write = bool(self._config.get("storage.atomic_write", True))
-        self._backups_enabled = bool(self._config.get("storage.backups_enabled", True))
-        self._default_threshold = float(self._config.get("matching.default_threshold", 0.88))
-        self._default_method = str(self._config.get("matching.method", "TM_CCOEFF_NORMED"))
-        self._game_name = str(self._config.get("game.name", ""))
+        self._knowledge_cfg = raw.get("knowledge", {})
+        self._app_cfg = raw.get("app", {})
+        self._profiles_cfg = raw.get("profiles", {})
 
-        self._profile_root = self._knowledge_dir / self.profile
-        self._common_root = self._knowledge_dir / "common"
+        self._rules_filename = str(self._app_cfg.get("rules_file", "rules.json"))
+        self._features_filename = str(self._app_cfg.get("features_file", "features.json"))
 
-        self._rules_data: dict[str, Any] = self._default_rules()
-        self._features_data: dict[str, Any] = self._default_features()
-        self._templates_cache: dict[str, Template] = {}
-        self._template_meta: dict[str, dict[str, Any]] = {}
-        self._pending: list[_PendingAction] = []
-        self._dirty_rules = False
-        self._dirty_features = False
+        profiles_root = Path(str(self._profiles_cfg.get("root_dir", "./data/profiles")))
+        self._profile_dir = profiles_root / self.profile
 
-        try:
-            self._ensure_directories()
-            self.load()
-        except FileNotFoundError:
-            self._rules_data = self._default_rules()
-            self._features_data = self._default_features()
-            self._dirty_rules = True
-            self._dirty_features = True
-        except Exception as exc:  # pragma: no cover - defensive wrapper
-            raise KnowledgeError(f"Failed to initialize knowledge base: {exc}") from exc
+        templates_root_cfg = Path(str(self._knowledge_cfg.get("templates_dir", "./data/templates")))
+        self._profile_templates_dir = self._resolve_profile_templates_dir(templates_root_cfg, self.profile)
+        self._common_templates_dir = self._resolve_common_templates_dir(templates_root_cfg)
 
-    def load(self) -> None:
+        self._rules_path = self._profile_dir / self._rules_filename
+        self._features_path = self._profile_dir / self._features_filename
+
+        min_size = self._knowledge_cfg.get("min_template_size", [8, 8])
+        max_size = self._knowledge_cfg.get("max_template_size", [800, 800])
+
+        if not isinstance(min_size, (list, tuple)) or len(min_size) != 2:
+            raise KnowledgeError("knowledge.min_template_size must be [width, height].")
+        if not isinstance(max_size, (list, tuple)) or len(max_size) != 2:
+            raise KnowledgeError("knowledge.max_template_size must be [width, height].")
+
+        self._min_template_size = (int(min_size[0]), int(min_size[1]))
+        self._max_template_size = (int(max_size[0]), int(max_size[1]))
+
+        self._staged_templates: list[TemplateRecord] = []
+        self._staged_clicks: list[dict[str, Any]] = []
+        self._staged_actions: list[dict[str, Any]] = []
+
         self._ensure_directories()
-        self._rules_data = self._load_rules_data()
-        self._features_data = self._load_features_data()
-        self._normalize_profile_sections()
-        self._rebuild_template_cache()
-        self._dirty_rules = False
-        self._dirty_features = False
 
-    def save(self) -> None:
-        self._apply_pending_actions()
-        self._normalize_profile_sections()
-        self._rebuild_features_from_rules()
+    def categories(self) -> list[str]:
+        return list(_ALLOWED_CATEGORIES)
 
-        if self._backups_enabled:
-            self._backup_file(self._rules_path)
-            self._backup_file(self._features_path)
+    def load_rules(self) -> dict:
+        with self._lock:
+            if not self._rules_path.exists():
+                raise FileNotFoundError(str(self._rules_path))
+            try:
+                with self._rules_path.open("r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+            except json.JSONDecodeError as exc:
+                raise KnowledgeError(f"rules.json is corrupted: {exc}") from exc
+            except OSError as exc:
+                raise KnowledgeError(f"Failed to read rules.json: {exc}") from exc
+            if not isinstance(data, dict):
+                raise KnowledgeError("rules.json root must be an object.")
+            return data
 
-        self._write_json_atomic(self._rules_path, self._rules_data)
-        self._write_json_atomic(self._features_path, self._features_data)
+    def save_rules(self, data: dict) -> None:
+        with self._lock:
+            if not isinstance(data, dict):
+                raise KnowledgeError("Rules data must be dict.")
+            payload = dict(data)
+            payload["version"] = int(payload.get("version", 1))
+            payload["profile"] = self.profile
+            payload["updated_at"] = _utc_now_iso()
+            payload["categories"] = self.categories()
+            try:
+                content = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=False) + "\n"
+                _atomic_write_text(self._rules_path, content)
+            except (TypeError, ValueError, OSError) as exc:
+                raise KnowledgeError(f"Failed to save rules.json: {exc}") from exc
 
-        self._dirty_rules = False
-        self._dirty_features = False
+    def load_features(self) -> list[TemplateRecord]:
+        with self._lock:
+            if not self._features_path.exists():
+                raise FileNotFoundError(str(self._features_path))
+            return self._load_templates_from_features_path(self._features_path)
 
-    def reset(self) -> None:
-        self._rules_data = self._default_rules()
-        self._features_data = self._default_features()
-        self._templates_cache.clear()
-        self._template_meta.clear()
-        self._pending.clear()
+    def save_features(self, templates: list[TemplateRecord]) -> None:
+        with self._lock:
+            normalized = [self._normalize_template_record(item) for item in templates]
+            payload = {
+                "version": 1,
+                "profile": self.profile,
+                "updated_at": _utc_now_iso(),
+                "categories": self.categories(),
+                "templates": [self._template_to_dict(item) for item in normalized],
+            }
+            try:
+                content = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=False) + "\n"
+                _atomic_write_text(self._features_path, content)
+            except (TypeError, ValueError, OSError) as exc:
+                raise KnowledgeError(f"Failed to save features.json: {exc}") from exc
 
-        profile_dir = self._profile_root
-        if profile_dir.exists():
-            shutil.rmtree(profile_dir)
-        self._ensure_directories()
-        self.save()
+    def get_templates(
+        self,
+        categories: list[str] | None = None,
+        enabled_only: bool = True
+    ) -> list[TemplateRecord]:
+        with self._lock:
+            category_filter: set[str] | None = None
+            if categories is not None:
+                category_filter = set()
+                for category in categories:
+                    self._validate_category(category)
+                    category_filter.add(category)
 
-    def categories(self) -> tuple[str, ...]:
-        return self.CATEGORIES
+            result: list[TemplateRecord] = []
+            for item in self._load_combined_templates(include_staged=True):
+                if enabled_only and not item.enabled:
+                    continue
+                if category_filter is not None and item.category not in category_filter:
+                    continue
+                result.append(item)
+            result.sort(key=lambda t: (t.category, t.id))
+            return result
 
-    def list_templates(self, category: str | None = None, enabled_only: bool = True) -> list[Template]:
-        if category is not None:
-            self._validate_category(category)
-
-        result: list[Template] = []
-        for template in self._templates_cache.values():
-            if category is not None and template.category != category:
-                continue
-            if enabled_only and not template.enabled:
-                continue
-            result.append(template)
-
-        result.sort(key=lambda item: item.id)
-        return result
+    def load_template_image(self, template_id: str) -> Frame:
+        with self._lock:
+            for item in self._load_combined_templates(include_staged=True):
+                if item.id == template_id:
+                    image = cv2.imread(str(Path(item.file)), cv2.IMREAD_COLOR)
+                    if image is None:
+                        raise KnowledgeError(f"Failed to read template image: {item.file}")
+                    return image
+            raise KeyError(template_id)
 
     def add_template(
         self,
+        frame: Frame,
+        rect: tuple[int, int, int, int],
         category: str,
-        image: "Frame",
-        roi: "Rect",
-        threshold: float | None = None,
-        tags: list[str] | None = None,
-        screen_tag: str = "",
-        note: str = "",
-    ) -> str:
-        self._validate_category(category)
-        self._validate_image(image)
-        self._validate_rect(roi)
+        roi_hint: tuple[int, int, int, int] | None = None,
+        tags: list[str] | None = None
+    ) -> TemplateRecord:
+        with self._lock:
+            self._validate_category(category)
+            _ensure_frame(frame)
 
-        match_threshold = float(threshold if threshold is not None else self._default_threshold)
-        if not (0.0 <= match_threshold <= 1.0):
-            raise KnowledgeError("Template threshold must be in range [0.0, 1.0].")
+            screen_w, screen_h = _frame_size(frame)
+            selected_rect = _normalize_rect(rect)
+            if not _rect_inside_screen(selected_rect, screen_w, screen_h):
+                raise KnowledgeError("Selected rect is outside source frame.")
 
-        template_id = self._generate_template_id()
-        category_dir = self._profile_root / category
-        category_dir.mkdir(parents=True, exist_ok=True)
-        image_path = category_dir / f"{template_id}.png"
+            x1, y1, x2, y2 = selected_rect
+            cropped = frame[y1:y2, x1:x2].copy()
+            tpl_w, tpl_h = _frame_size(cropped)
+            self._validate_template_size(tpl_w, tpl_h)
 
-        image_to_save = np.ascontiguousarray(image)
-        if not cv2.imwrite(str(image_path), image_to_save):
-            raise KnowledgeError(f"Failed to write template image: {image_path}")
+            if roi_hint is None:
+                roi_rect = (0, 0, screen_w, screen_h)
+            else:
+                roi_rect = _clamp_rect(_normalize_rect(roi_hint), screen_w, screen_h)
+                if roi_rect[0] >= roi_rect[2] or roi_rect[1] >= roi_rect[3]:
+                    raise KnowledgeError("roi_hint is invalid after clamping.")
 
-        timestamp = self._utc_now_iso()
-        template_entry = {
-            "id": template_id,
-            "category": category,
-            "image_path": self._normalize_path(image_path),
-            "created_at": timestamp,
-            "updated_at": timestamp,
-            "enabled": True,
-            "source": {
-                "kind": "user_labeled_crop",
-                "screen_tag": str(screen_tag),
-                "note": str(note),
-            },
-            "match": {
-                "method": self._default_method,
-                "threshold": match_threshold,
-            },
-            "roi": {
-                "x": int(roi.x),
-                "y": int(roi.y),
-                "w": int(roi.w),
-                "h": int(roi.h),
-            },
-            "profile": self.profile,
-            "tags": list(tags or []),
-            "stats": {
-                "times_used": 0,
-                "times_matched": 0,
-                "times_failed": 0,
-            },
-        }
+            template_id = self._next_template_id()
+            created_at = _utc_now_iso()
+            png_path = self._profile_templates_dir / f"{template_id}.png"
 
-        profile_block = self._profile_rules_block(self.profile)
-        profile_block["templates"].append(template_entry)
-        if category in self._SCREEN_CATEGORIES:
-            profile_block.setdefault("screen_classifiers", {})
-            profile_block["screen_classifiers"].setdefault(category, [])
-            profile_block["screen_classifiers"][category].append(template_id)
+            if not cv2.imwrite(str(png_path), cropped):
+                raise KnowledgeError(f"Failed to write template PNG: {png_path}")
 
-        self._dirty_rules = True
-        self._dirty_features = True
-        self._rebuild_template_cache()
-        return template_id
+            record = TemplateRecord(
+                id=template_id,
+                category=category,
+                file=str(png_path.as_posix()),
+                width=tpl_w,
+                height=tpl_h,
+                source_screen_size=(screen_w, screen_h),
+                selected_rect=selected_rect,
+                roi_hint=roi_rect,
+                created_at=created_at,
+                enabled=True,
+                tags=tuple(tags or ["manual"]),
+            )
 
-    def get_templates_for_screen_classification(self) -> list[Template]:
-        templates: list[Template] = []
-        for category in self._SCREEN_CATEGORIES:
-            templates.extend(self.get_templates_for_category(category))
-        templates.sort(key=lambda item: item.id)
-        return templates
+            existing = self.load_features()
+            existing.append(record)
+            self.save_features(existing)
+            self._staged_templates.append(record)
+            self._staged_actions.append({"type": "template", "id": record.id})
+            return record
 
-    def get_templates_for_category(self, category: str) -> list[Template]:
-        self._validate_category(category)
-        return self.list_templates(category=category, enabled_only=True)
-
-    def increment_match_stats(self, template_id: str, matched: bool) -> None:
-        template_entry = self._find_template_entry(template_id)
-        if template_entry is None:
-            raise KnowledgeError(f"Template not found: {template_id}")
-
-        stats = template_entry.setdefault("stats", {})
-        stats["times_used"] = int(stats.get("times_used", 0)) + 1
-        if matched:
-            stats["times_matched"] = int(stats.get("times_matched", 0)) + 1
-        else:
-            stats["times_failed"] = int(stats.get("times_failed", 0)) + 1
-        template_entry["updated_at"] = self._utc_now_iso()
-        self._dirty_rules = True
-        self._dirty_features = True
+    def reset(self) -> None:
+        with self._lock:
+            self._ensure_directories()
+            self.save_rules(self._default_rules())
+            self.save_features([])
+            if self._profile_templates_dir.exists():
+                for file_path in self._profile_templates_dir.iterdir():
+                    if file_path.is_file() and file_path.suffix.lower() == ".png":
+                        file_path.unlink()
+            self._staged_templates.clear()
+            self._staged_clicks.clear()
+            self._staged_actions.clear()
 
     def add_click_point(
         self,
-        category: str,
         x: int,
         y: int,
-        roi: Rect | None = None,
-        note: str = "",
-    ) -> None:
-        self._validate_category(category)
-        if x < 0 or y < 0:
-            raise KnowledgeError("Click point coordinates must be non-negative.")
-
-        payload = {
-            "category": category,
-            "x": int(x),
-            "y": int(y),
-            "note": str(note),
-        }
-        if roi is not None:
-            self._validate_rect(roi)
-            payload["roi"] = {"x": roi.x, "y": roi.y, "w": roi.w, "h": roi.h}
-        self._pending.append(_PendingAction(kind="click_point", payload=payload))
-        self._dirty_rules = True
-
-    def add_template_from_frame(
-        self,
-        frame: "Frame",
-        rect: Rect,
         category: str,
-        threshold: float | None = None,
-        tags: list[str] | None = None,
-        screen_tag: str = "",
-        note: str = "",
-    ) -> str:
-        self._validate_image(frame)
-        self._validate_rect(rect)
-        h, w = frame.shape[:2]
-        if rect.x + rect.w > w or rect.y + rect.h > h:
-            raise KnowledgeError("Template rectangle is outside frame bounds.")
-        crop = frame[rect.y:rect.y + rect.h, rect.x:rect.x + rect.w].copy()
-        return self.add_template(
-            category=category,
-            image=crop,
-            roi=rect,
-            threshold=threshold,
-            tags=tags,
-            screen_tag=screen_tag,
-            note=note,
-        )
+        roi_hint: tuple[int, int, int, int] | None = None,
+        tags: list[str] | None = None
+    ) -> dict[str, Any]:
+        with self._lock:
+            self._validate_category(category)
+            record = {
+                "type": "click_point",
+                "x": int(x),
+                "y": int(y),
+                "category": category,
+                "roi_hint": list(_normalize_rect(roi_hint)) if roi_hint is not None else None,
+                "tags": list(tags or ["manual"]),
+                "created_at": _utc_now_iso(),
+            }
+            self._staged_clicks.append(record)
+            self._staged_actions.append({"type": "click_point", "index": len(self._staged_clicks) - 1})
+            return dict(record)
 
     def undo_last_annotation(self) -> bool:
-        if self._pending:
-            self._pending.pop()
-            self._dirty_rules = True
-            return True
+        with self._lock:
+            if not self._staged_actions:
+                return False
+            last = self._staged_actions.pop()
+            if last.get("type") == "template":
+                template_id = str(last["id"])
+                templates = self.load_features()
+                to_remove = None
+                remaining: list[TemplateRecord] = []
+                for item in templates:
+                    if item.id == template_id and to_remove is None:
+                        to_remove = item
+                    else:
+                        remaining.append(item)
+                if to_remove is not None:
+                    image_path = Path(to_remove.file)
+                    if image_path.exists():
+                        image_path.unlink()
+                    self.save_features(remaining)
+                self._staged_templates = [item for item in self._staged_templates if item.id != template_id]
+                return True
+            if last.get("type") == "click_point":
+                index = int(last["index"])
+                if 0 <= index < len(self._staged_clicks):
+                    self._staged_clicks.pop(index)
+                    rebuilt: list[dict[str, Any]] = []
+                    click_index = 0
+                    for action in self._staged_actions:
+                        if action.get("type") == "click_point":
+                            rebuilt.append({"type": "click_point", "index": click_index})
+                            click_index += 1
+                        else:
+                            rebuilt.append(action)
+                    self._staged_actions = rebuilt
+                    return True
+            return False
 
-        profile_block = self._profile_rules_block(self.profile)
-        templates = profile_block.get("templates", [])
-        if templates:
-            last = templates.pop()
-            image_path = Path(str(last.get("image_path", "")))
-            try:
-                if image_path.exists():
-                    image_path.unlink()
-            except OSError as exc:
-                raise KnowledgeError(f"Failed to remove template image: {image_path}") from exc
+    def save(self) -> None:
+        with self._lock:
+            templates = self.load_features() if self._features_path.exists() else []
+            self.save_features(templates)
+            if not self._rules_path.exists():
+                self.save_rules(self._default_rules())
 
-            category = str(last.get("category", ""))
-            if category in self._SCREEN_CATEGORIES:
-                classifier_ids = profile_block.get("screen_classifiers", {}).get(category, [])
-                profile_block.get("screen_classifiers", {}).setdefault(category, [])
-                profile_block["screen_classifiers"][category] = [tid for tid in classifier_ids if tid != last.get("id")]
+    def profile_dir(self) -> str:
+        return str(self._profile_dir.as_posix())
 
-            self._dirty_rules = True
-            self._dirty_features = True
-            self._rebuild_template_cache()
-            return True
-
-        return False
-
-    def _default_rules(self) -> dict[str, Any]:
-        return {
-            "version": 1,
-            "game": self._game_name,
-            "profiles": {
-                self.profile: {
-                    "templates": [],
-                    "screen_classifiers": {
-                        "room_screen": [],
-                        "passage_screen": [],
-                        "event_screen": [],
-                    },
-                    "click_points": {},
-                },
-                "common": {
-                    "templates": [],
-                    "screen_classifiers": {
-                        "room_screen": [],
-                        "passage_screen": [],
-                        "event_screen": [],
-                    },
-                    "click_points": {},
-                },
-            },
-        }
-
-    def _default_features(self) -> dict[str, Any]:
-        return {
-            "version": 1,
-            "profile": self.profile,
-            "generated_at": self._utc_now_iso(),
-            "templates": {},
-        }
+    def common_dir(self) -> str:
+        return str(self._common_templates_dir.as_posix())
 
     def _ensure_directories(self) -> None:
-        self._rules_path.parent.mkdir(parents=True, exist_ok=True)
-        self._features_path.parent.mkdir(parents=True, exist_ok=True)
-        self._profile_root.mkdir(parents=True, exist_ok=True)
-        self._common_root.mkdir(parents=True, exist_ok=True)
-        for category in self.CATEGORIES:
-            (self._profile_root / category).mkdir(parents=True, exist_ok=True)
-            (self._common_root / category).mkdir(parents=True, exist_ok=True)
-
-    def _load_rules_data(self) -> dict[str, Any]:
+        self._profile_dir.mkdir(parents=True, exist_ok=True)
+        self._profile_templates_dir.mkdir(parents=True, exist_ok=True)
+        self._common_templates_dir.mkdir(parents=True, exist_ok=True)
         if not self._rules_path.exists():
-            return self._default_rules()
-        try:
-            with self._rules_path.open("r", encoding="utf-8") as fh:
-                data = json.load(fh)
-        except json.JSONDecodeError as exc:
-            raise KnowledgeError(f"Invalid rules.json: {exc}") from exc
-        if not isinstance(data, dict):
-            raise KnowledgeError("rules.json root must be an object.")
-        return data
-
-    def _load_features_data(self) -> dict[str, Any]:
+            self.save_rules(self._default_rules())
         if not self._features_path.exists():
-            return self._default_features()
-        try:
-            with self._features_path.open("r", encoding="utf-8") as fh:
-                data = json.load(fh)
-        except json.JSONDecodeError as exc:
-            raise KnowledgeError(f"Invalid features.json: {exc}") from exc
-        if not isinstance(data, dict):
-            raise KnowledgeError("features.json root must be an object.")
-        return data
+            self.save_features([])
 
-    def _normalize_profile_sections(self) -> None:
-        self._rules_data.setdefault("version", 1)
-        self._rules_data.setdefault("game", self._game_name)
-        profiles = self._rules_data.setdefault("profiles", {})
-        if not isinstance(profiles, dict):
-            raise KnowledgeError("rules.json field 'profiles' must be an object.")
+    def _resolve_profile_templates_dir(self, templates_root: Path, profile: str) -> Path:
+        parts = [part for part in templates_root.parts if part not in ("", ".")]
+        if len(parts) >= 2 and parts[-2] == "templates" and parts[-1] == profile:
+            return templates_root
+        if parts and parts[-1] == profile:
+            return templates_root
+        return templates_root / profile
 
-        for profile_name in (self.profile, "common"):
-            block = profiles.setdefault(profile_name, {})
-            if not isinstance(block, dict):
-                raise KnowledgeError(f"Profile block must be an object: {profile_name}")
-            block.setdefault("templates", [])
-            block.setdefault("screen_classifiers", {})
-            block.setdefault("click_points", {})
-            for category in self._SCREEN_CATEGORIES:
-                block["screen_classifiers"].setdefault(category, [])
+    def _resolve_common_templates_dir(self, templates_root: Path) -> Path:
+        parts = [part for part in templates_root.parts if part not in ("", ".")]
+        if parts and parts[-1] == "templates":
+            return templates_root / "common"
+        if len(parts) >= 2 and parts[-2] == "templates":
+            return templates_root.parent / "common"
+        return templates_root / "common"
 
-        self._features_data.setdefault("version", 1)
-        self._features_data["profile"] = self.profile
-        self._features_data.setdefault("generated_at", self._utc_now_iso())
-        self._features_data.setdefault("templates", {})
-
-    def _profile_rules_block(self, profile_name: str) -> dict[str, Any]:
-        profiles = self._rules_data.setdefault("profiles", {})
-        block = profiles.setdefault(profile_name, {})
-        block.setdefault("templates", [])
-        block.setdefault("screen_classifiers", {})
-        block.setdefault("click_points", {})
-        for category in self._SCREEN_CATEGORIES:
-            block["screen_classifiers"].setdefault(category, [])
-        return block
-
-    def _rebuild_template_cache(self) -> None:
-        self._templates_cache.clear()
-        self._template_meta.clear()
-
-        for profile_name in ("common", self.profile):
-            block = self._profile_rules_block(profile_name)
-            templates = block.get("templates", [])
-            if not isinstance(templates, list):
-                raise KnowledgeError(f"templates for profile '{profile_name}' must be a list.")
-            for entry in templates:
-                template = self._template_from_entry(entry)
-                self._templates_cache[template.id] = template
-                self._template_meta[template.id] = entry
-
-        self._rebuild_features_from_rules()
-
-    def _rebuild_features_from_rules(self) -> None:
-        templates_section: dict[str, Any] = {}
-        for template_id, template in self._templates_cache.items():
-            image_path = Path(self._template_meta[template_id]["image_path"])
-            checksum = self._compute_checksum(image_path)
-            templates_section[template_id] = {
-                "image_path": self._normalize_path(image_path),
-                "category": template.category,
-                "shape": list(template.image.shape),
-                "roi": {
-                    "x": template.roi.x,
-                    "y": template.roi.y,
-                    "w": template.roi.w,
-                    "h": template.roi.h,
-                },
-                "match": {
-                    "method": self._default_method,
-                    "threshold": float(template.threshold),
-                },
-                "checksum": checksum,
-                "enabled": bool(template.enabled),
-                "updated_at": str(self._template_meta[template_id].get("updated_at", self._utc_now_iso())),
-            }
-        self._features_data = {
+    def _default_rules(self) -> dict[str, Any]:
+        safety = self.config.raw.get("safety", {}) if isinstance(self.config.raw, dict) else {}
+        game = self.config.raw.get("game", {}) if isinstance(self.config.raw, dict) else {}
+        return {
             "version": 1,
             "profile": self.profile,
-            "generated_at": self._utc_now_iso(),
-            "templates": templates_section,
+            "updated_at": "",
+            "categories": self.categories(),
+            "policy": {
+                "block_shop": bool(safety.get("block_shop", True)),
+                "block_ads": bool(safety.get("block_ads", True)),
+                "block_pvp": bool(safety.get("block_pvp", True)),
+                "stop_on_danger": bool(safety.get("stop_on_danger", True)),
+                "clear_room_immediately": bool(game.get("clear_room_immediately", True)),
+                "skip_events_by_exit": bool(game.get("skip_events_by_exit", True)),
+                "go_all_doors_before_next_floor": bool(game.get("go_all_doors_before_next_floor", True)),
+                "revisit_open_rooms": bool(game.get("revisit_open_rooms", False)),
+            },
+            "screen_rules": [],
+            "notes": "",
         }
 
-    def _template_from_entry(self, entry: dict[str, Any]) -> Template:
-        if not isinstance(entry, dict):
-            raise KnowledgeError("Template entry must be an object.")
-        category = str(entry.get("category", ""))
-        self._validate_category(category)
-        image_path = Path(str(entry.get("image_path", "")))
-        if not image_path.exists():
-            raise KnowledgeError(f"Template image file not found: {image_path}")
+    def _load_templates_from_features_path(self, path: Path) -> list[TemplateRecord]:
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except json.JSONDecodeError as exc:
+            raise KnowledgeError(f"features.json is corrupted: {exc}") from exc
+        except OSError as exc:
+            raise KnowledgeError(f"Failed to read features.json: {exc}") from exc
 
-        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-        if image is None or image.size == 0:
-            raise KnowledgeError(f"Failed to load template image: {image_path}")
+        if not isinstance(data, dict):
+            raise KnowledgeError("features.json root must be an object.")
+        templates_data = data.get("templates", [])
+        if not isinstance(templates_data, list):
+            raise KnowledgeError("features.json templates must be a list.")
 
-        roi_data = entry.get("roi", {})
-        rect = Rect(
-            x=int(roi_data.get("x", 0)),
-            y=int(roi_data.get("y", 0)),
-            w=int(roi_data.get("w", image.shape[1])),
-            h=int(roi_data.get("h", image.shape[0])),
-        )
-        self._validate_rect(rect)
+        result: list[TemplateRecord] = []
+        for item in templates_data:
+            if not isinstance(item, dict):
+                raise KnowledgeError("Template record must be object.")
+            category = str(item["category"])
+            self._validate_category(category)
+            source_screen_size = item.get("source_screen_size", [0, 0])
+            selected_rect = item.get("selected_rect", [0, 0, 0, 0])
+            roi_hint = item.get("roi_hint", [0, 0, 0, 0])
+            tags = item.get("tags", [])
+            if not isinstance(source_screen_size, (list, tuple)) or len(source_screen_size) != 2:
+                raise KnowledgeError("Template source_screen_size must be [width, height].")
+            if not isinstance(tags, list):
+                raise KnowledgeError("Template tags must be list.")
+            result.append(
+                TemplateRecord(
+                    id=str(item["id"]),
+                    category=category,
+                    file=str(item["file"]),
+                    width=int(item["width"]),
+                    height=int(item["height"]),
+                    source_screen_size=(int(source_screen_size[0]), int(source_screen_size[1])),
+                    selected_rect=_normalize_rect(selected_rect),
+                    roi_hint=_normalize_rect(roi_hint),
+                    created_at=str(item.get("created_at", "")),
+                    enabled=bool(item.get("enabled", True)),
+                    tags=tuple(str(tag) for tag in tags),
+                )
+            )
+        return result
 
-        match_data = entry.get("match", {})
-        threshold = float(match_data.get("threshold", self._default_threshold))
+    def _load_combined_templates(self, include_staged: bool) -> list[TemplateRecord]:
+        result: list[TemplateRecord] = []
+        seen: set[str] = set()
 
-        return Template(
-            id=str(entry.get("id", "")),
-            category=category,
-            image=image,
-            roi=rect,
-            threshold=threshold,
-            enabled=bool(entry.get("enabled", True)),
-        )
+        common_features = self._common_templates_dir / self._features_filename
+        if common_features.exists():
+            for item in self._load_templates_from_features_path(common_features):
+                if item.id not in seen:
+                    seen.add(item.id)
+                    result.append(item)
 
-    def _find_template_entry(self, template_id: str) -> dict[str, Any] | None:
-        for profile_name in (self.profile, "common"):
-            block = self._profile_rules_block(profile_name)
-            for entry in block.get("templates", []):
-                if str(entry.get("id", "")) == template_id:
-                    return entry
-        return None
+        if self._features_path.exists():
+            for item in self._load_templates_from_features_path(self._features_path):
+                if item.id not in seen:
+                    seen.add(item.id)
+                    result.append(item)
 
-    def _apply_pending_actions(self) -> None:
-        if not self._pending:
-            return
-        block = self._profile_rules_block(self.profile)
-        click_points = block.setdefault("click_points", {})
-        for action in self._pending:
-            if action.kind == "click_point":
-                payload = dict(action.payload)
-                category = str(payload.pop("category"))
-                click_points.setdefault(category, [])
-                click_points[category].append(payload)
-            else:
-                raise KnowledgeError(f"Unsupported pending action kind: {action.kind}")
-        self._pending.clear()
+        if include_staged:
+            for item in self._staged_templates:
+                if item.id not in seen:
+                    seen.add(item.id)
+                    result.append(item)
 
-    def _write_json_atomic(self, path: Path, data: dict[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if self._atomic_write:
-            fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    json.dump(data, fh, ensure_ascii=False, indent=2)
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                os.replace(tmp_name, path)
-            except Exception:
-                try:
-                    os.unlink(tmp_name)
-                except OSError:
-                    pass
-                raise
-        else:
-            with path.open("w", encoding="utf-8") as fh:
-                json.dump(data, fh, ensure_ascii=False, indent=2)
-                fh.flush()
-                os.fsync(fh.fileno())
+        return result
 
-    def _backup_file(self, path: Path) -> None:
-        if not path.exists():
-            return
-        backup_path = path.with_suffix(path.suffix + ".bak")
-        shutil.copy2(path, backup_path)
-
-    def _compute_checksum(self, path: Path) -> str:
-        hasher = hashlib.sha256()
-        with path.open("rb") as fh:
-            while True:
-                chunk = fh.read(65536)
-                if not chunk:
-                    break
-                hasher.update(chunk)
-        return "sha256:" + hasher.hexdigest()
-
-    def _generate_template_id(self) -> str:
-        base = datetime.now(timezone.utc).strftime("tpl_%Y%m%d_%H%M%S")
-        index = 1
-        while True:
-            template_id = f"{base}_{index:03d}"
-            if template_id not in self._templates_cache:
-                return template_id
-            index += 1
+    def _template_to_dict(self, item: TemplateRecord) -> dict[str, Any]:
+        return {
+            "id": item.id,
+            "category": item.category,
+            "file": item.file,
+            "width": int(item.width),
+            "height": int(item.height),
+            "source_screen_size": [int(item.source_screen_size[0]), int(item.source_screen_size[1])],
+            "selected_rect": [int(v) for v in item.selected_rect],
+            "roi_hint": [int(v) for v in item.roi_hint],
+            "created_at": item.created_at,
+            "enabled": bool(item.enabled),
+            "tags": [str(tag) for tag in item.tags],
+        }
 
     def _validate_category(self, category: str) -> None:
-        if category not in self.CATEGORIES:
+        if category not in _ALLOWED_CATEGORIES:
             raise UnknownCategoryError(f"Unknown category: {category}")
 
-    def _validate_rect(self, rect: Rect) -> None:
-        if rect.w <= 0 or rect.h <= 0:
-            raise KnowledgeError("Rect width and height must be positive.")
-        if rect.x < 0 or rect.y < 0:
-            raise KnowledgeError("Rect coordinates must be non-negative.")
+    def _validate_template_size(self, width: int, height: int) -> None:
+        _validate_positive_size(width, height)
+        min_w, min_h = self._min_template_size
+        max_w, max_h = self._max_template_size
+        if width < min_w or height < min_h:
+            raise KnowledgeError(f"Template is too small: {(width, height)}, minimum is {(min_w, min_h)}.")
+        if width > max_w or height > max_h:
+            raise KnowledgeError(f"Template is too large: {(width, height)}, maximum is {(max_w, max_h)}.")
 
-    def _validate_image(self, image: "Frame") -> None:
-        if not isinstance(image, np.ndarray):
-            raise KnowledgeError("Template image must be a numpy array.")
-        if image.size == 0:
-            raise KnowledgeError("Template image must not be empty.")
-        if image.ndim not in (2, 3):
-            raise KnowledgeError("Template image must be 2D or 3D numpy array.")
+    def _next_template_id(self) -> str:
+        used_ids = {item.id for item in self._load_combined_templates(include_staged=True)}
+        number = 1
+        while True:
+            candidate = f"tpl_{number:06d}"
+            if candidate not in used_ids:
+                return candidate
+            number += 1
 
-    def _normalize_path(self, path: Path) -> str:
-        return path.as_posix()
-
-    def _utc_now_iso(self) -> str:
-        return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    def _normalize_template_record(self, item: TemplateRecord) -> TemplateRecord:
+        if not isinstance(item, TemplateRecord):
+            raise KnowledgeError("All features must be TemplateRecord instances.")
+        self._validate_category(item.category)
+        _validate_positive_size(item.width, item.height)
+        return TemplateRecord(
+            id=str(item.id),
+            category=str(item.category),
+            file=str(item.file),
+            width=int(item.width),
+            height=int(item.height),
+            source_screen_size=(int(item.source_screen_size[0]), int(item.source_screen_size[1])),
+            selected_rect=_normalize_rect(item.selected_rect),
+            roi_hint=_normalize_rect(item.roi_hint),
+            created_at=str(item.created_at),
+            enabled=bool(item.enabled),
+            tags=tuple(str(tag) for tag in item.tags),
+        )
