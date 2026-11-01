@@ -5,51 +5,90 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
+
+from bot.config import Config, ConfigError
+from bot.vision import Rect
+
+
+class ProfileError(Exception):
+    ...
+
+
+class ProfileNotFoundError(ProfileError):
+    ...
 
 
 @dataclass(frozen=True)
-class LocationProfile:
-    """
-    Расширенный профиль локации.
-
-    Хранит:
-    - идентификатор профиля из config.yaml;
-    - отображаемое имя;
-    - файловые пути его базы знаний;
-    - обученный путь до локации из главного меню;
-    - обученный способ выбора этажа;
-    - путь к progress.json.
-    """
-
-    id: str
+class Profile:
     name: str
-    knowledge_dir: str
-    rules_file: str
-    screens_dir: str
-    common_knowledge_dir: str
-    common_rules_file: str
-    route_file: str
-    floor_selection_file: str
-    progress_file: str
+    screen_width: int | None
+    screen_height: int | None
+    rois: dict[str, Rect]
+    thresholds: dict[str, float]
+
+
+@dataclass(frozen=True)
+class ProfileRunConfig:
+    profile: str
     floor_from: int
     floor_to: int
     run_all_floors: bool
 
 
 @dataclass(frozen=True)
-class ProfileKnowledgePaths:
-    """Служебный набор путей к знаниям конкретного профиля."""
-
-    knowledge_dir: str
-    rules_file: str
-    screens_dir: str
-    route_file: str
-    floor_selection_file: str
-    progress_file: str
+class LocationPathStep:
+    kind: str
+    x: int
+    y: int
+    note: str = ""
 
 
-DEFAULT_PROFILE_IDS: Tuple[str, ...] = (
+@dataclass(frozen=True)
+class NextFloorAction:
+    x: int
+    y: int
+    note: str = ""
+
+
+@dataclass(frozen=True)
+class FloorTemplateEntry:
+    floor: int
+    image_path: str
+    roi: Rect
+    threshold: float
+    swipe_attempts_from_top: int = 0
+
+
+@dataclass(frozen=True)
+class FloorSelectionMethod:
+    mode: str
+    next_floor_action: NextFloorAction | None
+    floor_templates: dict[int, FloorTemplateEntry]
+    list_roi: Rect | None
+    swipe_start_x: int | None
+    swipe_start_y: int | None
+    swipe_end_x: int | None
+    swipe_end_y: int | None
+    swipe_duration_ms: int
+    swipe_step_limit: int
+
+
+@dataclass(frozen=True)
+class LocationProfile:
+    profile: Profile
+    profile_id: str
+    display_name: str
+    knowledge_dir: Path
+    rules_path: Path
+    screens_dir: Path
+    progress_path: Path
+    path_to_location: list[LocationPathStep]
+    floor_selection: FloorSelectionMethod
+    run: ProfileRunConfig
+
+
+DEFAULT_PROFILE_IDS: tuple[str, ...] = (
     "loc1",
     "loc2",
     "loc3",
@@ -59,202 +98,325 @@ DEFAULT_PROFILE_IDS: Tuple[str, ...] = (
     "loc7",
 )
 
-DEFAULT_PROGRESS: Dict[str, Any] = {
-    "version": 1,
-    "profile": "",
-    "started_at": "",
-    "updated_at": "",
-    "current_floor": 0,
-    "floor_from": 0,
-    "floor_to": 0,
-    "status": "idle",
-    "totals": {
-        "floors_completed": 0,
-        "rooms_cleared": 0,
-        "rooms_skipped": 0,
-        "rooms_failed": 0,
-    },
-    "last_result": {
-        "floor_number": 0,
-        "status": "",
-        "reason": "",
-    },
-}
+
+_PROGRESS_VERSION = 1
 
 
-def _utc_now_iso() -> str:
-    from datetime import datetime, timezone
-
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+def _config_dir(config: Config) -> Path:
+    return config.path.parent.resolve()
 
 
 
-def _ensure_dir(path: str) -> None:
-    Path(path).mkdir(parents=True, exist_ok=True)
+def _resolve_path(base_dir: Path, value: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = (base_dir / path).resolve()
+    return path
 
 
 
-def _atomic_write_json(path: str, data: Dict[str, Any]) -> None:
-    target = Path(path)
-    _ensure_dir(str(target.parent))
-    fd, tmp_path = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp", dir=str(target.parent))
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False, indent=2)
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp_path, path)
-    finally:
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+        finally:
+            pass
+        raise
 
 
 
-def _read_json(path: str, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    file_path = Path(path)
-    if not file_path.is_file():
-        return dict(default or {})
-    with file_path.open("r", encoding="utf-8") as fh:
-        loaded = json.load(fh)
-    if not isinstance(loaded, dict):
-        raise ValueError(f"JSON object expected in file: {path}")
-    return loaded
+def _require_mapping(value: Any, name: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ProfileError(f"{name} must be a mapping")
+    return value
 
 
 
-def _profile_root(config: Any, profile_id: str) -> str:
-    knowledge_root = str(getattr(config, "knowledge_dir"))
-    return str((Path(knowledge_root) / profile_id).resolve())
+def _require_list(value: Any, name: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise ProfileError(f"{name} must be a list")
+    return value
 
 
 
-def _common_root(config: Any) -> str:
-    knowledge_root = str(getattr(config, "knowledge_dir"))
-    return str((Path(knowledge_root) / "common").resolve())
+def _as_int(value: Any, name: str, allow_none: bool = False) -> int | None:
+    if value is None and allow_none:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ProfileError(f"{name} must be an integer")
+    return value
 
 
 
-def _build_profile_paths(config: Any, profile_id: str) -> ProfileKnowledgePaths:
-    root = Path(_profile_root(config, profile_id))
-    return ProfileKnowledgePaths(
-        knowledge_dir=str(root),
-        rules_file=str((root / "rules.json").resolve()),
-        screens_dir=str((root / "screens").resolve()),
-        route_file=str((root / "route.json").resolve()),
-        floor_selection_file=str((root / "floor_selection.json").resolve()),
-        progress_file=str((root / "progress.json").resolve()),
-    )
+def _as_float(value: Any, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ProfileError(f"{name} must be a number")
+    return float(value)
 
 
 
-def _normalize_profile_items(raw_items: Any) -> Dict[str, Dict[str, Any]]:
-    if not isinstance(raw_items, dict):
+def _as_str(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ProfileError(f"{name} must be a non-empty string")
+    return value
+
+
+
+def _as_bool(value: Any, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ProfileError(f"{name} must be a boolean")
+    return value
+
+
+
+def _parse_rect(data: Any, name: str) -> Rect:
+    mapping = _require_mapping(data, name)
+    x = _as_int(mapping.get("x"), f"{name}.x")
+    y = _as_int(mapping.get("y"), f"{name}.y")
+    w = _as_int(mapping.get("w"), f"{name}.w")
+    h = _as_int(mapping.get("h"), f"{name}.h")
+    assert x is not None and y is not None and w is not None and h is not None
+    if w <= 0 or h <= 0:
+        raise ProfileError(f"{name}.w and {name}.h must be > 0")
+    return Rect(x=x, y=y, w=w, h=h)
+
+
+
+def _default_profile_ids(config: Config) -> list[str]:
+    game_locations_count = config.get("game.locations_count", 7)
+    if isinstance(game_locations_count, int) and game_locations_count == 7:
+        return list(DEFAULT_PROFILE_IDS)
+    return [f"loc{i}" for i in range(1, 8)]
+
+
+
+def _profiles_section(config: Config) -> dict[str, Any]:
+    section = config.get("profiles")
+    if not isinstance(section, dict):
+        raise ProfileError("config section 'profiles' must be a mapping")
+    return section
+
+
+
+def _profiles_list(config: Config) -> list[dict[str, Any]]:
+    section = _profiles_section(config)
+    raw_profiles = section.get("list")
+    if raw_profiles is None:
+        default_ids = _default_profile_ids(config)
+        generated: list[dict[str, Any]] = []
+        for pid in default_ids:
+            generated.append({"id": pid, "name": pid})
+        return generated
+
+    profiles = _require_list(raw_profiles, "profiles.list")
+    if len(profiles) != 7:
+        raise ProfileError("profiles.list must contain exactly 7 profiles")
+    parsed: list[dict[str, Any]] = []
+    for index, item in enumerate(profiles, start=1):
+        mapping = _require_mapping(item, f"profiles.list[{index}]")
+        pid = _as_str(mapping.get("id", f"loc{index}"), f"profiles.list[{index}].id")
+        name = _as_str(mapping.get("name", pid), f"profiles.list[{index}].name")
+        parsed.append({"id": pid, "name": name})
+    return parsed
+
+
+
+def list_profiles(config: Config) -> list[str]:
+    """
+    Возвращает список доступных профилей.
+    Исключения:
+        - ProfileError
+    """
+    return [item["id"] for item in _profiles_list(config)]
+
+
+
+def _find_profile_entry(config: Config, profile_name: str) -> dict[str, Any]:
+    for item in _profiles_list(config):
+        if item["id"] == profile_name:
+            return item
+    raise ProfileNotFoundError(f"profile not found: {profile_name}")
+
+
+
+def _parse_rois(raw: Any) -> dict[str, Rect]:
+    if raw is None:
         return {}
-    result: Dict[str, Dict[str, Any]] = {}
-    for key, value in raw_items.items():
-        if not isinstance(key, str) or not key:
-            continue
-        result[key] = value if isinstance(value, dict) else {}
+    mapping = _require_mapping(raw, "rois")
+    result: dict[str, Rect] = {}
+    for category, rect_data in mapping.items():
+        if not isinstance(category, str) or not category:
+            raise ProfileError("rois keys must be non-empty strings")
+        result[category] = _parse_rect(rect_data, f"rois.{category}")
     return result
 
 
 
-def _extract_profiles_section(config: Any) -> Tuple[Optional[str], Dict[str, Dict[str, Any]]]:
-    raw = getattr(config, "raw", {})
-    if not isinstance(raw, dict):
-        return None, {}
-    profiles_section = raw.get("profiles")
-    if not isinstance(profiles_section, dict):
-        return None, {}
-
-    active = profiles_section.get("active")
-    if active is not None and not isinstance(active, str):
-        active = None
-
-    items = profiles_section.get("items")
-    normalized = _normalize_profile_items(items)
-
-    if normalized:
-        return active, normalized
-
-    auto_items: Dict[str, Dict[str, Any]] = {}
-    for profile_id in DEFAULT_PROFILE_IDS:
-        entry = profiles_section.get(profile_id)
-        if isinstance(entry, dict):
-            auto_items[profile_id] = entry
-
-    return active, auto_items
+def _parse_thresholds(raw: Any) -> dict[str, float]:
+    if raw is None:
+        return {}
+    mapping = _require_mapping(raw, "thresholds")
+    result: dict[str, float] = {}
+    for category, value in mapping.items():
+        if not isinstance(category, str) or not category:
+            raise ProfileError("thresholds keys must be non-empty strings")
+        result[category] = _as_float(value, f"thresholds.{category}")
+    return result
 
 
 
-def _get_profile_range_settings(config: Any, profile_id: str) -> Tuple[int, int, bool]:
-    raw = getattr(config, "raw", {})
-    if not isinstance(raw, dict):
-        floor_from = int(getattr(config, "default_floor_from", 1))
-        floor_to = int(getattr(config, "default_floor_to", floor_from))
-        return floor_from, floor_to, True
-
-    exploration = raw.get("exploration")
-    default_floor_from = int(getattr(config, "default_floor_from", 1))
-    default_floor_to = int(getattr(config, "default_floor_to", default_floor_from))
-    run_all_default = True
-
-    if isinstance(exploration, dict):
-        if isinstance(exploration.get("default_floor_from"), int):
-            default_floor_from = int(exploration["default_floor_from"])
-        if isinstance(exploration.get("default_floor_to"), int):
-            default_floor_to = int(exploration["default_floor_to"])
-
-    profiles_run = raw.get("run")
-    if isinstance(profiles_run, dict):
-        per_profile = profiles_run.get("profiles")
-        if isinstance(per_profile, dict):
-            entry = per_profile.get(profile_id)
-            if isinstance(entry, dict):
-                floor_from = int(entry.get("floor_from", default_floor_from))
-                floor_to = int(entry.get("floor_to", default_floor_to))
-                run_all_floors = bool(entry.get("run_all_floors", run_all_default))
-                return floor_from, floor_to, run_all_floors
-
-    profile_entry = None
-    _, items = _extract_profiles_section(config)
-    if profile_id in items:
-        profile_entry = items[profile_id]
-    if isinstance(profile_entry, dict):
-        floor_from = int(profile_entry.get("floor_from", default_floor_from))
-        floor_to = int(profile_entry.get("floor_to", default_floor_to))
-        run_all_floors = bool(profile_entry.get("run_all_floors", run_all_default))
-        return floor_from, floor_to, run_all_floors
-
-    return default_floor_from, default_floor_to, run_all_default
+def _profile_dirs(config: Config, profile_id: str) -> tuple[Path, Path, Path, Path, Path]:
+    base_dir = _config_dir(config)
+    knowledge_base = _resolve_path(base_dir, str(config.get("storage.knowledge_dir", "./data/knowledge")))
+    profile_dir = knowledge_base / profile_id
+    rules_path = profile_dir / "rules.json"
+    screens_dir = profile_dir / "screens"
+    progress_path = profile_dir / "progress.json"
+    common_dir = knowledge_base / "common"
+    return profile_dir, rules_path, screens_dir, progress_path, common_dir
 
 
 
-def _make_location_profile(config: Any, profile_id: str, profile_data: Dict[str, Any]) -> LocationProfile:
-    paths = _build_profile_paths(config, profile_id)
-    common_root = Path(_common_root(config))
-    floor_from, floor_to, run_all_floors = _get_profile_range_settings(config, profile_id)
+def _parse_path_steps(raw: Any) -> list[LocationPathStep]:
+    if raw is None:
+        return []
+    items = _require_list(raw, "path_to_location")
+    steps: list[LocationPathStep] = []
+    for index, item in enumerate(items, start=1):
+        mapping = _require_mapping(item, f"path_to_location[{index}]")
+        kind = _as_str(mapping.get("kind", "tap"), f"path_to_location[{index}].kind")
+        x = _as_int(mapping.get("x"), f"path_to_location[{index}].x")
+        y = _as_int(mapping.get("y"), f"path_to_location[{index}].y")
+        note = str(mapping.get("note", ""))
+        assert x is not None and y is not None
+        steps.append(LocationPathStep(kind=kind, x=x, y=y, note=note))
+    return steps
 
-    _ensure_dir(paths.knowledge_dir)
-    _ensure_dir(paths.screens_dir)
-    _ensure_dir(str(common_root))
-    common_screens_dir = common_root / "screens"
-    _ensure_dir(str(common_screens_dir))
 
-    return LocationProfile(
-        id=profile_id,
-        name=str(profile_data.get("name", profile_id)),
-        knowledge_dir=paths.knowledge_dir,
-        rules_file=paths.rules_file,
-        screens_dir=paths.screens_dir,
-        common_knowledge_dir=str(common_root.resolve()),
-        common_rules_file=str((common_root / "rules.json").resolve()),
-        route_file=paths.route_file,
-        floor_selection_file=paths.floor_selection_file,
-        progress_file=paths.progress_file,
+
+def _parse_next_floor_action(raw: Any) -> NextFloorAction | None:
+    if raw is None:
+        return None
+    mapping = _require_mapping(raw, "floor_selection.next_floor_action")
+    x = _as_int(mapping.get("x"), "floor_selection.next_floor_action.x")
+    y = _as_int(mapping.get("y"), "floor_selection.next_floor_action.y")
+    note = str(mapping.get("note", ""))
+    assert x is not None and y is not None
+    return NextFloorAction(x=x, y=y, note=note)
+
+
+
+def _parse_floor_templates(raw: Any) -> dict[int, FloorTemplateEntry]:
+    if raw is None:
+        return {}
+    items = _require_list(raw, "floor_selection.floor_templates")
+    result: dict[int, FloorTemplateEntry] = {}
+    for index, item in enumerate(items, start=1):
+        mapping = _require_mapping(item, f"floor_selection.floor_templates[{index}]")
+        floor = _as_int(mapping.get("floor"), f"floor_selection.floor_templates[{index}].floor")
+        image_path = _as_str(
+            mapping.get("image_path"), f"floor_selection.floor_templates[{index}].image_path"
+        )
+        roi = _parse_rect(mapping.get("roi"), f"floor_selection.floor_templates[{index}].roi")
+        threshold = _as_float(
+            mapping.get("threshold", 0.88), f"floor_selection.floor_templates[{index}].threshold"
+        )
+        swipe_attempts_from_top = _as_int(
+            mapping.get("swipe_attempts_from_top", 0),
+            f"floor_selection.floor_templates[{index}].swipe_attempts_from_top",
+        )
+        assert floor is not None and swipe_attempts_from_top is not None
+        result[floor] = FloorTemplateEntry(
+            floor=floor,
+            image_path=image_path,
+            roi=roi,
+            threshold=threshold,
+            swipe_attempts_from_top=swipe_attempts_from_top,
+        )
+    return result
+
+
+
+def _parse_floor_selection(raw: Any) -> FloorSelectionMethod:
+    if raw is None:
+        return FloorSelectionMethod(
+            mode="untrained",
+            next_floor_action=None,
+            floor_templates={},
+            list_roi=None,
+            swipe_start_x=None,
+            swipe_start_y=None,
+            swipe_end_x=None,
+            swipe_end_y=None,
+            swipe_duration_ms=300,
+            swipe_step_limit=0,
+        )
+
+    mapping = _require_mapping(raw, "floor_selection")
+    mode = _as_str(mapping.get("mode", "untrained"), "floor_selection.mode")
+    next_floor_action = _parse_next_floor_action(mapping.get("next_floor_action"))
+    floor_templates = _parse_floor_templates(mapping.get("floor_templates"))
+    list_roi = None
+    if mapping.get("list_roi") is not None:
+        list_roi = _parse_rect(mapping.get("list_roi"), "floor_selection.list_roi")
+
+    swipe_start_x = _as_int(mapping.get("swipe_start_x"), "floor_selection.swipe_start_x", allow_none=True)
+    swipe_start_y = _as_int(mapping.get("swipe_start_y"), "floor_selection.swipe_start_y", allow_none=True)
+    swipe_end_x = _as_int(mapping.get("swipe_end_x"), "floor_selection.swipe_end_x", allow_none=True)
+    swipe_end_y = _as_int(mapping.get("swipe_end_y"), "floor_selection.swipe_end_y", allow_none=True)
+    swipe_duration_ms = _as_int(mapping.get("swipe_duration_ms", 300), "floor_selection.swipe_duration_ms")
+    swipe_step_limit = _as_int(mapping.get("swipe_step_limit", 0), "floor_selection.swipe_step_limit")
+    assert swipe_duration_ms is not None and swipe_step_limit is not None
+
+    if mode not in {"untrained", "next_floor_button", "floor_list"}:
+        raise ProfileError(
+            "floor_selection.mode must be one of: untrained, next_floor_button, floor_list"
+        )
+
+    return FloorSelectionMethod(
+        mode=mode,
+        next_floor_action=next_floor_action,
+        floor_templates=floor_templates,
+        list_roi=list_roi,
+        swipe_start_x=swipe_start_x,
+        swipe_start_y=swipe_start_y,
+        swipe_end_x=swipe_end_x,
+        swipe_end_y=swipe_end_y,
+        swipe_duration_ms=swipe_duration_ms,
+        swipe_step_limit=swipe_step_limit,
+    )
+
+
+
+def _parse_run_config(config: Config, profile_id: str) -> ProfileRunConfig:
+    profiles_section = _profiles_section(config)
+    raw_ranges = profiles_section.get("ranges", {})
+    ranges = _require_mapping(raw_ranges, "profiles.ranges") if raw_ranges is not None else {}
+    raw_entry = ranges.get(profile_id, {})
+    entry = _require_mapping(raw_entry, f"profiles.ranges.{profile_id}") if raw_entry is not None else {}
+
+    floor_from = _as_int(entry.get("floor_from", 1), f"profiles.ranges.{profile_id}.floor_from")
+    floor_to = _as_int(entry.get("floor_to", floor_from), f"profiles.ranges.{profile_id}.floor_to")
+    run_all_floors = _as_bool(
+        entry.get("run_all_floors", False), f"profiles.ranges.{profile_id}.run_all_floors"
+    )
+    assert floor_from is not None and floor_to is not None
+    if floor_from <= 0 or floor_to <= 0:
+        raise ProfileError(f"profiles.ranges.{profile_id} floors must be > 0")
+    if floor_from > floor_to:
+        raise ProfileError(f"profiles.ranges.{profile_id}.floor_from must be <= floor_to")
+
+    return ProfileRunConfig(
+        profile=profile_id,
         floor_from=floor_from,
         floor_to=floor_to,
         run_all_floors=run_all_floors,
@@ -262,406 +424,307 @@ def _make_location_profile(config: Any, profile_id: str, profile_data: Dict[str,
 
 
 
-def list_profiles(config: Any) -> List[str]:
+def load_profile(config: Config, profile_name: str) -> Profile:
     """
-    Возвращает список имён профилей.
+    Загружает профиль.
+    Источник допустим либо из config, либо из файлов в profiles_dir,
+    но сигнатура должна остаться этой.
 
-    Публичный метод по контракту модуля.
-    Если в config.yaml профили не заданы явно, создаёт стандартный список
-    из 7 идентификаторов: loc1..loc7.
-    """
-
-    _, items = _extract_profiles_section(config)
-    if items:
-        names = list(items.keys())
-        for default_id in DEFAULT_PROFILE_IDS:
-            if default_id not in items:
-                names.append(default_id)
-        return names
-    return list(DEFAULT_PROFILE_IDS)
-
-
-
-def resolve_profile(config: Any, profile_name: Optional[str]) -> Any:
-    """
-    Возвращает профиль или активный профиль.
-
-    Публичный метод по контракту модуля.
-    Поддерживает два режима:
-    - если конфиг уже содержит объект профиля в config.profiles, возвращает его;
-    - если выбран один из 7 профилей локаций, возвращает LocationProfile.
+    Возвращает:
+        Profile
 
     Исключения:
-    - KeyError, если профиль не найден.
+        - ProfileNotFoundError
+        - ProfileError
     """
+    if not profile_name or not profile_name.strip():
+        raise ProfileNotFoundError("profile name is empty")
 
-    requested = profile_name
-    if not requested:
-        requested = getattr(config, "active_profile_name", None)
+    entry = _find_profile_entry(config, profile_name)
+    profiles_section = _profiles_section(config)
+    details = profiles_section.get("details", {})
+    details_map = _require_mapping(details, "profiles.details") if details is not None else {}
+    detail_entry = details_map.get(profile_name, {})
+    detail = _require_mapping(detail_entry, f"profiles.details.{profile_name}") if detail_entry is not None else {}
 
-    active_from_raw, raw_items = _extract_profiles_section(config)
-    if not requested:
-        requested = active_from_raw or DEFAULT_PROFILE_IDS[0]
+    screen_width = _as_int(detail.get("screen_width"), f"profiles.details.{profile_name}.screen_width", allow_none=True)
+    screen_height = _as_int(
+        detail.get("screen_height"), f"profiles.details.{profile_name}.screen_height", allow_none=True
+    )
+    rois = _parse_rois(detail.get("rois"))
+    thresholds = _parse_thresholds(detail.get("thresholds"))
 
-    config_profiles = getattr(config, "profiles", None)
-    if isinstance(config_profiles, dict) and requested in config_profiles:
-        return config_profiles[requested]
-
-    allowed = set(list_profiles(config))
-    if requested not in allowed:
-        raise KeyError(f"profile not found: {requested}")
-
-    profile_data = raw_items.get(requested, {"name": requested})
-    return _make_location_profile(config, requested, profile_data)
+    return Profile(
+        name=entry["id"],
+        screen_width=screen_width,
+        screen_height=screen_height,
+        rois=rois,
+        thresholds=thresholds,
+    )
 
 
 
-def load_profile(config: Any, profile_name: Optional[str] = None) -> LocationProfile:
+def roi_for(profile: Profile, category: str) -> Rect | None:
+    """
+    Возвращает ROI для категории, если определён.
+    """
+    return profile.rois.get(category)
+
+
+
+def load_location_profile(config: Config, profile_name: str) -> LocationProfile:
     """
     Загружает расширенный профиль локации.
 
-    Публичный метод:
-    - выбирает профиль по имени или активный;
-    - создаёт каталоги knowledge/<profile_id>/ и knowledge/common/ при необходимости;
-    - возвращает объект LocationProfile с путями к знаниям, route.json,
-      floor_selection.json и progress.json.
+    Публичный метод на русском:
+    - читает базовый Profile через load_profile(...)
+    - привязывает к нему отдельную папку знаний knowledge/<profile_id>/
+    - подключает общую папку knowledge/common/
+    - загружает обученный путь до локации и способ выбора этажа
+    - загружает диапазон этажей из config.yaml
 
     Исключения:
-    - KeyError, если профиль не найден.
+        - ProfileNotFoundError
+        - ProfileError
     """
+    base_profile = load_profile(config, profile_name)
+    profile_dir, rules_path, screens_dir, progress_path, _common_dir = _profile_dirs(config, profile_name)
+    profiles_section = _profiles_section(config)
+    details = profiles_section.get("details", {})
+    details_map = _require_mapping(details, "profiles.details") if details is not None else {}
+    detail_entry = details_map.get(profile_name, {})
+    detail = _require_mapping(detail_entry, f"profiles.details.{profile_name}") if detail_entry is not None else {}
 
-    requested = profile_name
-    if not requested:
-        requested = getattr(config, "active_profile_name", None)
-    if not requested:
-        active_from_raw, _ = _extract_profiles_section(config)
-        requested = active_from_raw or DEFAULT_PROFILE_IDS[0]
+    path_to_location = _parse_path_steps(detail.get("path_to_location"))
+    floor_selection = _parse_floor_selection(detail.get("floor_selection"))
+    run = _parse_run_config(config, profile_name)
 
-    _, raw_items = _extract_profiles_section(config)
-    if requested not in set(list_profiles(config)):
-        raise KeyError(f"profile not found: {requested}")
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    screens_dir.mkdir(parents=True, exist_ok=True)
 
-    profile_data = raw_items.get(requested, {"name": requested})
-    return _make_location_profile(config, requested, profile_data)
+    return LocationProfile(
+        profile=base_profile,
+        profile_id=profile_name,
+        display_name=detail.get("display_name", profile_name),
+        knowledge_dir=profile_dir,
+        rules_path=rules_path,
+        screens_dir=screens_dir,
+        progress_path=progress_path,
+        path_to_location=path_to_location,
+        floor_selection=floor_selection,
+        run=run,
+    )
 
 
 
-def load_profile_by_cli(config: Any, cli_args: Any) -> LocationProfile:
+def profile_rules_path(config: Config, profile_name: str) -> Path:
+    _, rules_path, _, _, _ = _profile_dirs(config, profile_name)
+    return rules_path
+
+
+
+def profile_progress_path(config: Config, profile_name: str) -> Path:
+    _, _, _, progress_path, _ = _profile_dirs(config, profile_name)
+    return progress_path
+
+
+
+def common_knowledge_dir(config: Config) -> Path:
+    _, _, _, _, common_dir = _profile_dirs(config, "loc1")
+    common_dir.mkdir(parents=True, exist_ok=True)
+    return common_dir
+
+
+
+def get_active_profile_name(config: Config, cli_profile: str | None = None) -> str:
     """
-    Выбирает профиль из аргументов командной строки.
+    Возвращает имя активного профиля.
 
-    Ожидается поле `cli_args.profile`, совместимое с `--profile loc3`.
-    Если аргумент отсутствует, используется активный профиль.
+    Публичный метод на русском:
+    - если передан --profile, он имеет приоритет
+    - иначе используется profiles.active из config.yaml
+    - имя проверяется по списку из 7 профилей
+
+    Исключения:
+        - ProfileNotFoundError
+        - ProfileError
+        - ConfigError
     """
-
-    profile_name = getattr(cli_args, "profile", None)
-    return load_profile(config, profile_name)
-
-
-
-def create_default_progress(profile: LocationProfile) -> Dict[str, Any]:
-    """
-    Создаёт структуру progress.json для профиля.
-
-    Поля соответствуют архитектурному контракту общего прогресса,
-    а файл хранится отдельно для каждого профиля: knowledge/<profile_id>/progress.json.
-    """
-
-    progress = json.loads(json.dumps(DEFAULT_PROGRESS))
-    now = _utc_now_iso()
-    progress["profile"] = profile.id
-    progress["started_at"] = now
-    progress["updated_at"] = now
-    progress["current_floor"] = max(0, profile.floor_from - 1)
-    progress["floor_from"] = profile.floor_from
-    progress["floor_to"] = profile.floor_to
-    progress["status"] = "idle"
-    return progress
+    candidate = cli_profile.strip() if isinstance(cli_profile, str) and cli_profile.strip() else None
+    if candidate is None:
+        configured = config.get("profiles.active")
+        if not isinstance(configured, str) or not configured.strip():
+            raise ConfigError("profiles.active must be a non-empty string")
+        candidate = configured.strip()
+    _find_profile_entry(config, candidate)
+    return candidate
 
 
 
-def read_progress(profile: LocationProfile) -> Dict[str, Any]:
+def progress_json_template(profile_name: str, floor_from: int, floor_to: int) -> dict[str, Any]:
+    return {
+        "version": _PROGRESS_VERSION,
+        "profile": profile_name,
+        "updated_at": "",
+        "run_state": {
+            "active": False,
+            "mode": "teach",
+            "started_at": "",
+            "last_error": "",
+        },
+        "game_progress": {
+            "current_location": None,
+            "current_floor": None,
+            "target_floor_from": floor_from,
+            "target_floor_to": floor_to,
+            "last_completed_floor": None,
+        },
+        "stats": {
+            "floors_completed": 0,
+            "rooms_cleared": 0,
+            "rooms_skipped": 0,
+            "rooms_failed": 0,
+        },
+    }
+
+
+
+def read_progress(config: Config, profile_name: str) -> dict[str, Any]:
     """
     Читает progress.json профиля.
 
-    Если файл ещё не существует, создаёт структуру по умолчанию,
-    сохраняет её и возвращает.
+    Публичный метод на русском:
+    - если файла ещё нет, создаёт структуру по умолчанию на основе диапазона из конфига
+    - возвращает словарь прогресса
+    - прогресс хранится отдельно для каждого профиля в knowledge/<profile_id>/progress.json
+
+    Исключения:
+        - ProfileError
+        - OSError
+        - json.JSONDecodeError
     """
-
-    if not Path(profile.progress_file).is_file():
-        progress = create_default_progress(profile)
-        write_progress(profile, progress)
-        return progress
-
-    progress = _read_json(profile.progress_file, default=create_default_progress(profile))
-    progress.setdefault("version", 1)
-    progress.setdefault("profile", profile.id)
-    progress.setdefault("started_at", "")
-    progress.setdefault("updated_at", _utc_now_iso())
-    progress.setdefault("current_floor", max(0, profile.floor_from - 1))
-    progress.setdefault("floor_from", profile.floor_from)
-    progress.setdefault("floor_to", profile.floor_to)
-    progress.setdefault("status", "idle")
-    progress.setdefault(
-        "totals",
-        {
-            "floors_completed": 0,
-            "rooms_cleared": 0,
-            "rooms_skipped": 0,
-            "rooms_failed": 0,
-        },
-    )
-    progress.setdefault(
-        "last_result",
-        {
-            "floor_number": 0,
-            "status": "",
-            "reason": "",
-        },
-    )
-    return progress
+    run = _parse_run_config(config, profile_name)
+    path = profile_progress_path(config, profile_name)
+    if not path.exists():
+        return progress_json_template(profile_name, run.floor_from, run.floor_to)
+    with path.open("r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        raise ProfileError(f"invalid progress.json for profile {profile_name}: root must be object")
+    return data
 
 
 
-def write_progress(profile: LocationProfile, progress: Dict[str, Any]) -> None:
+def write_progress(config: Config, profile_name: str, progress: dict[str, Any]) -> None:
     """
     Записывает progress.json профиля атомарно.
 
-    Перед сохранением дополняет обязательные поля profile/floor_from/floor_to/updated_at.
+    Публичный метод на русском:
+    - сохраняет последний пройденный этаж и агрегированный прогресс
+    - файл лежит в папке конкретного профиля
+    - нужен для продолжения запуска после остановки
+
+    Исключения:
+        - ProfileError
+        - OSError
     """
-
-    progress["version"] = int(progress.get("version", 1))
-    progress["profile"] = profile.id
-    progress["floor_from"] = int(progress.get("floor_from", profile.floor_from))
-    progress["floor_to"] = int(progress.get("floor_to", profile.floor_to))
-    progress["updated_at"] = _utc_now_iso()
-    progress.setdefault("started_at", progress["updated_at"])
-    progress.setdefault("status", "idle")
-    progress.setdefault(
-        "totals",
-        {
-            "floors_completed": 0,
-            "rooms_cleared": 0,
-            "rooms_skipped": 0,
-            "rooms_failed": 0,
-        },
-    )
-    progress.setdefault(
-        "last_result",
-        {
-            "floor_number": 0,
-            "status": "",
-            "reason": "",
-        },
-    )
-    _atomic_write_json(profile.progress_file, progress)
+    _find_profile_entry(config, profile_name)
+    if not isinstance(progress, dict):
+        raise ProfileError("progress must be a dict")
+    path = profile_progress_path(config, profile_name)
+    _atomic_write_json(path, progress)
 
 
 
-def get_last_completed_floor(profile: LocationProfile) -> int:
+def get_last_completed_floor(config: Config, profile_name: str) -> int | None:
     """
     Возвращает последний пройденный этаж из progress.json.
 
-    Используется для продолжения после остановки.
+    Публичный метод на русском:
+    - читает game_progress.last_completed_floor
+    - если значения нет, возвращает None
     """
+    progress = read_progress(config, profile_name)
+    game_progress = progress.get("game_progress", {})
+    if not isinstance(game_progress, dict):
+        return None
+    value = game_progress.get("last_completed_floor")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ProfileError("game_progress.last_completed_floor must be integer or null")
+    return value
 
-    progress = read_progress(profile)
-    return int(progress.get("current_floor", max(0, profile.floor_from - 1)))
 
 
-
-def set_last_completed_floor(
-    profile: LocationProfile,
-    floor_number: int,
-    status: str = "running",
-    reason: str = "",
-) -> Dict[str, Any]:
+def set_last_completed_floor(config: Config, profile_name: str, floor_number: int) -> None:
     """
     Обновляет последний пройденный этаж в progress.json.
 
-    Параметры:
-    - floor_number: последний завершённый этаж;
-    - status: текущее состояние прогресса;
-    - reason: причина последнего результата.
+    Публичный метод на русском:
+    - сохраняет номер последнего успешно завершённого этажа
+    - используется для возобновления прохода
+    - не позволяет записать номер этажа меньше 1
 
-    Возвращает обновлённую структуру progress.
+    Исключения:
+        - ProfileError
+        - OSError
     """
-
-    progress = read_progress(profile)
-    progress["current_floor"] = int(floor_number)
-    progress["status"] = status
-    progress["last_result"] = {
-        "floor_number": int(floor_number),
-        "status": status,
-        "reason": reason,
-    }
-    completed = max(0, int(floor_number) - int(progress.get("floor_from", profile.floor_from)) + 1)
-    progress.setdefault("totals", {})
-    progress["totals"]["floors_completed"] = completed
-    write_progress(profile, progress)
-    return progress
+    if isinstance(floor_number, bool) or not isinstance(floor_number, int) or floor_number <= 0:
+        raise ProfileError("floor_number must be an integer > 0")
+    progress = read_progress(config, profile_name)
+    game_progress = progress.setdefault("game_progress", {})
+    if not isinstance(game_progress, dict):
+        raise ProfileError("progress.game_progress must be a dict")
+    game_progress["last_completed_floor"] = floor_number
+    write_progress(config, profile_name, progress)
 
 
 
-def get_next_floor_to_run(profile: LocationProfile) -> Optional[int]:
+def resolve_floor_range(config: Config, profile_name: str) -> tuple[int, int, bool]:
     """
-    Возвращает следующий этаж для запуска с учётом progress.json.
+    Возвращает диапазон этажей профиля из config.yaml.
 
-    Логика:
-    - если прогресса нет, стартует с floor_from;
-    - если run_all_floors=true, продолжает с последнего + 1;
-    - если достигнут floor_to, возвращает None.
+    Публичный метод на русском:
+    - читает profile, floor_from, floor_to, run_all_floors из секции profiles.ranges
+    - используется для остановки на floor_to
+    - не выдумывает значения вне конфига
     """
-
-    progress = read_progress(profile)
-    floor_from = int(progress.get("floor_from", profile.floor_from))
-    floor_to = int(progress.get("floor_to", profile.floor_to))
-    current_floor = int(progress.get("current_floor", floor_from - 1))
-
-    if profile.run_all_floors:
-        next_floor = max(floor_from, current_floor + 1)
-    else:
-        next_floor = floor_from if current_floor < floor_from else current_floor + 1
-
-    if next_floor > floor_to:
-        return None
-    return next_floor
+    run = _parse_run_config(config, profile_name)
+    return run.floor_from, run.floor_to, run.run_all_floors
 
 
 
-def should_stop_after_floor(profile: LocationProfile, floor_number: int) -> bool:
+def next_floor_to_run(config: Config, profile_name: str) -> int:
+    """
+    Вычисляет следующий этаж для запуска.
+
+    Публичный метод на русском:
+    - если прогресса ещё нет, возвращает floor_from
+    - если есть last_completed_floor, возвращает следующий этаж
+    - если достигнут floor_to, дальнейший запуск должен быть остановлен вызывающим кодом
+
+    Исключения:
+        - ProfileError
+    """
+    floor_from, floor_to, _run_all = resolve_floor_range(config, profile_name)
+    last_completed = get_last_completed_floor(config, profile_name)
+    if last_completed is None or last_completed < floor_from:
+        return floor_from
+    candidate = last_completed + 1
+    if candidate > floor_to:
+        return floor_to + 1
+    return candidate
+
+
+
+def should_stop_after_floor(config: Config, profile_name: str, floor_number: int) -> bool:
     """
     Проверяет, нужно ли остановиться по достижении floor_to.
 
-    Возвращает True, если floor_number >= floor_to.
+    Публичный метод на русском:
+    - возвращает True, если floor_number >= floor_to
+    - используется внешним циклом прохода
     """
-
-    return int(floor_number) >= int(profile.floor_to)
-
-
-
-def mark_progress_completed(profile: LocationProfile, floor_number: int, reason: str = "floor_to_reached") -> Dict[str, Any]:
-    """
-    Помечает progress.json как completed.
-
-    Обычно вызывается, когда бот достиг floor_to и должен остановиться.
-    """
-
-    progress = read_progress(profile)
-    progress["current_floor"] = int(floor_number)
-    progress["status"] = "completed"
-    progress["last_result"] = {
-        "floor_number": int(floor_number),
-        "status": "completed",
-        "reason": reason,
-    }
-    progress.setdefault("totals", {})
-    progress["totals"]["floors_completed"] = max(
-        0,
-        int(floor_number) - int(progress.get("floor_from", profile.floor_from)) + 1,
-    )
-    write_progress(profile, progress)
-    return progress
-
-
-
-def save_location_route(profile: LocationProfile, steps: List[Dict[str, Any]]) -> None:
-    """
-    Сохраняет обученный путь до локации из главного меню.
-
-    Формат route.json:
-    {
-      "profile": "loc1",
-      "steps": [ ... ]
-    }
-
-    Содержимое шагов не выдумывается модулем: его должен передать режим обучения.
-    """
-
-    data = {
-        "profile": profile.id,
-        "steps": steps,
-        "updated_at": _utc_now_iso(),
-    }
-    _atomic_write_json(profile.route_file, data)
-
-
-
-def load_location_route(profile: LocationProfile) -> Dict[str, Any]:
-    """
-    Загружает обученный путь до локации из route.json.
-
-    Если файла нет, возвращает пустую структуру со списком шагов.
-    """
-
-    return _read_json(
-        profile.route_file,
-        default={
-            "profile": profile.id,
-            "steps": [],
-        },
-    )
-
-
-
-def save_floor_selection(profile: LocationProfile, selection_data: Dict[str, Any]) -> None:
-    """
-    Сохраняет обученный способ выбора этажа.
-
-    Поддерживаемые сценарии задаются только пользователем в --teach:
-    - вариант (а): кнопка "следующий этаж" после победы;
-    - вариант (б): выбор этажа из списка с эталонами номеров и прокруткой свайпом.
-
-    Модуль ничего не угадывает, а лишь сохраняет структуру как есть.
-    """
-
-    data = dict(selection_data)
-    data["profile"] = profile.id
-    data["updated_at"] = _utc_now_iso()
-    _atomic_write_json(profile.floor_selection_file, data)
-
-
-
-def load_floor_selection(profile: LocationProfile) -> Dict[str, Any]:
-    """
-    Загружает обученный способ выбора этажа.
-
-    Если способ ещё не обучен, возвращает пустую структуру:
-    {
-      "profile": "loc1",
-      "mode": "",
-      "updated_at": ""
-    }
-    """
-
-    return _read_json(
-        profile.floor_selection_file,
-        default={
-            "profile": profile.id,
-            "mode": "",
-            "updated_at": "",
-        },
-    )
-
-
-__all__ = [
-    "DEFAULT_PROFILE_IDS",
-    "LocationProfile",
-    "ProfileKnowledgePaths",
-    "create_default_progress",
-    "get_last_completed_floor",
-    "get_next_floor_to_run",
-    "list_profiles",
-    "load_floor_selection",
-    "load_location_route",
-    "load_profile",
-    "load_profile_by_cli",
-    "mark_progress_completed",
-    "read_progress",
-    "resolve_profile",
-    "save_floor_selection",
-    "save_location_route",
-    "set_last_completed_floor",
-    "should_stop_after_floor",
-    "write_progress",
-]
+    _floor_from, floor_to, _run_all = resolve_floor_range(config, profile_name)
+    return floor_number >= floor_to
