@@ -1,209 +1,309 @@
-"""Tkinter window for teaching the shared GUI navigation profile ``base``.
+"""Tkinter training tab for the shared ``base`` navigation profile.
 
-The module deliberately keeps ADB/template matching out of the GUI.  It only
-presents a guided, click-free teaching checklist and delegates every lesson
-to the existing ``main.py --teach-only`` path with ``--profile base``.
+Storage contract:
+    data/base/nav.json = {
+        "base_to_locations": {"png": "..."},
+        "locations": [
+            {"slot": 1, "name": "...", "png": "...",
+             "floors": [{"name": "...", "png": "..."}]}
+        ],
+        "enter_dungeon": {"png": "..."}
+    }
+
+PNG files are stored in ``data/base``.  JSON writes use a temporary file and
+``os.replace``.  This module only teaches and stores navigation knowledge; it
+does not start farming or perform automatic clicks.
 """
 from __future__ import annotations
 
 import json
-import subprocess
-import sys
-import tkinter as tk
+import os
+import time
 from pathlib import Path
+from typing import Any, Callable
+import tkinter as tk
 from tkinter import messagebox, ttk
-from typing import Any
 
-LOCATION_IDS = tuple(f"loc{i}" for i in range(1, 8))
-LESSONS = (
-    ("main_base", "Главная база", "Откройте в LDPlayer главный экран базы."),
-    ("location_select", "Экран выбора локаций", "Откройте в LDPlayer экран выбора локаций."),
-    *tuple(
-        (f"location_{i}", f"Иконка локации loc{i}", f"Откройте в LDPlayer экран с иконкой локации loc{i}.")
-        for i in range(1, 8)
-    ),
-    ("hero_menu_start", "Меню героев и кнопка старта", "Откройте в LDPlayer меню героев с видимой кнопкой старта."),
-)
+try:
+    import cv2
+except ImportError:  # pragma: no cover
+    cv2 = None
 
+try:
+    from bot.config import load_config
+    from bot.adb_controller import ADBController
+    from bot.logging_setup import setup_logging
+    from bot.screenshot import ScreenshotProvider
+except Exception:  # allow importing the GUI in lightweight/test environments
+    load_config = ADBController = setup_logging = ScreenshotProvider = None
 
-def base_profile_dir(config: Any = None) -> Path:
-    """Return ``data/profiles/base`` without requiring BotConfig at import time."""
-    if config is not None:
-        root = getattr(config, "base_dir", None)
-        if root is not None:
-            return Path(root) / "data" / "profiles" / "base"
-        raw = getattr(config, "raw", {}) or {}
-        configured = raw.get("profiles", {}).get("root_dir", "data/profiles")
-        path = Path(str(configured))
-        if not path.is_absolute():
-            path = Path.cwd() / path
-        return path / "base"
-    return Path(__file__).resolve().parent / "data" / "profiles" / "base"
+BASE_DIR = Path("data/base")
+NAV_PATH = BASE_DIR / "nav.json"
 
 
-def validate_base_knowledge(data: dict) -> None:
-    if data.get("schema_version") != 1:
-        raise ValueError("base knowledge: schema_version must be 1")
-    if data.get("profile") != "base":
-        raise ValueError("base knowledge: profile must be 'base'")
-    screens = data.get("screen_templates")
-    if not isinstance(screens, dict):
-        raise ValueError("base knowledge: screen_templates is missing")
-    for key in ("main_base", "location_select", "hero_menu_start"):
-        if not isinstance(screens.get(key), dict):
-            raise ValueError(f"base knowledge: missing screen template {key}")
-    icons = data.get("location_icons")
-    if not isinstance(icons, list) or len(icons) != 7:
-        raise ValueError("base knowledge: location_icons must contain exactly 7 items")
-    ids = [item.get("location_id") for item in icons if isinstance(item, dict)]
-    if set(ids) != set(LOCATION_IDS) or len(ids) != len(set(ids)):
-        raise ValueError("base knowledge: location_ids must be loc1..loc7 and unique")
+def _empty_nav() -> dict[str, Any]:
+    return {
+        "base_to_locations": {"png": ""},
+        "locations": [
+            {"slot": i, "name": "", "png": "", "floors": []}
+            for i in range(1, 8)
+        ],
+        "enter_dungeon": {"png": ""},
+    }
 
 
-def load_base_knowledge(config: Any = None) -> dict:
-    path = base_profile_dir(config) / "knowledge.json"
-    with path.open("r", encoding="utf-8") as stream:
-        data = json.load(stream)
-    validate_base_knowledge(data)
-    return data
-
-
-def get_location_icon(knowledge: dict, location_id: str) -> dict:
-    if location_id not in LOCATION_IDS:
-        raise ValueError(f"unknown location: {location_id}")
-    for item in knowledge.get("location_icons", []):
-        if item.get("location_id") == location_id:
-            return item
-    raise KeyError(location_id)
-
-
-def resolve_template_path(base_dir: Path, record: dict) -> Path:
-    return (Path(base_dir) / str(record["file"])).resolve()
-
-
-def _state_path(config: Any = None) -> Path:
-    return base_profile_dir(config) / "training_state.json"
-
-
-def _load_state(config: Any = None) -> dict[str, bool]:
+def _load_nav() -> dict[str, Any]:
     try:
-        with _state_path(config).open("r", encoding="utf-8") as stream:
-            data = json.load(stream)
-        return {str(k): bool(v) for k, v in data.items()}
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {}
+        with NAV_PATH.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            raise ValueError("nav.json must contain an object")
+    except (OSError, ValueError, json.JSONDecodeError):
+        return _empty_nav()
+    result = _empty_nav()
+    result.update({k: v for k, v in data.items() if k in result})
+    locations = result.get("locations")
+    if not isinstance(locations, list):
+        locations = []
+    by_slot = {int(x.get("slot")): x for x in locations if isinstance(x, dict) and str(x.get("slot", "")).isdigit()}
+    result["locations"] = [
+        by_slot.get(i, {"slot": i, "name": "", "png": "", "floors": []})
+        for i in range(1, 8)
+    ]
+    return result
 
 
-def _save_state(state: dict[str, bool], config: Any = None) -> None:
-    path = _state_path(config)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".tmp")
-    with temporary.open("w", encoding="utf-8") as stream:
-        json.dump(state, stream, ensure_ascii=False, indent=2)
-        stream.write("\n")
-    temporary.replace(path)
+def _save_nav(data: dict[str, Any]) -> None:
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = NAV_PATH.with_name(f".{NAV_PATH.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, NAV_PATH)
 
 
-class BaseKnowledgeWindow:
-    def __init__(self, master: tk.Misc, config_path: str = "config.yaml") -> None:
-        self.master = master
-        self.config_path = config_path
-        self.window = tk.Toplevel(master)
-        self.window.title("Базовые знания")
-        self.window.geometry("760x560")
-        self.window.minsize(650, 440)
-        self.state = _load_state()
-        self.config = None
+def _provider() -> Any:
+    if ScreenshotProvider is None or load_config is None:
+        raise RuntimeError("Модули ADB/ScreenshotProvider недоступны")
+    config = load_config("config.yaml")
+    logger = setup_logging(config) if setup_logging else None
+    adb = ADBController(config, logger)
+    adb.connect()
+    return ScreenshotProvider(adb, config, logger)
+
+
+def capture_region(parent, prompt) -> tuple[Any, tuple[int, int, int, int]] | None:
+    """Capture a device screenshot and let the user select a rectangle.
+
+    Returns ``(crop_bgr, bbox)`` in screenshot coordinates, or ``None`` when
+    cancelled.  Selection is mouse-only: dragging creates the rectangle and
+    the Save/Cancel buttons finish the operation.
+    """
+    if cv2 is None:
+        messagebox.showerror("Скриншот", "Не установлен OpenCV", parent=parent)
+        return None
+    try:
+        frame = _provider().capture()
+    except Exception as exc:
+        messagebox.showerror("Скриншот", str(exc), parent=parent)
+        return None
+    if frame is None or getattr(frame, "size", 0) == 0:
+        return None
+
+    height, width = frame.shape[:2]
+    scale = min(1.0, 900 / width, 650 / height)
+    display = cv2.resize(frame, (int(width * scale), int(height * scale))) if scale != 1 else frame
+    rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
+    try:
+        from PIL import Image, ImageTk
+        image = ImageTk.PhotoImage(Image.fromarray(rgb))
+    except Exception:
+        messagebox.showerror("Скриншот", "Для выбора рамки нужен Pillow", parent=parent)
+        return None
+
+    win = tk.Toplevel(parent)
+    win.title(str(prompt))
+    win.transient(parent)
+    canvas = tk.Canvas(win, width=display.shape[1], height=display.shape[0], cursor="crosshair")
+    canvas.pack(padx=8, pady=8)
+    canvas.create_image(0, 0, anchor="nw", image=image)
+    canvas.image = image
+    state: dict[str, Any] = {"start": None, "rect": None, "result": None}
+
+    def down(event):
+        state["start"] = (max(0, min(event.x, canvas.winfo_width())), max(0, min(event.y, canvas.winfo_height())))
+        if state["rect"]:
+            canvas.delete(state["rect"])
+        state["rect"] = canvas.create_rectangle(*state["start"], *state["start"], outline="red", width=2)
+
+    def move(event):
+        if state["start"] and state["rect"]:
+            canvas.coords(state["rect"], state["start"][0], state["start"][1], event.x, event.y)
+
+    canvas.bind("<ButtonPress-1>", down)
+    canvas.bind("<B1-Motion>", move)
+
+    def save():
+        if not state["start"] or not state["rect"]:
+            return
+        x1, y1, x2, y2 = canvas.coords(state["rect"])
+        left, right = sorted((int(x1 / scale), int(x2 / scale)))
+        top, bottom = sorted((int(y1 / scale), int(y2 / scale)))
+        left, top = max(0, left), max(0, top)
+        right, bottom = min(width, right), min(height, bottom)
+        if right <= left or bottom <= top:
+            return
+        state["result"] = (frame[top:bottom, left:right].copy(), (left, top, right, bottom))
+        win.destroy()
+
+    buttons = ttk.Frame(win)
+    buttons.pack(fill="x", padx=8, pady=(0, 8))
+    ttk.Button(buttons, text="Сохранить", command=save).pack(side="left")
+    ttk.Button(buttons, text="Отмена", command=win.destroy).pack(side="right")
+    win.grab_set()
+    win.wait_window()
+    return state["result"]
+
+
+def _write_png(crop: Any, prefix: str) -> str:
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    path = BASE_DIR / f"{prefix}_{stamp}_{time.time_ns() % 1000000:06d}.png"
+    if cv2 is None or not cv2.imwrite(str(path), crop):
+        raise RuntimeError(f"Не удалось сохранить PNG: {path}")
+    return str(path.as_posix())
+
+
+class NavigationTab(ttk.Frame):
+    """Step-by-step, click-free teaching UI for base navigation."""
+    def __init__(self, parent, app):
+        super().__init__(parent, padding=12)
+        self.app = app
+        self.data = _load_nav()
+        self.location_vars = [tk.StringVar(value=x.get("name", "")) for x in self.data["locations"]]
+        self.status_vars = [tk.StringVar(value="✓" if x.get("png") else "✗") for x in self.data["locations"]]
+        self.floor_location = tk.StringVar(value="1")
+        self._build()
+
+    def _build(self):
+        ttk.Label(self, text="Базовые знания", font=("TkDefaultFont", 15, "bold")).pack(anchor="w")
+        ttk.Label(self, text="Откройте нужный экран в эмуляторе, выделите рамкой элемент и сохраните.").pack(anchor="w", pady=(2, 10))
+        ttk.Button(self, text="Назначить вход в локации", command=self._base_to_locations).pack(anchor="w", pady=3)
+        self.base_status = ttk.Label(self, text="✓" if self.data["base_to_locations"].get("png") else "✗")
+        self.base_status.pack(anchor="w")
+
+        loc_box = ttk.LabelFrame(self, text="7 локаций")
+        loc_box.pack(fill="x", pady=8)
+        for i in range(7):
+            row = ttk.Frame(loc_box)
+            row.pack(fill="x", pady=2)
+            ttk.Label(row, text=f"{i + 1}.", width=3).pack(side="left")
+            ttk.Entry(row, textvariable=self.location_vars[i], width=24).pack(side="left", padx=3)
+            ttk.Button(row, text="Привязать к скриншоту", command=lambda n=i: self._bind_location(n)).pack(side="left", padx=3)
+            ttk.Label(row, textvariable=self.status_vars[i], width=3).pack(side="left")
+
+        floor_box = ttk.LabelFrame(self, text="Этаж")
+        floor_box.pack(fill="x", pady=8)
+        ttk.Label(floor_box, text="Локация:").pack(side="left", padx=4)
+        ttk.Combobox(floor_box, textvariable=self.floor_location, values=[str(i) for i in range(1, 8)], state="readonly", width=5).pack(side="left")
+        ttk.Button(floor_box, text="Добавить этаж", command=self._add_floor).pack(side="left", padx=8)
+        self.floor_list = tk.Listbox(floor_box, height=5, width=45)
+        self.floor_list.pack(side="left", padx=4)
+        self._refresh_floors()
+
+        ttk.Button(self, text="Назначить кнопку В данж", command=self._enter_dungeon).pack(anchor="w", pady=4)
+        ttk.Button(self, text="Проверить цепочку", command=self._check_chain).pack(anchor="w", pady=4)
+
+    def _capture_and_save(self, prompt: str, prefix: str) -> str | None:
+        selected = capture_region(self, prompt)
+        if selected is None:
+            return None
         try:
-            from bot.config import load_config
-            self.config = load_config(config_path)
-            load_base_knowledge(self.config)
+            return _write_png(selected[0], prefix)
         except Exception as exc:
-            self._knowledge_error = str(exc)
-        else:
-            self._knowledge_error = ""
+            messagebox.showerror("Сохранение", str(exc), parent=self)
+            return None
 
-        container = ttk.Frame(self.window, padding=16)
-        container.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(container, text="Базовые знания", font=("TkDefaultFont", 16, "bold")).pack(anchor=tk.W)
-        ttk.Label(container, text="Обучение выполняется без кликов: откройте нужный экран в LDPlayer и нажмите «Обучить».", wraplength=700).pack(anchor=tk.W, pady=(5, 12))
-        if self._knowledge_error:
-            ttk.Label(container, text=f"Профиль base пока не готов: {self._knowledge_error}", foreground="darkorange", wraplength=700).pack(anchor=tk.W, pady=(0, 8))
+    def _base_to_locations(self):
+        png = self._capture_and_save("Выделите кнопку перехода к локациям", "base_to_locations")
+        if png:
+            self.data["base_to_locations"] = {"png": png}
+            _save_nav(self.data)
+            self.base_status.config(text="✓")
 
-        self.tree = ttk.Treeview(container, columns=("status", "instruction"), show="headings", selectmode="browse")
-        self.tree.heading("status", text="Состояние")
-        self.tree.heading("instruction", text="Что открыть в LDPlayer")
-        self.tree.column("status", width=130, anchor=tk.CENTER)
-        self.tree.column("instruction", width=540)
-        self.tree.pack(fill=tk.BOTH, expand=True)
-        self.tree.bind("<<TreeviewSelect>>", self._on_select)
-        for key, title, instruction in LESSONS:
-            self.tree.insert("", tk.END, iid=key, values=(self._status(key), f"{title}: {instruction}"))
+    def _bind_location(self, index: int):
+        png = self._capture_and_save(f"Локация {index + 1}: выделите иконку", f"location_{index + 1:02d}")
+        if png:
+            item = self.data["locations"][index]
+            item.update(slot=index + 1, name=self.location_vars[index].get().strip(), png=png)
+            _save_nav(self.data)
+            self.status_vars[index].set("✓")
 
-        self.selected = tk.StringVar()
-        ttk.Label(container, textvariable=self.selected, wraplength=700).pack(anchor=tk.W, pady=(10, 6))
-        buttons = ttk.Frame(container)
-        buttons.pack(fill=tk.X)
-        self.teach_button = ttk.Button(buttons, text="Обучить выбранный пункт", command=self._teach_selected)
-        self.teach_button.pack(side=tk.LEFT)
-        ttk.Button(buttons, text="Обновить состояние", command=self._refresh).pack(side=tk.LEFT, padx=8)
-        ttk.Button(buttons, text="Закрыть", command=self.window.destroy).pack(side=tk.RIGHT)
-
-    def _status(self, key: str) -> str:
-        return "Обучено" if self.state.get(key) else "Не обучено"
-
-    def _on_select(self, _event: object = None) -> None:
-        selection = self.tree.selection()
-        if not selection:
-            self.selected.set("Выберите пункт обучения.")
+    def _add_floor(self):
+        index = int(self.floor_location.get()) - 1
+        name = tk.simpledialog.askstring("Этаж", "Название этажа:", parent=self) if hasattr(tk, "simpledialog") else None
+        if not name:
+            from tkinter import simpledialog
+            name = simpledialog.askstring("Этаж", "Название этажа:", parent=self)
+        if not name:
             return
-        key = selection[0]
-        item = next(item for item in LESSONS if item[0] == key)
-        self.selected.set(f"{item[1]}\n{item[2]}")
+        png = self._capture_and_save("Выделите шаблон экрана этажа", f"location_{index + 1:02d}_floor")
+        if png:
+            self.data["locations"][index].setdefault("floors", []).append({"name": name.strip(), "png": png})
+            _save_nav(self.data)
+            self._refresh_floors()
 
-    def _refresh(self) -> None:
-        self.state = _load_state(self.config)
-        for key, _, _ in LESSONS:
-            self.tree.set(key, "status", self._status(key))
+    def _refresh_floors(self):
+        if not hasattr(self, "floor_list"):
+            return
+        self.floor_list.delete(0, tk.END)
+        floors = self.data["locations"][int(self.floor_location.get()) - 1].get("floors", [])
+        for floor in floors:
+            self.floor_list.insert(tk.END, f"{floor.get('name', '')}: {floor.get('png', '')}")
 
-    def _teach_selected(self) -> None:
-        selection = self.tree.selection()
-        if not selection:
-            messagebox.showinfo("Базовые знания", "Сначала выберите пункт обучения.", parent=self.window)
-            return
-        key = selection[0]
-        if self.state.get(key) and not messagebox.askyesno("Повторное обучение", "Этот пункт уже обучен. Повторить обучение?", parent=self.window):
-            return
-        if self._knowledge_error:
-            messagebox.showerror("Базовые знания", "Нельзя начать обучение: профиль base не найден или повреждён.", parent=self.window)
-            return
-        command = [sys.executable, "main.py", "--teach-only", "--profile", "base", "--config", self.config_path, "--base-lesson", key]
+    def _enter_dungeon(self):
+        png = self._capture_and_save("Выделите кнопку В данж", "enter_dungeon")
+        if png:
+            self.data["enter_dungeon"] = {"png": png}
+            _save_nav(self.data)
+
+    def _check_chain(self):
         try:
-            result = subprocess.run(command, cwd=Path(__file__).resolve().parent, check=False)
-        except OSError as exc:
-            messagebox.showerror("Обучение", f"Не удалось запустить main.py: {exc}", parent=self.window)
-            return
-        if result.returncode == 0:
-            self.state[key] = True
-            _save_state(self.state, self.config)
-            self.tree.set(key, "status", "Обучено")
-            messagebox.showinfo("Обучение", "Пункт успешно обучен в общем профиле base.", parent=self.window)
-        else:
-            messagebox.showerror("Обучение", f"main.py завершился с кодом {result.returncode}.", parent=self.window)
+            import nav
+            checker = getattr(nav, "check_chain", None)
+            if callable(checker):
+                result = checker()
+                messagebox.showinfo("Проверка цепочки", str(result), parent=self)
+            else:
+                messagebox.showinfo("Проверка цепочки", "Функция проверки цепочки в nav.py не найдена.", parent=self)
+        except Exception as exc:
+            messagebox.showerror("Проверка цепочки", str(exc), parent=self)
 
 
-def open_base_window(master: tk.Misc | None = None, config_path: str = "config.yaml") -> BaseKnowledgeWindow:
-    """Open the window expected by ``gui.py`` and return its controller."""
-    if master is None:
-        master = tk._get_default_root() or tk.Tk()
-    return BaseKnowledgeWindow(master, config_path=config_path)
+def create_base_view(parent, on_location_selected: Callable[[str], None], on_back=None):
+    return render_base_screen(parent, on_location_selected, on_back)
 
 
-# Compatibility aliases for callers that use a verb-oriented name.
-launch_base_window = open_base_window
+def render_base_screen(parent, on_location_selected: Callable[[str], None], on_back=None):
+    frame = ttk.Frame(parent, padding=12)
+    ttk.Label(frame, text="Главная база", font=("TkDefaultFont", 15, "bold")).pack(anchor="w")
+    ttk.Button(frame, text="Перейти к выбору локации", command=lambda: on_location_selected("location_select")).pack(anchor="w", pady=8)
+    for item in location_button_data():
+        ttk.Button(frame, text=item["title"], command=lambda x=item["location_id"]: on_location_selected(x)).pack(anchor="w", pady=2)
+    if on_back:
+        ttk.Button(frame, text="Назад", command=on_back).pack(anchor="w", pady=8)
+    return frame
 
-__all__ = [
-    "BaseKnowledgeWindow", "base_profile_dir", "load_base_knowledge",
-    "validate_base_knowledge", "get_location_icon", "resolve_template_path",
-    "open_base_window", "launch_base_window",
-]
+
+def location_button_data() -> tuple[dict, ...]:
+    return tuple({"location_id": f"loc{i}", "index": i, "title": f"Локация {i}"} for i in range(1, 8))
+
+
+def on_location_selected(location_id: str) -> None:
+    """Callback placeholder; the application supplies the real callback."""
+    return None
+
+
+__all__ = ["capture_region", "NavigationTab", "create_base_view", "render_base_screen", "location_button_data"]
