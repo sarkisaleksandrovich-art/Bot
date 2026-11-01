@@ -1,451 +1,108 @@
-# Главный конфиг бота.
-# Ниже только те ключи, которые реально читают уже показанные модули:
-# bot/config.py, bot/logging_setup.py, bot/vision.py, bot/safety.py,
-# bot/knowledge.py, bot/profiles.py.
-
 app:
-  # Имя приложения. Используется в логах и имени log-файла.
   name: "dungeon2_bot"
-
-  # Уровень логирования.
-  # Допустимые значения проверяет config.py: DEBUG, INFO, WARNING, ERROR, CRITICAL.
   log_level: "INFO"
-
-  # Базовая папка данных проекта.
-  # Нужна как корень для файлов знаний, прогресса и скриншотов.
   data_dir: "./data"
-
-  # Папка профилей. Сейчас код проверяет и создаёт её, даже если профили лежат в YAML.
-  profiles_dir: "./profiles"
-
-  # Куда сохранять скриншоты в режиме capture и отладке.
-  screenshots_dir: "./data/screenshots"
-
-  # Временная папка. logging_setup.py кладёт сюда log-файл.
+  captures_dir: "./data/captures"
   temp_dir: "./data/tmp"
 
 adb:
-  # Serial устройства/emulator для ADB.
-  # Пустая строка означает: попытаться автоматически найти единственное подключённое устройство.
-  serial: ""
+  device_serial: "127.0.0.1:5555"
+  command_timeout_s: 15.0
+  connect_timeout_s: 10.0
+  adb_path: ""
+  post_tap_delay_ms: 250
+  post_swipe_delay_ms: 400
+  post_keyevent_delay_ms: 200
 
-  # Путь к adb.exe или adb.
-  # Для Windows можно заменить на полный путь, например C:/Android/platform-tools/adb.exe.
-  adb_path: "adb.exe"
-
-  # Таймаут выполнения одной ADB-команды в секундах.
-  exec_timeout_s: 15
-
-  # Подключаться ли к устройству сразу при старте приложения.
-  # Этот ключ валидируется config.py, даже если другие модули пока могут его не использовать напрямую.
-  connect_on_start: false
-
-  # Разрешено ли кэшировать разрешение экрана устройства.
-  # Тоже обязателен по валидации config.py.
-  device_resolution_cache: true
-
-game:
-  # Название игры. knowledge.py записывает его в rules.json.
-  name: "Выживание в подземелье 2"
-
-  # Размер команды. Сейчас это просто параметр модели игры в конфиге.
-  team_size: 4
-
-  # Количество локаций. profiles.py ориентируется на 7 профилей loc1..loc7.
-  locations_count: 7
-
-  # Сколько этажей максимум в одной локации.
-  floors_per_location: 100
-
-  # Сколько случайных подэтажей/подуровней может быть на уровень.
-  random_subfloors_per_level: 7
-
-  # Политика прохождения: заходить во все двери.
-  enter_all_doors: true
-
-  # Политика прохождения: комнату зачищать сразу после входа.
-  clear_room_immediately: true
-
-  # Политика прохождения: события пропускать выходом, а не запускать.
-  skip_events_by_exit: true
-
-  # Политика прохождения: не возвращаться в уже открытые комнаты.
-  never_return_to_opened_rooms: true
-
-  # Политика прохождения: использовать только авто-бой.
-  auto_battle_only: true
-
-  # Есть ли в игре энергия. Если механика не используется, оставляем false.
-  has_energy_system: false
-
-  # Переход на следующий этаж разрешён только по обученному шаблону next_floor.
-  use_next_floor_template_only: true
+screen:
+  expected_width: 1280
+  expected_height: 720
+  capture_format: "png"
+  rotation: 0
 
 motion:
-  # Сколько почти одинаковых кадров подряд нужно, чтобы экран считался стабильным.
   stable_frames: 3
-
-  # Порог различия между соседними уменьшенными кадрами.
-  # vision.py считает mean absdiff в диапазоне примерно [0..1].
-  stable_diff_threshold: 0.015
-
-  # Пауза между проверками стабильности экрана, в миллисекундах.
-  stable_poll_ms: 350
-
-  # Максимальное время одной попытки ожидания стабильного экрана, в секундах.
+  stable_diff_threshold: 2.5
+  stable_poll_ms: 250
   stable_timeout_s: 8.0
-
-  # Сколько раз повторять ожидание стабильности, если с первой попытки экран не успокоился.
   max_stable_retries: 2
-
-  # Размер уменьшенной копии кадра для сравнения движения.
-  # Формат: [ширина, высота].
-  downscale_size: [160, 90]
+  downscale_size: [64, 36]
 
 matching:
-  # Метод OpenCV для matchTemplate.
-  # Сейчас vision.py фактически использует TM_CCOEFF_NORMED,
-  # но knowledge.py и config.py этот ключ читают и валидируют.
-  method: "TM_CCOEFF_NORMED"
-
-  # Порог совпадения по умолчанию для обычных шаблонов.
-  default_threshold: 0.88
-
-  # Порог для классификации экранов room_screen / passage_screen / event_screen.
+  default_threshold: 0.90
   classify_threshold: 0.90
+  method: "TM_CCOEFF_NORMED"
+  grayscale: true
 
-  # Использовать ли ROI из профиля, если для категории он задан.
-  use_profile_rois: true
-
-timings:
-  # Небольшая задержка после скриншота перед тапом, в миллисекундах.
-  tap_after_screenshot_delay_ms: 100
-
-  # Задержка после обычного тапа, в миллисекундах.
-  post_tap_delay_ms: 250
-
-  # Задержка после нажатия Back, в миллисекундах.
-  post_back_delay_ms: 350
-
-  # Задержка после входа в комнату, в миллисекундах.
-  after_room_enter_delay_ms: 300
-
-  # Задержка после выхода из комнаты, в миллисекундах.
-  after_exit_delay_ms: 300
-
-  # Задержка после перехода на следующий этаж, в миллисекундах.
-  next_floor_delay_ms: 500
-
-  # Как часто проверять состояние авто-боя, в миллисекундах.
-  auto_battle_check_interval_ms: 500
-
-  # Максимальное время ожидания боя, в секундах.
-  battle_timeout_s: 180
-
-teaching:
-  # Включён ли режим обучения интерфейса разметки.
-  enabled: true
-
-  # Горячая клавиша паузы для teacher_ui.
+teacher:
   pause_hotkey: "space"
-
-  # Можно ли предлагать обучение пользователю после таймаута нестабильности.
-  allow_teach_on_unstable_timeout: true
-
-  # Текстовая подпись для случая, когда экран так и не стабилизировался.
-  unstable_screen_label: "экран не стабилизировался"
-
-  # Сохранять ли выделенные пользователем фрагменты как шаблоны.
-  save_crops_as_templates: true
-
-  # Сохранять ли полную копию экрана для отладки обучения.
-  save_fullscreen_debug_copy: true
+  knowledge_dir: "./data/knowledge"
+  save_unknown_frames: true
+  unknown_dir: "./data/knowledge/unknown"
 
 safety:
-  # Останавливать ли бота, если найден шаблон danger.
+  block_purchases: true
+  block_ads: true
+  block_pvp: true
   stop_on_danger: true
-
-  # Разрешена ли реклама.
-  # По задаче и для безопасности держим false.
-  allow_ads: false
-
-  # Разрешены ли покупки.
-  # Ключ именно allow_purchase, потому что его читает safety.py.
-  allow_purchase: false
-
-  # Разрешена ли премиум-валюта.
-  allow_premium_currency: false
-
-  # Разрешён ли PvP.
-  allow_pvp: false
-
-  # Совместимость с config.py и safety.py:
-  # старый флаг запрета рекламы.
-  forbid_ads: true
-
-  # Совместимость с config.py и safety.py:
-  # старый флаг запрета покупок.
-  forbid_purchases: true
-
-  # Совместимость с config.py и safety.py:
-  # старый флаг запрета PvP.
-  forbid_pvp: true
-
-  # Минимальная пауза между действиями бота, в миллисекундах.
-  min_action_interval_ms: 250
-
-  # Нижняя граница случайной дополнительной задержки, в миллисекундах.
-  random_delay_min_ms: 0
-
-  # Верхняя граница случайной дополнительной задержки, в миллисекундах.
-  random_delay_max_ms: 0
-
-  # Сколько подряд сетевых ошибок можно пережить до аварийной остановки.
-  max_consecutive_network_errors: 3
-
-storage:
-  # Файл базы правил и шаблонов.
-  rules_file: "./data/rules.json"
-
-  # Файл кэша признаков шаблонов.
-  features_file: "./data/features.json"
-
-  # Общий файл прогресса запуска.
-  progress_file: "./data/progress.json"
-
-  # Папка, где будут лежать floor_state.json по этажам.
-  floor_state_dir: "./data/floors"
-
-  # Папка, где knowledge.py хранит шаблоны по профилям.
-  knowledge_dir: "./data/knowledge"
-
-  # Делать ли резервные копии JSON-файлов перед перезаписью.
-  backups_enabled: true
-
-  # Использовать ли атомарную запись через временный файл и os.replace().
-  atomic_write: true
+  enforce_safe_actions: false
 
 profiles:
-  # Профиль по умолчанию, если в CLI не передали --profile.
-  active: "loc1"
+  active: "default"
+  items:
+    default:
+      name: "default"
+      rois:
+        party_marker: [0, 0, 1280, 720]
+        room_open_big_icon: [0, 0, 1280, 720]
+        door_search: [0, 0, 1280, 720]
+        room_screen: [0, 0, 1280, 720]
+        passage_screen: [0, 0, 1280, 720]
+        event_screen: [0, 0, 1280, 720]
+        mob: [0, 0, 1280, 720]
+        boss: [0, 0, 1280, 720]
+        loot: [0, 0, 1280, 720]
+        exit: [0, 0, 1280, 720]
+        auto_battle: [0, 0, 1280, 720]
+        next_floor: [0, 0, 1280, 720]
+        danger: [0, 0, 1280, 720]
+      actions:
+        exit_tap: [100, 100]
+        auto_battle_tap: [1100, 650]
+        next_floor_tap: [1180, 660]
+      timings:
+        after_room_enter_ms: 500
+        after_exit_ms: 500
+        after_next_floor_ms: 1000
+        battle_settle_timeout_s: 120.0
 
-  # Список доступных профилей для config.py.
-  # Этот ключ обязателен, потому что его валидирует config.py.
-  available:
-    - "loc1"
-    - "loc2"
-    - "loc3"
-    - "loc4"
-    - "loc5"
-    - "loc6"
-    - "loc7"
+progress:
+  file: "./data/progress.json"
 
-  # Список профилей в формате, который реально читает profiles.py.
-  # Должно быть ровно 7 записей.
-  list:
-    - id: "loc1"
-      name: "loc1"
-    - id: "loc2"
-      name: "loc2"
-    - id: "loc3"
-      name: "loc3"
-    - id: "loc4"
-      name: "loc4"
-    - id: "loc5"
-      name: "loc5"
-    - id: "loc6"
-      name: "loc6"
-    - id: "loc7"
-      name: "loc7"
+knowledge:
+  rules_file: "./data/knowledge/rules.json"
+  features_file: "./data/knowledge/features.json"
 
-  # Диапазоны этажей для каждого профиля.
-  # Их читает profiles.py через profiles.ranges.<profile>.
-  ranges:
-    loc1:
-      # С какого этажа начинать для профиля loc1.
-      floor_from: 1
-      # На каком этаже остановиться для профиля loc1.
-      floor_to: 100
-      # Если true, внешний код может игнорировать частичный диапазон и идти все этажи.
-      run_all_floors: false
-    loc2:
-      floor_from: 1
-      floor_to: 100
-      run_all_floors: false
-    loc3:
-      floor_from: 1
-      floor_to: 100
-      run_all_floors: false
-    loc4:
-      floor_from: 1
-      floor_to: 100
-      run_all_floors: false
-    loc5:
-      floor_from: 1
-      floor_to: 100
-      run_all_floors: false
-    loc6:
-      floor_from: 1
-      floor_to: 100
-      run_all_floors: false
-    loc7:
-      floor_from: 1
-      floor_to: 100
-      run_all_floors: false
+state:
+  dir: "./data/state"
+  floor_state_file_pattern: "floor_{floor_number}.json"
 
-  # Детали профилей.
-  # Здесь оставляем только то, что умеет читать profiles.py,
-  # и не выдумываем координаты/ROI/шаги по игре.
-  details:
-    loc1:
-      # Человекочитаемое имя профиля.
-      display_name: "loc1"
-      # Ширина экрана. null = не задано, бот не должен выдумывать.
-      screen_width: null
-      # Высота экрана. null = не задано.
-      screen_height: null
-      # ROI по категориям. Пусто, пока пользователь не обучил.
-      rois: {}
-      # Локальные пороги по категориям. Пусто, пока не настроено.
-      thresholds: {}
-      # Обученный путь до локации. Пустой список, чтобы не выдумывать нажатия.
-      path_to_location: []
-      # Способ выбора этажа. untrained = ещё не обучено.
-      floor_selection:
-        mode: "untrained"
-        # Координаты кнопки следующего этажа не заданы, потому что их нельзя выдумывать.
-        next_floor_action: null
-        # ROI списка этажей не задан, потому что его нельзя выдумывать.
-        list_roi: null
-        # Координаты свайпа списка этажей не заданы.
-        swipe_start_x: null
-        swipe_start_y: null
-        swipe_end_x: null
-        swipe_end_y: null
-        # Длительность свайпа по умолчанию.
-        swipe_duration_ms: 300
-        # Сколько максимум свайпов можно сделать при поиске этажа.
-        swipe_step_limit: 0
-        # Обученные шаблоны этажей. Пока пусто.
-        floor_templates: []
-    loc2:
-      display_name: "loc2"
-      screen_width: null
-      screen_height: null
-      rois: {}
-      thresholds: {}
-      path_to_location: []
-      floor_selection:
-        mode: "untrained"
-        next_floor_action: null
-        list_roi: null
-        swipe_start_x: null
-        swipe_start_y: null
-        swipe_end_x: null
-        swipe_end_y: null
-        swipe_duration_ms: 300
-        swipe_step_limit: 0
-        floor_templates: []
-    loc3:
-      display_name: "loc3"
-      screen_width: null
-      screen_height: null
-      rois: {}
-      thresholds: {}
-      path_to_location: []
-      floor_selection:
-        mode: "untrained"
-        next_floor_action: null
-        list_roi: null
-        swipe_start_x: null
-        swipe_start_y: null
-        swipe_end_x: null
-        swipe_end_y: null
-        swipe_duration_ms: 300
-        swipe_step_limit: 0
-        floor_templates: []
-    loc4:
-      display_name: "loc4"
-      screen_width: null
-      screen_height: null
-      rois: {}
-      thresholds: {}
-      path_to_location: []
-      floor_selection:
-        mode: "untrained"
-        next_floor_action: null
-        list_roi: null
-        swipe_start_x: null
-        swipe_start_y: null
-        swipe_end_x: null
-        swipe_end_y: null
-        swipe_duration_ms: 300
-        swipe_step_limit: 0
-        floor_templates: []
-    loc5:
-      display_name: "loc5"
-      screen_width: null
-      screen_height: null
-      rois: {}
-      thresholds: {}
-      path_to_location: []
-      floor_selection:
-        mode: "untrained"
-        next_floor_action: null
-        list_roi: null
-        swipe_start_x: null
-        swipe_start_y: null
-        swipe_end_x: null
-        swipe_end_y: null
-        swipe_duration_ms: 300
-        swipe_step_limit: 0
-        floor_templates: []
-    loc6:
-      display_name: "loc6"
-      screen_width: null
-      screen_height: null
-      rois: {}
-      thresholds: {}
-      path_to_location: []
-      floor_selection:
-        mode: "untrained"
-        next_floor_action: null
-        list_roi: null
-        swipe_start_x: null
-        swipe_start_y: null
-        swipe_end_x: null
-        swipe_end_y: null
-        swipe_duration_ms: 300
-        swipe_step_limit: 0
-        floor_templates: []
-    loc7:
-      display_name: "loc7"
-      screen_width: null
-      screen_height: null
-      rois: {}
-      thresholds: {}
-      path_to_location: []
-      floor_selection:
-        mode: "untrained"
-        next_floor_action: null
-        list_roi: null
-        swipe_start_x: null
-        swipe_start_y: null
-        swipe_end_x: null
-        swipe_end_y: null
-        swipe_duration_ms: 300
-        swipe_step_limit: 0
-        floor_templates: []
+exploration:
+  default_floor_from: 1
+  default_floor_to: 100
+  enter_all_doors: true
+  skip_events_by_exit: true
+  revisit_open_rooms: false
+  max_attempts_per_door: 1
+
+# добавлены по задаче как обязательные присутствующие ключи
+# даже если текущий код их не читает напрямую
+
+game:
+  current_location: ""
+  current_level: 1
 
 debug:
-  # Сохранять ли сырые скриншоты без обработки.
-  save_raw_screenshots: false
-
-  # Сохранять ли примеры кадров для отладки стабилизации.
-  save_stability_samples: false
-
-  # Сохранять ли картинки с нарисованными совпадениями шаблонов.
-  save_match_visualization: false
-
-  # Тестовый режим без реальных действий.
-  dry_run: false
+  save_every_capture: false
+  save_matched_frames: false
+  annotate_matches: false
