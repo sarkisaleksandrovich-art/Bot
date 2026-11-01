@@ -8,14 +8,14 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
-from typing import Any
+from typing import Any, Callable
 
-
-BOT_ACTIONS: tuple[tuple[str, str], ...] = (
-    ("Проверка", "--check"),
-    ("Скриншот", "--capture"),
-    ("Обучение", "--teach"),
-    ("Обучение без кликов", "--teach-only"),
+BOT_ACTIONS: tuple[tuple[str, str, bool], ...] = (
+    ("Проверка", "--check", False),
+    ("Скриншот", "--capture", False),
+    ("Обучение", "--teach", True),
+    ("Обучение без кликов", "--teach-only", True),
+    ("Список профилей", "--list-profiles", False),
 )
 
 
@@ -25,14 +25,26 @@ class MissingTab(ttk.Frame):
     def __init__(self, parent: tk.Misc, title: str, message: str) -> None:
         super().__init__(parent, padding=12)
         ttk.Label(self, text=title, font=("TkDefaultFont", 11, "bold")).pack(anchor=tk.W)
-        ttk.Label(self, text=message, foreground="red", wraplength=900, justify=tk.LEFT).pack(
-            anchor=tk.W,
-            pady=(8, 0),
-        )
+        ttk.Label(
+            self,
+            text=message,
+            foreground="red",
+            wraplength=900,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(8, 0))
+
+
+class PlaceholderTab(ttk.Frame):
+    """Simple tab used when a module exists but does not expose the required Frame class."""
+
+    def __init__(self, parent: tk.Misc, title: str, message: str) -> None:
+        super().__init__(parent, padding=12)
+        ttk.Label(self, text=title, font=("TkDefaultFont", 11, "bold")).pack(anchor=tk.W)
+        ttk.Label(self, text=message, wraplength=900, justify=tk.LEFT).pack(anchor=tk.W, pady=(8, 0))
 
 
 class BotTab(ttk.Frame):
-    """Main bot control tab: runs main.py with only real CLI flags."""
+    """Main bot control tab: runs main.py with only real CLI flags from main.py."""
 
     def __init__(self, parent: tk.Misc, app: "GuiApp") -> None:
         super().__init__(parent, padding=12)
@@ -65,22 +77,17 @@ class BotTab(ttk.Frame):
         buttons_row = ttk.Frame(controls)
         buttons_row.pack(fill=tk.X)
 
-        for title, flag in BOT_ACTIONS:
+        for title, flag, needs_profile in BOT_ACTIONS:
             button = ttk.Button(
                 buttons_row,
                 text=title,
-                command=lambda current_flag=flag: self.app.run_main([current_flag]),
+                command=lambda current_flag=flag, current_needs_profile=needs_profile: self.app.run_main(
+                    [current_flag],
+                    with_profile=current_needs_profile,
+                ),
             )
             button.pack(side=tk.LEFT, padx=(0, 8))
             self.app.start_buttons.append(button)
-
-        list_button = ttk.Button(
-            buttons_row,
-            text="Список профилей",
-            command=lambda: self.app.run_main(["--list-profiles"], with_profile=False),
-        )
-        list_button.pack(side=tk.LEFT, padx=(0, 8))
-        self.app.start_buttons.append(list_button)
 
         self.app.stop_button = ttk.Button(
             buttons_row,
@@ -131,6 +138,7 @@ class GuiApp:
         self._poll_log_queue()
 
     def _build_ui(self) -> None:
+        self._build_menu()
         main = ttk.Frame(self.root, padding=10)
         main.pack(fill=tk.BOTH, expand=True)
 
@@ -138,93 +146,63 @@ class GuiApp:
         notebook.pack(fill=tk.BOTH, expand=True)
         self.notebook = notebook
 
+    def _build_menu(self) -> None:
+        menu = tk.Menu(self.root)
+        profile_menu = tk.Menu(menu, tearoff=False)
+        profile_menu.add_command(label="Выбор профиля", command=self.open_profile_picker)
+        menu.add_cascade(label="Профиль", menu=profile_menu)
+        self.root.config(menu=menu)
+
     def _mount_tabs(self) -> None:
-        self._add_navigation_tab()
-        self._add_memory_tab()
-        self._add_farm_tab()
-        self._add_bot_tab()
+        self._add_tab(
+            title="Навигация",
+            module_name="gui_base",
+            class_name="NavigationTab",
+            fallback_message_missing="Модуль gui_base.py не найден. Вкладка навигации недоступна.",
+            fallback_message_contract="В gui_base.py не найден класс NavigationTab(parent, app).",
+        )
+        self._add_tab(
+            title="Память",
+            module_name="gui_memory",
+            class_name="MemoryTab",
+            fallback_message_missing="Модуль gui_memory.py не найден. Вкладка памяти недоступна.",
+            fallback_message_contract="В gui_memory.py не найден класс MemoryTab(parent, app).",
+        )
+        self._add_tab(
+            title="Фарм",
+            module_name="gui_farm",
+            class_name="FarmTab",
+            fallback_message_missing="Модуль gui_farm.py не найден. Вкладка фарма недоступна.",
+            fallback_message_contract="В gui_farm.py не найден класс FarmTab(parent, app).",
+        )
+        self.notebook.add(BotTab(self.notebook, self), text="Бот")
 
-    def _add_navigation_tab(self) -> None:
+    def _add_tab(
+        self,
+        *,
+        title: str,
+        module_name: str,
+        class_name: str,
+        fallback_message_missing: str,
+        fallback_message_contract: str,
+    ) -> None:
+        tab: ttk.Frame
         try:
-            from gui_base import NavigationTab  # type: ignore
+            module = __import__(module_name, fromlist=[class_name])
         except ModuleNotFoundError:
-            tab: ttk.Frame = MissingTab(
-                self.notebook,
-                "Навигация",
-                "Модуль gui_base.py не найден. Вкладка навигации недоступна.",
-            )
+            tab = MissingTab(self.notebook, title, fallback_message_missing)
         except ImportError as exc:
-            tab = MissingTab(
-                self.notebook,
-                "Навигация",
-                f"Не удалось импортировать NavigationTab из gui_base.py: {exc}",
-            )
+            tab = MissingTab(self.notebook, title, f"Не удалось импортировать {class_name} из {module_name}.py: {exc}")
         else:
-            try:
-                tab = NavigationTab(self.notebook, self)
-            except Exception as exc:
-                tab = MissingTab(
-                    self.notebook,
-                    "Навигация",
-                    f"Ошибка создания NavigationTab(parent, app): {exc}",
-                )
-        self.notebook.add(tab, text="Навигация")
-
-    def _add_memory_tab(self) -> None:
-        try:
-            from gui_memory import MemoryTab  # type: ignore
-        except ModuleNotFoundError:
-            tab: ttk.Frame = MissingTab(
-                self.notebook,
-                "Память",
-                "Модуль gui_memory.py не найден. Вкладка памяти недоступна.",
-            )
-        except ImportError as exc:
-            tab = MissingTab(
-                self.notebook,
-                "Память",
-                f"Не удалось импортировать MemoryTab из gui_memory.py: {exc}",
-            )
-        else:
-            try:
-                tab = MemoryTab(self.notebook, self)
-            except Exception as exc:
-                tab = MissingTab(
-                    self.notebook,
-                    "Память",
-                    f"Ошибка создания MemoryTab(parent, app): {exc}",
-                )
-        self.notebook.add(tab, text="Память")
-
-    def _add_farm_tab(self) -> None:
-        try:
-            from gui_farm import FarmTab  # type: ignore
-        except ModuleNotFoundError:
-            tab: ttk.Frame = MissingTab(
-                self.notebook,
-                "Фарм",
-                "Модуль gui_farm.py не найден. Вкладка фарма недоступна.",
-            )
-        except ImportError as exc:
-            tab = MissingTab(
-                self.notebook,
-                "Фарм",
-                f"Не удалось импортировать FarmTab из gui_farm.py: {exc}",
-            )
-        else:
-            try:
-                tab = FarmTab(self.notebook, self)
-            except Exception as exc:
-                tab = MissingTab(
-                    self.notebook,
-                    "Фарм",
-                    f"Ошибка создания FarmTab(parent, app): {exc}",
-                )
-        self.notebook.add(tab, text="Фарм")
-
-    def _add_bot_tab(self) -> None:
-        tab = BotTab(self.notebook, self)
-        self.notebook.add(tab, text="Бот")
+            tab_class = getattr(module, class_name, None)
+            if tab_class is None:
+                tab = PlaceholderTab(self.notebook, title, fallback_message_contract)
+            else:
+                try:
+                    tab = tab_class(self.notebook, self)
+                except Exception as exc:
+                    tab = MissingTab(self.notebook, title, f"Ошибка создания {class_name}(parent, app): {exc}")
+        self.notebook.add(tab, text=title)
 
     def reload_profiles(self) -> None:
         profiles_root = self.project_dir / "data" / "profiles"
@@ -245,6 +223,13 @@ class GuiApp:
             self.profile_var.set(profiles[0])
 
         self.log(f"[GUI] Профили обновлены: {', '.join(profiles)}")
+
+    def open_profile_picker(self) -> None:
+        if self.notebook.tabs():
+            self.notebook.select(self.notebook.tabs()[-1])
+        if self.profile_combo is not None:
+            self.profile_combo.focus_set()
+        self.log("[GUI] Открыт выбор профиля.")
 
     def on_profile_selected(self, _event: object | None = None) -> None:
         del _event
@@ -377,6 +362,34 @@ class GuiApp:
     def run(self) -> int:
         self.root.mainloop()
         return self.exit_code
+
+
+def start_farm_navigation(location_id: str, floor_number: int) -> Any:
+    """Delegate farm navigation to NavigationController without duplicating ADB/template logic."""
+    try:
+        from bot.config import load_config
+        from bot.logging_setup import setup_logging
+        from bot.adb_controller import ADBController
+        from bot.screenshot import ScreenshotProvider
+        from bot.vision import VisionEngine
+        from nav import NavigationController
+    except Exception as exc:
+        raise RuntimeError(f"Не удалось подготовить навигацию: {exc}") from exc
+
+    config = load_config("config.yaml")
+    logger = setup_logging(config)
+    adb = ADBController(config, logger)
+    screenshot = ScreenshotProvider(adb, config, logger)
+    vision = VisionEngine(config, logger)
+    adb.connect()
+    controller = NavigationController(
+        adb=adb,
+        screenshot=screenshot,
+        vision=vision,
+        base_dir=config.base_dir,
+        logger=logger,
+    )
+    return controller.navigate_from_current_screen(location_id=location_id, floor_number=floor_number)
 
 
 def launch_gui(profile: str | None = None) -> int:
