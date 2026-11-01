@@ -2,342 +2,377 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import yaml
 
 
 class ConfigError(Exception):
-    ...
+    pass
 
 
-_MISSING = object()
-
-
-@dataclass(frozen=True)
-class Config:
-    raw: dict[str, Any]
-    path: Path
-
-    def get(self, dotted_key: str, default: Any = None) -> Any:
-        """
-        Возвращает значение по пути вида 'motion.stable_frames'.
-        Если ключ отсутствует и default не передан, возвращает None.
-        Исключения:
-            - ConfigError: если dotted_key пустой или структура не словарь там, где ожидается.
-        """
-        if not dotted_key or not dotted_key.strip():
-            raise ConfigError("dotted_key must be a non-empty string")
-
-        current: Any = self.raw
-        for part in dotted_key.split("."):
-            if not isinstance(current, Mapping):
-                raise ConfigError(
-                    f"expected mapping while traversing '{dotted_key}', got {type(current).__name__}"
-                )
-            if part not in current:
-                return default
-            current = current[part]
-        return current
-
-
-_REQUIRED_TOP_LEVEL_SECTIONS: tuple[str, ...] = (
+_REQUIRED_SECTIONS: tuple[str, ...] = (
     "app",
     "adb",
-    "game",
+    "capture",
     "motion",
-    "matching",
-    "timings",
-    "teaching",
-    "safety",
-    "storage",
+    "vision",
+    "teacher",
+    "knowledge",
     "profiles",
+    "game",
+    "safety",
+    "timeouts",
+    "input",
     "debug",
 )
 
-
-_REQUIRED_KEYS: dict[str, type | tuple[type, ...]] = {
-    "app.name": str,
-    "app.log_level": str,
-    "app.data_dir": str,
-    "app.profiles_dir": str,
-    "app.screenshots_dir": str,
-    "app.temp_dir": str,
-    "adb.serial": str,
-    "adb.adb_path": str,
-    "adb.exec_timeout_s": (int, float),
-    "adb.connect_on_start": bool,
-    "adb.device_resolution_cache": bool,
-    "game.name": str,
-    "game.team_size": int,
-    "game.locations_count": int,
-    "game.floors_per_location": int,
-    "game.random_subfloors_per_level": int,
-    "game.enter_all_doors": bool,
-    "game.clear_room_immediately": bool,
-    "game.skip_events_by_exit": bool,
-    "game.never_return_to_opened_rooms": bool,
-    "game.auto_battle_only": bool,
-    "game.has_energy_system": bool,
-    "game.use_next_floor_template_only": bool,
-    "motion.stable_frames": int,
-    "motion.stable_diff_threshold": (int, float),
-    "motion.stable_poll_ms": int,
-    "motion.stable_timeout_s": (int, float),
-    "motion.max_stable_retries": int,
-    "matching.method": str,
-    "matching.default_threshold": (int, float),
-    "matching.classify_threshold": (int, float),
-    "matching.use_profile_rois": bool,
-    "timings.tap_after_screenshot_delay_ms": int,
-    "timings.post_tap_delay_ms": int,
-    "timings.post_back_delay_ms": int,
-    "timings.after_room_enter_delay_ms": int,
-    "timings.after_exit_delay_ms": int,
-    "timings.next_floor_delay_ms": int,
-    "timings.auto_battle_check_interval_ms": int,
-    "timings.battle_timeout_s": (int, float),
-    "teaching.enabled": bool,
-    "teaching.pause_hotkey": str,
-    "teaching.allow_teach_on_unstable_timeout": bool,
-    "teaching.unstable_screen_label": str,
-    "teaching.save_crops_as_templates": bool,
-    "teaching.save_fullscreen_debug_copy": bool,
-    "safety.stop_on_danger": bool,
-    "safety.forbid_purchases": bool,
-    "safety.forbid_ads": bool,
-    "safety.forbid_pvp": bool,
-    "safety.min_action_interval_ms": int,
-    "storage.rules_file": str,
-    "storage.features_file": str,
-    "storage.progress_file": str,
-    "storage.floor_state_dir": str,
-    "storage.knowledge_dir": str,
-    "storage.backups_enabled": bool,
-    "storage.atomic_write": bool,
-    "profiles.active": str,
-    "profiles.available": list,
-    "debug.save_raw_screenshots": bool,
-    "debug.save_stability_samples": bool,
-    "debug.save_match_visualization": bool,
-    "debug.dry_run": bool,
-}
+_REQUIRED_MOTION_FIELDS: tuple[str, ...] = (
+    "stable_frames",
+    "stable_diff_threshold",
+    "stable_poll_ms",
+    "stable_timeout_s",
+    "max_stable_retries",
+    "downscale_size",
+)
 
 
-def _require_mapping(value: Any, name: str) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping):
-        raise ConfigError(f"section '{name}' must be a mapping")
-    return value
+@dataclass(frozen=True)
+class BotConfig:
+    raw: dict[str, Any]
+
+    @property
+    def base_dir(self) -> Path:
+        source_path = self.raw.get("__source_path")
+        if isinstance(source_path, str) and source_path:
+            return Path(source_path).resolve().parent
+        return Path.cwd()
+
+    @property
+    def data_dir(self) -> Path:
+        return self.resolve_path("app", "data_dir")
+
+    @property
+    def log_dir(self) -> Path:
+        return self.resolve_path("app", "log_dir")
+
+    @property
+    def debug_dir(self) -> Path:
+        return self.resolve_path("vision", "debug_dir")
+
+    @property
+    def templates_dir(self) -> Path:
+        return self.resolve_path("knowledge", "templates_dir")
+
+    @property
+    def profiles_root_dir(self) -> Path:
+        return self.resolve_path("profiles", "root_dir")
+
+    @property
+    def rules_file_name(self) -> str:
+        return str(get_path(self, "app", "rules_file"))
+
+    @property
+    def features_file_name(self) -> str:
+        return str(get_path(self, "app", "features_file"))
+
+    @property
+    def progress_file_name(self) -> str:
+        return str(get_path(self, "app", "progress_file"))
+
+    @property
+    def floor_state_file_name(self) -> str:
+        return str(get_path(self, "app", "floor_state_file"))
+
+    @property
+    def log_level(self) -> str:
+        return str(get_path(self, "app", "log_level")).upper()
+
+    @property
+    def default_match_threshold(self) -> float:
+        return float(get_path(self, "vision", "default_match_threshold"))
+
+    @property
+    def min_roi_area(self) -> int:
+        return int(get_path(self, "vision", "min_roi_area"))
+
+    @property
+    def motion(self) -> dict[str, Any]:
+        return dict(get_path(self, "motion"))
+
+    @property
+    def stable_frames(self) -> int:
+        return int(get_path(self, "motion", "stable_frames"))
+
+    @property
+    def stable_diff_threshold(self) -> float:
+        return float(get_path(self, "motion", "stable_diff_threshold"))
+
+    @property
+    def stable_poll_ms(self) -> int:
+        return int(get_path(self, "motion", "stable_poll_ms"))
+
+    @property
+    def stable_timeout_s(self) -> float:
+        return float(get_path(self, "motion", "stable_timeout_s"))
+
+    @property
+    def max_stable_retries(self) -> int:
+        return int(get_path(self, "motion", "max_stable_retries"))
+
+    @property
+    def downscale_size(self) -> tuple[int, int]:
+        value = get_path(self, "motion", "downscale_size")
+        width, height = _validate_int_pair(value, "motion.downscale_size")
+        return width, height
+
+    @property
+    def min_template_size(self) -> tuple[int, int]:
+        value = get_path(self, "knowledge", "min_template_size")
+        width, height = _validate_int_pair(value, "knowledge.min_template_size")
+        return width, height
+
+    @property
+    def max_template_size(self) -> tuple[int, int]:
+        value = get_path(self, "knowledge", "max_template_size")
+        width, height = _validate_int_pair(value, "knowledge.max_template_size")
+        return width, height
+
+    @property
+    def categories(self) -> list[str]:
+        categories = get_path(self, "knowledge", "categories")
+        if not isinstance(categories, list):
+            raise ConfigError("knowledge.categories must be a list[str]")
+        return [str(item) for item in categories]
+
+    def resolve_path(self, *keys: str) -> Path:
+        value = get_path(self, *keys)
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError(f"{'.'.join(keys)} must be a non-empty path string")
+        path = Path(value)
+        if not path.is_absolute():
+            path = self.base_dir / path
+        return path.resolve()
 
 
-def _require_type(config: Config, key: str, expected_type: type | tuple[type, ...]) -> Any:
-    value = config.get(key, _MISSING)
-    if value is _MISSING:
-        raise ConfigError(f"missing required config key: {key}")
-    if not isinstance(value, expected_type):
-        if expected_type == (int, float) and isinstance(value, bool):
-            raise ConfigError(f"config key '{key}' must be numeric, got bool")
-        expected_name = (
-            ", ".join(t.__name__ for t in expected_type)
-            if isinstance(expected_type, tuple)
-            else expected_type.__name__
-        )
-        raise ConfigError(
-            f"config key '{key}' must be of type {expected_name}, got {type(value).__name__}"
-        )
-    return value
-
-
-def _validate_non_negative_int(name: str, value: int) -> None:
-    if value < 0:
-        raise ConfigError(f"config key '{name}' must be >= 0")
-
-
-def _validate_positive_number(name: str, value: int | float) -> None:
-    if value <= 0:
-        raise ConfigError(f"config key '{name}' must be > 0")
-
-
-def _validate_probability_like(name: str, value: int | float) -> None:
-    if not 0 <= float(value) <= 1:
-        raise ConfigError(f"config key '{name}' must be in range [0, 1]")
-
-
-def _resolve_path(base_dir: Path, value: str) -> Path:
-    path = Path(value).expanduser()
-    if not path.is_absolute():
-        path = (base_dir / path).resolve()
-    return path
-
-
-def load_config(path: str | Path) -> Config:
+def load_config(path: str) -> BotConfig:
     """
-    Загружает YAML-конфиг.
-    Возвращает:
-        Config
-    Исключения:
-        - FileNotFoundError: файл не найден
-        - ConfigError: YAML некорректен или отсутствуют обязательные секции
+    Загружает YAML-конфиг, валидирует обязательные секции и возвращает BotConfig.
+
+    :param path: путь к config.yaml
+    :return: BotConfig
+    :raises FileNotFoundError: если файл не найден
+    :raises ConfigError: если YAML повреждён или отсутствуют обязательные ключи
     """
-    config_path = Path(path).expanduser()
+    config_path = Path(path)
     if not config_path.exists():
-        raise FileNotFoundError(config_path)
+        raise FileNotFoundError(path)
 
     try:
         with config_path.open("r", encoding="utf-8") as fh:
-            data = yaml.safe_load(fh)
+            loaded = yaml.safe_load(fh)
     except yaml.YAMLError as exc:
-        raise ConfigError(f"invalid YAML in config '{config_path}': {exc}") from exc
+        raise ConfigError(f"Invalid YAML in config '{path}': {exc}") from exc
 
-    if data is None:
-        raise ConfigError("config file is empty")
+    if loaded is None:
+        loaded = {}
+    if not isinstance(loaded, dict):
+        raise ConfigError("Root YAML object must be a mapping")
+
+    data = dict(loaded)
+    data["__source_path"] = str(config_path.resolve())
+    validate_config(data)
+    return BotConfig(raw=data)
+
+
+def validate_config(data: dict[str, Any]) -> None:
+    """
+    Проверяет структуру конфига.
+
+    Обязательные секции:
+      app, adb, capture, motion, vision, teacher, knowledge, profiles, game, safety, timeouts, input, debug
+
+    Обязательные поля motion:
+      stable_frames, stable_diff_threshold, stable_poll_ms, stable_timeout_s, max_stable_retries, downscale_size
+
+    :param data: словарь конфига
+    :raises ConfigError: если структура невалидна
+    """
     if not isinstance(data, dict):
-        raise ConfigError("top-level YAML structure must be a mapping")
+        raise ConfigError("Config must be a dict")
 
-    config = Config(raw=data, path=config_path.resolve())
-    validate_config(config)
-    return config
+    for section in _REQUIRED_SECTIONS:
+        if section not in data:
+            raise ConfigError(f"Missing required section: {section}")
+        if not isinstance(data[section], dict):
+            raise ConfigError(f"Section '{section}' must be a mapping")
+
+    motion = data["motion"]
+    for field in _REQUIRED_MOTION_FIELDS:
+        if field not in motion:
+            raise ConfigError(f"Missing required motion field: {field}")
+
+    _require_non_empty_string(data, "app", "data_dir")
+    _require_non_empty_string(data, "app", "log_dir")
+    _require_non_empty_string(data, "app", "log_level")
+    _require_non_empty_string(data, "app", "rules_file")
+    _require_non_empty_string(data, "app", "features_file")
+    _require_non_empty_string(data, "app", "progress_file")
+    _require_non_empty_string(data, "app", "floor_state_file")
+
+    _require_non_empty_string(data, "adb", "device_serial")
+    _require_number(data, "adb", "command_timeout_s", minimum=0.0, allow_zero=False)
+    _require_int(data, "adb", "post_input_delay_ms", minimum=0)
+    _require_bool(data, "adb", "auto_connect")
+
+    _require_non_empty_string(data, "capture", "method")
+    _require_non_empty_string(data, "capture", "color_format")
+    _require_int(data, "capture", "retry_count", minimum=0)
+    _require_int(data, "capture", "retry_delay_ms", minimum=0)
+
+    _require_int(data, "motion", "stable_frames", minimum=1)
+    _require_number(data, "motion", "stable_diff_threshold", minimum=0.0)
+    _require_int(data, "motion", "stable_poll_ms", minimum=1)
+    _require_number(data, "motion", "stable_timeout_s", minimum=0.0, allow_zero=False)
+    _require_int(data, "motion", "max_stable_retries", minimum=0)
+    downscale = motion["downscale_size"]
+    width, height = _validate_int_pair(downscale, "motion.downscale_size")
+    if width <= 0 or height <= 0:
+        raise ConfigError("motion.downscale_size values must be > 0")
+
+    _require_number(data, "vision", "default_match_threshold", minimum=0.0, maximum=1.0)
+    _require_non_empty_string(data, "vision", "template_method")
+    _require_bool(data, "vision", "save_debug_images")
+    _require_non_empty_string(data, "vision", "debug_dir")
+    _require_int(data, "vision", "min_roi_area", minimum=1)
+
+    _require_non_empty_string(data, "teacher", "pause_hotkey")
+    _require_non_empty_string(data, "teacher", "window_name")
+    _require_number(data, "teacher", "preview_scale", minimum=0.0, allow_zero=False)
+    _require_bool(data, "teacher", "allow_cancel")
+    _require_non_empty_string(data, "teacher", "unknown_stable_prompt")
+    _require_non_empty_string(data, "teacher", "unknown_unstable_prompt")
+
+    _require_non_empty_string(data, "knowledge", "templates_dir")
+    _require_non_empty_string(data, "knowledge", "profiles_dir")
+    _require_bool(data, "knowledge", "store_template_metadata")
+    min_tpl = _validate_int_pair(get_path(BotConfig(data), "knowledge", "min_template_size"), "knowledge.min_template_size")
+    max_tpl = _validate_int_pair(get_path(BotConfig(data), "knowledge", "max_template_size"), "knowledge.max_template_size")
+    if min_tpl[0] <= 0 or min_tpl[1] <= 0:
+        raise ConfigError("knowledge.min_template_size values must be > 0")
+    if max_tpl[0] <= 0 or max_tpl[1] <= 0:
+        raise ConfigError("knowledge.max_template_size values must be > 0")
+    if min_tpl[0] > max_tpl[0] or min_tpl[1] > max_tpl[1]:
+        raise ConfigError("knowledge.min_template_size must be <= knowledge.max_template_size")
+    categories = data["knowledge"].get("categories")
+    if not isinstance(categories, list) or not categories:
+        raise ConfigError("knowledge.categories must be a non-empty list[str]")
+    normalized_categories = []
+    for item in categories:
+        if not isinstance(item, str) or not item.strip():
+            raise ConfigError("knowledge.categories must contain non-empty strings")
+        normalized_categories.append(item)
+    if len(set(normalized_categories)) != len(normalized_categories):
+        raise ConfigError("knowledge.categories must not contain duplicates")
+
+    _require_non_empty_string(data, "profiles", "default_profile")
+    _require_non_empty_string(data, "profiles", "root_dir")
+
+    _require_int(data, "game", "party_size", minimum=1)
+    _require_int(data, "game", "locations_count", minimum=1)
+    _require_int(data, "game", "levels_per_location", minimum=1)
+    _require_int(data, "game", "floors_per_level", minimum=1)
+    _require_bool(data, "game", "go_all_doors_before_next_floor")
+    _require_bool(data, "game", "skip_events_by_exit")
+    _require_bool(data, "game", "clear_room_immediately")
+    _require_bool(data, "game", "revisit_open_rooms")
+
+    _require_bool(data, "safety", "block_shop")
+    _require_bool(data, "safety", "block_ads")
+    _require_bool(data, "safety", "block_pvp")
+    _require_bool(data, "safety", "stop_on_danger")
+    _require_int(data, "safety", "max_unknown_stable_screens", minimum=0)
+    _require_int(data, "safety", "max_io_errors", minimum=0)
+
+    _require_number(data, "timeouts", "battle_start_timeout_s", minimum=0.0, allow_zero=False)
+    _require_number(data, "timeouts", "battle_finish_timeout_s", minimum=0.0, allow_zero=False)
+    _require_number(data, "timeouts", "room_enter_timeout_s", minimum=0.0, allow_zero=False)
+    _require_number(data, "timeouts", "room_exit_timeout_s", minimum=0.0, allow_zero=False)
+    _require_number(data, "timeouts", "next_floor_timeout_s", minimum=0.0, allow_zero=False)
+
+    _require_int(data, "input", "swipe_duration_ms", minimum=0)
+    _require_int(data, "input", "tap_jitter_px", minimum=0)
+    _require_bool(data, "input", "clamp_to_screen")
+
+    _require_bool(data, "debug", "save_last_frame_on_error")
+    _require_bool(data, "debug", "verbose_vision")
 
 
-def validate_config(config: Config) -> None:
+def get_path(config: BotConfig, *keys: str) -> Any:
     """
-    Проверяет обязательные секции и типы ключевых параметров.
-    Возвращает:
-        None
-    Исключения:
-        - ConfigError: при неверных типах/значениях
+    Достаёт вложенное значение из config.raw по цепочке ключей.
+
+    :param config: BotConfig
+    :param keys: последовательность ключей
+    :return: значение
+    :raises KeyError: если путь отсутствует
     """
-    if not isinstance(config.raw, dict):
-        raise ConfigError("config.raw must be a dict")
-
-    for section in _REQUIRED_TOP_LEVEL_SECTIONS:
-        if section not in config.raw:
-            raise ConfigError(f"missing required config section: {section}")
-        _require_mapping(config.raw[section], section)
-
-    ldplayer = config.raw.get("ldplayer")
-    if ldplayer is not None:
-        _require_mapping(ldplayer, "ldplayer")
-
-    for key, expected_type in _REQUIRED_KEYS.items():
-        _require_type(config, key, expected_type)
-
-    available = config.get("profiles.available")
-    if not all(isinstance(item, str) and item for item in available):
-        raise ConfigError("config key 'profiles.available' must be a non-empty list of strings")
-    if config.get("profiles.active") not in available:
-        raise ConfigError("config key 'profiles.active' must be present in 'profiles.available'")
-
-    for key in (
-        "adb.exec_timeout_s",
-        "motion.stable_timeout_s",
-        "timings.battle_timeout_s",
-    ):
-        _validate_positive_number(key, _require_type(config, key, (int, float)))
-
-    for key in (
-        "game.team_size",
-        "game.locations_count",
-        "game.floors_per_location",
-        "game.random_subfloors_per_level",
-        "motion.stable_frames",
-        "motion.stable_poll_ms",
-        "motion.max_stable_retries",
-        "timings.tap_after_screenshot_delay_ms",
-        "timings.post_tap_delay_ms",
-        "timings.post_back_delay_ms",
-        "timings.after_room_enter_delay_ms",
-        "timings.after_exit_delay_ms",
-        "timings.next_floor_delay_ms",
-        "timings.auto_battle_check_interval_ms",
-        "safety.min_action_interval_ms",
-    ):
-        _validate_non_negative_int(key, _require_type(config, key, int))
-
-    if config.get("game.team_size") <= 0:
-        raise ConfigError("config key 'game.team_size' must be > 0")
-    if config.get("game.locations_count") <= 0:
-        raise ConfigError("config key 'game.locations_count' must be > 0")
-    if config.get("game.floors_per_location") <= 0:
-        raise ConfigError("config key 'game.floors_per_location' must be > 0")
-    if config.get("game.random_subfloors_per_level") <= 0:
-        raise ConfigError("config key 'game.random_subfloors_per_level' must be > 0")
-    if config.get("motion.stable_frames") <= 0:
-        raise ConfigError("config key 'motion.stable_frames' must be > 0")
-
-    _validate_probability_like(
-        "motion.stable_diff_threshold", _require_type(config, "motion.stable_diff_threshold", (int, float))
-    )
-    _validate_probability_like(
-        "matching.default_threshold", _require_type(config, "matching.default_threshold", (int, float))
-    )
-    _validate_probability_like(
-        "matching.classify_threshold", _require_type(config, "matching.classify_threshold", (int, float))
-    )
-
-    downscale_size = config.get("motion.downscale_size", _MISSING)
-    if downscale_size is _MISSING:
-        raise ConfigError("missing required config key: motion.downscale_size")
-    if not isinstance(downscale_size, (list, tuple)) or len(downscale_size) != 2:
-        raise ConfigError("config key 'motion.downscale_size' must be a list/tuple of two integers")
-    if not all(isinstance(item, int) and item > 0 for item in downscale_size):
-        raise ConfigError("config key 'motion.downscale_size' must contain positive integers")
-
-    log_level = config.get("app.log_level")
-    if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
-        raise ConfigError("config key 'app.log_level' must be one of DEBUG, INFO, WARNING, ERROR, CRITICAL")
-
-    for key in (
-        "app.data_dir",
-        "app.profiles_dir",
-        "app.screenshots_dir",
-        "app.temp_dir",
-        "storage.rules_file",
-        "storage.features_file",
-        "storage.progress_file",
-        "storage.floor_state_dir",
-        "storage.knowledge_dir",
-    ):
-        value = _require_type(config, key, str)
-        if not value.strip():
-            raise ConfigError(f"config key '{key}' must be a non-empty path string")
+    current: Any = config.raw
+    walked: list[str] = []
+    for key in keys:
+        walked.append(key)
+        if not isinstance(current, dict) or key not in current:
+            raise KeyError(".".join(walked))
+        current = current[key]
+    return current
 
 
-def ensure_directories(config: Config) -> None:
-    """
-    Создаёт необходимые директории из конфига.
-    Возвращает:
-        None
-    Исключения:
-        - OSError: ошибки файловой системы
-        - ConfigError: если путь невалиден
-    """
-    base_dir = config.path.parent
+def _require_non_empty_string(data: dict[str, Any], section: str, key: str) -> None:
+    value = data[section].get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{section}.{key} must be a non-empty string")
 
-    dir_keys = (
-        "app.data_dir",
-        "app.profiles_dir",
-        "app.screenshots_dir",
-        "app.temp_dir",
-        "storage.floor_state_dir",
-        "storage.knowledge_dir",
-    )
-    file_keys = (
-        "storage.rules_file",
-        "storage.features_file",
-        "storage.progress_file",
-    )
 
-    for key in dir_keys:
-        value = config.get(key)
-        if not isinstance(value, str) or not value.strip():
-            raise ConfigError(f"config key '{key}' must be a non-empty path string")
-        target = _resolve_path(base_dir, value)
-        target.mkdir(parents=True, exist_ok=True)
+def _require_bool(data: dict[str, Any], section: str, key: str) -> None:
+    value = data[section].get(key)
+    if not isinstance(value, bool):
+        raise ConfigError(f"{section}.{key} must be a bool")
 
-    for key in file_keys:
-        value = config.get(key)
-        if not isinstance(value, str) or not value.strip():
-            raise ConfigError(f"config key '{key}' must be a non-empty path string")
-        target = _resolve_path(base_dir, value)
-        target.parent.mkdir(parents=True, exist_ok=True)
+
+def _require_int(data: dict[str, Any], section: str, key: str, minimum: int | None = None) -> None:
+    value = data[section].get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"{section}.{key} must be an int")
+    if minimum is not None and value < minimum:
+        raise ConfigError(f"{section}.{key} must be >= {minimum}")
+
+
+def _require_number(
+    data: dict[str, Any],
+    section: str,
+    key: str,
+    minimum: float | None = None,
+    maximum: float | None = None,
+    allow_zero: bool = True,
+) -> None:
+    value = data[section].get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f"{section}.{key} must be a number")
+    number = float(value)
+    if not allow_zero and number == 0.0:
+        raise ConfigError(f"{section}.{key} must be > 0")
+    if minimum is not None and number < minimum:
+        raise ConfigError(f"{section}.{key} must be >= {minimum}")
+    if maximum is not None and number > maximum:
+        raise ConfigError(f"{section}.{key} must be <= {maximum}")
+
+
+def _validate_int_pair(value: Any, field_name: str) -> tuple[int, int]:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ConfigError(f"{field_name} must be a list/tuple of two integers")
+    first, second = value
+    if isinstance(first, bool) or not isinstance(first, int):
+        raise ConfigError(f"{field_name}[0] must be an int")
+    if isinstance(second, bool) or not isinstance(second, int):
+        raise ConfigError(f"{field_name}[1] must be an int")
+    return first, second
