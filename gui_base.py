@@ -1,140 +1,228 @@
-"""Tkinter training tab for shared base navigation.
-
-Storage: data/base/nav.json contains base_to_locations={"png": ...}, exactly
-seven locations [{"slot": 1, "name": ..., "png": ..., "floors":
-[{"name": ..., "png": ...}]}], and enter_dungeon={"png": ...}. PNG files
-are in data/base/. JSON is written atomically with a temporary file and replace.
-This module only teaches regions; it never farms or performs automatic clicks.
-"""
 from __future__ import annotations
-import json, os, time, tkinter as tk
+
+import json
+import os
+import tempfile
+import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, simpledialog, ttk
 from typing import Any
+
 try:
     import cv2
-except ImportError:
+except ImportError:  # pragma: no cover
     cv2 = None
+
 try:
     from PIL import Image, ImageTk
-except ImportError:
+except ImportError:  # pragma: no cover
     Image = ImageTk = None
+
 try:
     from bot.config import load_config
     from bot.adb_controller import ADBController
     from bot.logging_setup import setup_logging
     from bot.screenshot import ScreenshotProvider
-except Exception:
+except Exception:  # pragma: no cover
     load_config = ADBController = setup_logging = ScreenshotProvider = None
 
 BASE_DIR = Path("data/base")
 NAV_PATH = BASE_DIR / "nav.json"
 
-def _empty_nav():
-    return {"base_to_locations": {"png": ""}, "locations": [{"slot": i, "name": "", "png": "", "floors": []} for i in range(1, 8)], "enter_dungeon": {"png": ""}}
 
-def _load_nav():
-    data = _empty_nav()
+def _empty_nav() -> dict[str, Any]:
+    return {
+        "base_to_locations": {"png": ""},
+        "locations": [
+            {"slot": i, "name": "", "png": "", "floors": []}
+            for i in range(1, 8)
+        ],
+        "enter_dungeon": {"png": ""},
+    }
+
+
+def _load_nav() -> dict[str, Any]:
     try:
-        with NAV_PATH.open(encoding="utf-8") as f: loaded = json.load(f)
-        if isinstance(loaded, dict): data.update({k: v for k, v in loaded.items() if k in data})
-    except (OSError, json.JSONDecodeError): pass
-    old = {int(x.get("slot")): x for x in data.get("locations", []) if isinstance(x, dict) and str(x.get("slot", "")).isdigit()}
-    data["locations"] = [old.get(i, _empty_nav()["locations"][i-1]) for i in range(1, 8)]
-    for x in data["locations"]: x.setdefault("floors", [])
-    return data
+        data = json.loads(NAV_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return _empty_nav()
+    if not isinstance(data, dict):
+        return _empty_nav()
+    result = _empty_nav()
+    for key in result:
+        if key in data:
+            result[key] = data[key]
+    locations = result.get("locations")
+    by_slot = {}
+    if isinstance(locations, list):
+        for item in locations:
+            if isinstance(item, dict) and str(item.get("slot", "")).isdigit():
+                by_slot[int(item["slot"])] = item
+    result["locations"] = []
+    for slot in range(1, 8):
+        item = by_slot.get(slot, {"slot": slot, "name": "", "png": "", "floors": []})
+        item.setdefault("slot", slot)
+        item.setdefault("name", "")
+        item.setdefault("png", "")
+        item.setdefault("floors", [])
+        result["locations"].append(item)
+    return result
 
-def _save_nav(data):
+
+def _save_nav(data: dict[str, Any]) -> None:
     BASE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = NAV_PATH.with_name(f".{NAV_PATH.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    fd, name = tempfile.mkstemp(prefix=".nav-", suffix=".tmp", dir=BASE_DIR)
     try:
-        with tmp.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2); f.write("\n"); f.flush(); os.fsync(f.fileno())
-        tmp.replace(NAV_PATH)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(name, NAV_PATH)
     finally:
-        if tmp.exists(): tmp.unlink()
+        if os.path.exists(name):
+            os.unlink(name)
 
-def _provider():
-    if ScreenshotProvider is None or load_config is None: raise RuntimeError("ScreenshotProvider unavailable")
+
+def _provider() -> Any:
+    if not all((load_config, ADBController, ScreenshotProvider)):
+        raise RuntimeError("Модули ADB/ScreenshotProvider недоступны")
     config = load_config("config.yaml")
     logger = setup_logging(config) if setup_logging else None
-    adb = ADBController(config, logger); adb.connect()
+    adb = ADBController(config, logger)
+    adb.connect()
     return ScreenshotProvider(adb, config, logger)
 
-def capture_region(parent, prompt) -> tuple[Any, tuple[int, int, int, int]] | None:
-    """Return (crop_bgr, bbox), selected with the mouse, or None on cancel."""
-    if cv2 is None or Image is None:
-        messagebox.showerror("Ошибка", "Нужны OpenCV и Pillow.", parent=parent); return None
-    try: frame = _provider().capture()
-    except Exception as exc:
-        messagebox.showerror("Скриншот", str(exc), parent=parent); return None
-    if frame is None or not getattr(frame, "size", 0): return None
-    h, w = frame.shape[:2]; scale = min(1.0, 900 / w, 650 / h)
-    display = cv2.resize(frame, (int(w*scale), int(h*scale))) if scale != 1 else frame
-    image = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(display, cv2.COLOR_BGR2RGB)))
-    win = tk.Toplevel(parent); win.title(str(prompt)); win.transient(parent)
-    canvas = tk.Canvas(win, width=display.shape[1], height=display.shape[0], cursor="crosshair"); canvas.pack(padx=8, pady=8)
-    canvas.create_image(0, 0, anchor="nw", image=image); state = {"start": None, "rect": None, "result": None}
-    def down(e):
-        state["start"] = (max(0, min(e.x, display.shape[1])), max(0, min(e.y, display.shape[0])))
-        if state["rect"]: canvas.delete(state["rect"])
-        state["rect"] = canvas.create_rectangle(*state["start"], *state["start"], outline="red", width=2)
-    def move(e):
-        if state["start"] and state["rect"]: canvas.coords(state["rect"], *state["start"], e.x, e.y)
-    def save():
-        if not state["start"] or not state["rect"]: return
-        x1,y1,x2,y2 = canvas.coords(state["rect"]); left,right = sorted((max(0,int(x1/scale)),min(w,int(x2/scale)))); top,bottom = sorted((max(0,int(y1/scale)),min(h,int(y2/scale))))
-        if right > left and bottom > top: state["result"] = (frame[top:bottom,left:right].copy(), (left,top,right,bottom)); win.destroy()
-    canvas.bind("<ButtonPress-1>", down); canvas.bind("<B1-Motion>", move)
-    buttons = ttk.Frame(win); buttons.pack(fill="x", padx=8, pady=(0,8)); ttk.Button(buttons,text="Сохранить",command=save).pack(side="left"); ttk.Button(buttons,text="Отмена",command=win.destroy).pack(side="right")
-    win.grab_set(); win.wait_window(); return state["result"]
 
-def _write_png(crop, prefix):
-    BASE_DIR.mkdir(parents=True, exist_ok=True); path = BASE_DIR / f"{prefix}_{time.time_ns()}.png"
-    if cv2 is None or not cv2.imwrite(str(path), crop): raise RuntimeError(f"PNG write failed: {path}")
-    return str(path)
+def capture_region(parent, prompt) -> tuple[Any, tuple[int, int, int, int]] | None:
+    if cv2 is None or Image is None or ImageTk is None:
+        messagebox.showerror("Скриншот", "Нужны OpenCV и Pillow", parent=parent)
+        return None
+    try:
+        frame = _provider().capture()
+    except Exception as exc:
+        messagebox.showerror("Скриншот", str(exc), parent=parent)
+        return None
+    if frame is None or getattr(frame, "size", 0) == 0:
+        return None
+    height, width = frame.shape[:2]
+    scale = min(1.0, 900 / width, 650 / height)
+    display = cv2.resize(frame, (int(width * scale), int(height * scale))) if scale != 1 else frame
+    image = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(display, cv2.COLOR_BGR2RGB)))
+    win = tk.Toplevel(parent)
+    win.title(str(prompt))
+    win.transient(parent)
+    canvas = tk.Canvas(win, width=display.shape[1], height=display.shape[0], cursor="crosshair")
+    canvas.pack(padx=8, pady=8)
+    canvas.create_image(0, 0, anchor="nw", image=image)
+    canvas.image = image
+    state = {"start": None, "rect": None, "result": None}
+
+    def down(event):
+        state["start"] = (max(0, min(event.x, display.shape[1])), max(0, min(event.y, display.shape[0])))
+        if state["rect"]:
+            canvas.delete(state["rect"])
+        state["rect"] = canvas.create_rectangle(*state["start"], *state["start"], outline="red", width=2)
+
+    def move(event):
+        if state["start"] and state["rect"]:
+            canvas.coords(state["rect"], *state["start"], event.x, event.y)
+
+    def save():
+        if not state["start"] or not state["rect"]:
+            return
+        x1, y1, x2, y2 = canvas.coords(state["rect"])
+        left, right = sorted((max(0, int(x1 / scale)), min(width, int(x2 / scale))))
+        top, bottom = sorted((max(0, int(y1 / scale)), min(height, int(y2 / scale))))
+        if right > left and bottom > top:
+            state["result"] = (frame[top:bottom, left:right].copy(), (left, top, right, bottom))
+            win.destroy()
+
+    canvas.bind("<ButtonPress-1>", down)
+    canvas.bind("<B1-Motion>", move)
+    buttons = ttk.Frame(win)
+    buttons.pack(fill="x", padx=8, pady=(0, 8))
+    ttk.Button(buttons, text="Сохранить", command=save).pack(side="left")
+    ttk.Button(buttons, text="Отмена", command=win.destroy).pack(side="right")
+    win.grab_set()
+    win.wait_window()
+    return state["result"]
+
+
+def _write_png(crop: Any, prefix: str) -> str:
+    if cv2 is None:
+        raise RuntimeError("OpenCV недоступен")
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    path = BASE_DIR / f"{prefix}_{os.getpid()}_{id(crop)}.png"
+    if not cv2.imwrite(str(path), crop):
+        raise RuntimeError(f"Не удалось сохранить PNG: {path}")
+    return path.as_posix()
+
 
 class NavigationTab(ttk.Frame):
-    """Training tab with four base lessons, seven locations and nested floors."""
     def __init__(self, parent, app):
-        super().__init__(parent, padding=12); self.app=app; self.data=_load_nav()
-        self.location_vars=[tk.StringVar(value=x.get("name", "")) for x in self.data["locations"]]; self.status_vars=[tk.StringVar(value="✓" if x.get("png") else "✗") for x in self.data["locations"]]; self.floor_location=tk.StringVar(value="1"); self._build()
-    def _build(self):
-        ttk.Label(self,text="Базовые знания",font=("TkDefaultFont",15,"bold")).pack(anchor="w"); ttk.Label(self,text="Выделяйте области мышью; кликов в эмуляторе не выполняется.",wraplength=900).pack(anchor="w",pady=(2,10))
-        r=ttk.Frame(self); r.pack(fill="x"); ttk.Button(r,text="Назначить вход в локации",command=self._base_to_locations).pack(side="left"); self.base_status=ttk.Label(r,text="✓" if self.data["base_to_locations"].get("png") else "✗"); self.base_status.pack(side="left",padx=8)
-        box=ttk.LabelFrame(self,text="7 локаций"); box.pack(fill="x",pady=8)
-        for i in range(7):
-            row=ttk.Frame(box); row.pack(fill="x",pady=2); ttk.Label(row,text=f"{i+1}.",width=3).pack(side="left"); ttk.Entry(row,textvariable=self.location_vars[i],width=24).pack(side="left"); ttk.Button(row,text="Привязать к скриншоту",command=lambda n=i:self._bind_location(n)).pack(side="left",padx=4); ttk.Label(row,textvariable=self.status_vars[i],width=2).pack(side="left")
-        floors=ttk.LabelFrame(self,text="Этаж"); floors.pack(fill="x",pady=8); ttk.Label(floors,text="Локация:").pack(side="left"); combo=ttk.Combobox(floors,textvariable=self.floor_location,values=[str(i) for i in range(1,8)],state="readonly",width=5); combo.pack(side="left"); combo.bind("<<ComboboxSelected>>",lambda e:self._refresh_floors()); ttk.Button(floors,text="Добавить этаж",command=self._add_floor).pack(side="left",padx=4); self.floor_list=tk.Listbox(floors,height=5,width=55); self.floor_list.pack(side="left"); self._refresh_floors()
-        r=ttk.Frame(self); r.pack(fill="x",pady=3); ttk.Button(r,text="Назначить кнопку В данж",command=self._enter_dungeon).pack(side="left"); ttk.Label(r,text="✓" if self.data["enter_dungeon"].get("png") else "✗").pack(side="left",padx=8); ttk.Button(self,text="Проверить цепочку",command=self._check_chain).pack(anchor="w",pady=8)
-    def _capture_save(self,prompt,prefix):
-        selected=capture_region(self,prompt)
-        if selected is None:return None
-        try:return _write_png(selected[0],prefix)
-        except Exception as exc: messagebox.showerror("Сохранение",str(exc),parent=self); return None
-    def _base_to_locations(self):
-        png=self._capture_save("Выделите кнопку перехода к локациям","base_to_locations")
-        if png:self.data["base_to_locations"]={"png":png}; _save_nav(self.data); self.base_status.config(text="✓")
-    def _bind_location(self,i):
-        png=self._capture_save(f"Локация {i+1}: выделите иконку",f"location_{i+1:02d}")
-        if png:self.data["locations"][i].update(slot=i+1,name=self.location_vars[i].get().strip(),png=png); _save_nav(self.data); self.status_vars[i].set("✓")
-    def _add_floor(self):
-        i=int(self.floor_location.get())-1; name=simpledialog.askstring("Этаж","Название этажа:",parent=self)
-        if not name:return
-        png=self._capture_save(f"{name}: выделите область этажа",f"location_{i+1:02d}_floor")
-        if png:self.data["locations"][i].setdefault("floors",[]).append({"name":name.strip(),"png":png}); _save_nav(self.data); self._refresh_floors()
-    def _refresh_floors(self):
-        if not hasattr(self,"floor_list"):return
-        self.floor_list.delete(0,tk.END)
-        for x in self.data["locations"][int(self.floor_location.get())-1].get("floors",[]):self.floor_list.insert(tk.END,f"{x.get('name','')}: {x.get('png','')}")
-    def _enter_dungeon(self):
-        png=self._capture_save("Выделите кнопку В данж","enter_dungeon")
-        if png:self.data["enter_dungeon"]={"png":png}; _save_nav(self.data)
-    def _check_chain(self):
-        try:
-            import nav; checker=getattr(nav,"check_chain",None)
-            if callable(checker): messagebox.showinfo("Цепочка",str(checker()),parent=self)
-            else: messagebox.showinfo("Цепочка","Функция проверки цепочки в nav.py отсутствует.",parent=self)
-        except Exception as exc: messagebox.showerror("Цепочка",str(exc),parent=self)
+        super().__init__(parent, padding=12)
+        self.app = app
+        self.data = _load_nav()
+        self.location_vars = [tk.StringVar(value=x.get("name", "")) for x in self.data["locations"]]
+        self.status_vars = [tk.StringVar(value="✓" if x.get("png") else "✗") for x in self.data["locations"]]
+        self.floor_location = tk.StringVar(value="1")
+        self._build()
 
-__all__=["capture_region","NavigationTab"]
+    def _build(self):
+        ttk.Label(self, text="Базовые знания", font=("TkDefaultFont", 15, "bold")).pack(anchor="w")
+        ttk.Button(self, text="Назначить вход в локации", command=self._base_to_locations).pack(anchor="w", pady=3)
+        self.base_status = ttk.Label(self, text="✓" if self.data["base_to_locations"].get("png") else "✗")
+        self.base_status.pack(anchor="w")
+        box = ttk.LabelFrame(self, text="7 локаций")
+        box.pack(fill="x", pady=8)
+        for i in range(7):
+            row = ttk.Frame(box); row.pack(fill="x", pady=2)
+            ttk.Label(row, text=f"{i + 1}.", width=3).pack(side="left")
+            ttk.Entry(row, textvariable=self.location_vars[i], width=24).pack(side="left", padx=3)
+            ttk.Button(row, text="Привязать к скриншоту", command=lambda n=i: self._bind_location(n)).pack(side="left", padx=3)
+            ttk.Label(row, textvariable=self.status_vars[i], width=3).pack(side="left")
+        floors = ttk.LabelFrame(self, text="Этаж"); floors.pack(fill="x", pady=8)
+        ttk.Label(floors, text="Локация:").pack(side="left", padx=4)
+        ttk.Combobox(floors, textvariable=self.floor_location, values=[str(i) for i in range(1, 8)], state="readonly", width=5).pack(side="left")
+        ttk.Button(floors, text="Добавить этаж", command=self._add_floor).pack(side="left", padx=8)
+        self.floor_list = tk.Listbox(floors, height=5, width=45); self.floor_list.pack(side="left", padx=4)
+        self._refresh_floors()
+        ttk.Button(self, text="Назначить В данж", command=self._enter_dungeon).pack(anchor="w", pady=4)
+
+    def _capture_and_save(self, prompt, prefix):
+        selected = capture_region(self, prompt)
+        if selected is None: return None
+        try: return _write_png(selected[0], prefix)
+        except Exception as exc:
+            messagebox.showerror("Сохранение", str(exc), parent=self); return None
+
+    def _base_to_locations(self):
+        if (png := self._capture_and_save("Выделите кнопку перехода к локациям", "base_to_locations")):
+            self.data["base_to_locations"] = {"png": png}; _save_nav(self.data); self.base_status.config(text="✓")
+
+    def _bind_location(self, index):
+        if (png := self._capture_and_save(f"Локация {index + 1}: выделите иконку", f"location_{index + 1:02d}")):
+            self.data["locations"][index].update(slot=index + 1, name=self.location_vars[index].get().strip(), png=png)
+            _save_nav(self.data); self.status_vars[index].set("✓")
+
+    def _add_floor(self):
+        index = int(self.floor_location.get()) - 1
+        name = simpledialog.askstring("Этаж", "Название этажа:", parent=self)
+        if not name: return
+        if (png := self._capture_and_save("Выделите шаблон экрана этажа", f"location_{index + 1:02d}_floor")):
+            self.data["locations"][index].setdefault("floors", []).append({"name": name.strip(), "png": png})
+            _save_nav(self.data); self._refresh_floors()
+
+    def _refresh_floors(self):
+        if not hasattr(self, "floor_list"): return
+        self.floor_list.delete(0, tk.END)
+        for floor in self.data["locations"][int(self.floor_location.get()) - 1].get("floors", []):
+            self.floor_list.insert(tk.END, f"{floor.get('name', '')}: {floor.get('png', '')}")
+
+    def _enter_dungeon(self):
+        if (png := self._capture_and_save("Выделите кнопку В данж", "enter_dungeon")):
+            self.data["enter_dungeon"] = {"png": png}; _save_nav(self.data)
+
+
+__all__ = ["capture_region", "NavigationTab"]
