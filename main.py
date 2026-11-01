@@ -22,17 +22,15 @@ from bot.explorer import DungeonExplorer, ExplorerError
 try:
     from bot.screenshot import ScreenshotError, ScreenshotProvider
 except ModuleNotFoundError as exc:
-    raise RuntimeError(
-        "Не найден модуль bot.screenshot. Установите/восстановите bot/screenshot.py."
-    ) from exc
+    raise RuntimeError("Не найден модуль bot.screenshot. Проверьте наличие файла bot/screenshot.py.") from exc
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="main.py",
         description=(
-            "CLI для управления LDPlayer. "
-            "Подключение к Android: --teach."
+            "CLI для LDPlayer. "
+            "Запуск Android: --teach."
         ),
     )
     parser.add_argument("--config", default="config.yaml")
@@ -40,7 +38,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--capture", action="store_true")
     parser.add_argument("--teach", action="store_true")
     parser.add_argument("--teach-only", dest="teach_only", action="store_true")
-    parser.add_argument("--profile", help="Имя профиля, например loc1")
+    parser.add_argument("--profile", help="Профиль знаний, например loc1")
     parser.add_argument("--floor-from", dest="floor_from", type=int)
     parser.add_argument("--floor-to", dest="floor_to", type=int)
     parser.add_argument("--list-profiles", dest="list_profiles", action="store_true")
@@ -48,7 +46,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--gui",
         action="store_true",
-        help="Запустить графический интерфейс навигации и фарма",
+        help="Запустить GUI для управления ботом и обучения шаблонов",
+    )
+    parser.add_argument(
+        "--navigate",
+        action="store_true",
+        help="Navigate from current screen to farm start",
+    )
+    parser.add_argument(
+        "--location",
+        type=str,
+        choices=[f"loc{i}" for i in range(1, 8)],
+        help="Location for --navigate",
+    )
+    parser.add_argument(
+        "--floor",
+        type=int,
+        help="Floor for --navigate",
     )
     return parser
 
@@ -81,7 +95,7 @@ def _resolve_profile_and_range(
     try:
         profile_manager.ensure_profile(selected_profile)
     except ProfileError as exc:
-        raise ProfileError(f"Не удалось выбрать профиль '{selected_profile}'. {exc}") from exc
+        raise ProfileError(f"Профиль '{selected_profile}' не найден. {exc}") from exc
 
     floor_from = cli_floor_from if cli_floor_from is not None else 1
     if floor_from < 1:
@@ -93,7 +107,7 @@ def _resolve_profile_and_range(
         try:
             floor_to = int(get_path(config, "game", "floors_per_level"))
         except (KeyError, TypeError, ValueError) as exc:
-            raise ProfileError("Не найден game.floors_per_level в config.yaml") from exc
+            raise ProfileError("Не удалось определить game.floors_per_level из config.yaml") from exc
 
     if floor_to < 1:
         raise ProfileError("--floor-to должен быть >= 1")
@@ -110,14 +124,12 @@ def _make_core_objects(config: BotConfig, logger: Any, profile: str) -> dict[str
     except Exception as exc:
         raise RuntimeError(
             "Не удалось импортировать bot.vision.VisionEngine. "
-            "Проверьте зависимости и исходники."
+            "Проверьте зависимости OpenCV и наличие файла bot/vision.py."
         ) from exc
     try:
         from bot.safety import SafetyManager
     except Exception as exc:
-        raise RuntimeError(
-            "Не удалось импортировать bot.safety.SafetyManager."
-        ) from exc
+        raise RuntimeError("Не удалось импортировать bot.safety.SafetyManager.") from exc
 
     vision = VisionEngine(config, logger)
     knowledge = KnowledgeBase(config, profile, logger)
@@ -232,23 +244,23 @@ def _run_check(config: BotConfig, logger: Any, profile: str) -> int:
         try:
             print(f"[3/8] Android: {_android_version(adb)}")
             width, height = adb.screen_size()
-            print(f"[4/8] размер экрана: {width}x{height}")
+            print(f"[4/8] Разрешение: {width}x{height}")
             frame = screenshot.capture()
             shot_ok = True
-            print("[5/8] скриншот: OK")
+            print("[5/8] Скриншот: OK")
         except (ADBCommandError, ScreenshotError) as exc:
-            errors.append(f"скриншот: {exc}")
-            print("[5/8] скриншот: ошибка")
+            errors.append(f"Скриншот: {exc}")
+            print("[5/8] Скриншот: ошибка")
     else:
         print("[3/8] Android: пропуск")
-        print("[4/8] размер экрана: пропуск")
-        print("[5/8] скриншот: пропуск")
+        print("[4/8] Разрешение: пропуск")
+        print("[5/8] Скриншот: пропуск")
     try:
         profiles = ProfileManager(config, logger).list_profiles()
         _, profile_dir, profile_templates_dir = _knowledge_paths(config, profile)
         print(f"[6/8] knowledge/profile: {profile_dir}")
         print(f"      templates/{profile}: {profile_templates_dir}")
-        print(f"[7/8] профили: {', '.join(profiles) if profiles else 'не найдены'}")
+        print(f"[7/8] Профили: {', '.join(profiles) if profiles else 'не найдены'}")
         templates = knowledge.get_templates(enabled_only=False)
         knowledge_ok = True
         print(f"[8/8] templates loaded: {len(templates)}")
@@ -263,9 +275,9 @@ def _run_check(config: BotConfig, logger: Any, profile: str) -> int:
         except Exception as exc:
             errors.append(f"vision: {exc}")
     if adb_exists and adb_ok and shot_ok and knowledge_ok and vision_ok:
-        print("Итог: OK")
+        print("Проверка: OK")
         return 0
-    print("Итог: есть ошибки")
+    print("Проверка: есть ошибки")
     for item in errors:
         print(f"- {item}")
     return 2 if (adb_exists and not adb_ok) or not adb_exists else 1
@@ -300,7 +312,7 @@ def _run_list_profiles(config: BotConfig, logger: Any) -> int:
             count_text = str(count) if count >= 0 else "ошибка"
             print(f"- {profile}: шаблонов {count_text}")
         except Exception as exc:
-            print(f"- {profile}: ошибка загрузки ({exc})")
+            print(f"- {profile}: ошибка ({exc})")
     return 0
 
 
@@ -328,18 +340,18 @@ def _backup_profile_knowledge(config: BotConfig, profile: str) -> Path:
 
 
 def _run_reset_knowledge(config: BotConfig, logger: Any, profile: str) -> int:
-    print(f"Сброс знаний профиля '{profile}'.")
-    print("rules.json и features.json будут заменены. Продолжить? (YES/NO): ", end="")
+    print(f"Сбросить rules.json и features.json профиля '{profile}'.")
+    print("Введите YES/NO: ", end="")
     answer = builtins.input().strip()
     if answer != "YES":
-        print("Отменено.")
+        print("Отмена.")
         return 0
     profile_manager = ProfileManager(config, logger)
     profile_manager.ensure_profile(profile)
     backup_dir = _backup_profile_knowledge(config, profile)
     knowledge = KnowledgeBase(config, profile, logger)
     knowledge.reset()
-    print(f"Профиль '{profile}' сброшен.")
+    print(f"Профиль '{profile}' очищен.")
     print(f"Резервная копия: {backup_dir}")
     return 0
 
@@ -360,7 +372,7 @@ def _run_teach(config: BotConfig, logger: Any, profile: str, floor_from: int, fl
     if not hasattr(explorer, "run_explore"):
         raise ExplorerError("DungeonExplorer.run_explore(...) не найден.")
     results = explorer.run_explore(floor_from=floor_from, floor_to=floor_to)
-    print(f"Исследование завершено. Обработано этажей: {len(results)}")
+    print(f"Исследовано этажей: {len(results)}")
     return 0
 
 
@@ -372,26 +384,62 @@ def _run_teach_only(config: BotConfig, logger: Any, profile: str) -> int:
     teacher_ui = objects["teacher_ui"]
     adb.connect()
     if not hasattr(teacher_ui, "teach_only"):
-        raise TeacherUIError("TeacherUI.teach_only(adb, screenshot, knowledge) не найден.")
+        raise TeacherUIError("TeacherUI.teach_only(...) не найден.")
     added = teacher_ui.teach_only(adb, screenshot, knowledge)
     print(f"Добавлено шаблонов: {added}")
     return 0
 
 
+def _run_navigation(config: BotConfig, location_id: str, floor_number: int) -> int:
+    if not location_id or floor_number is None or floor_number < 1:
+        return 2
+    try:
+        logger = setup_logging(config)
+        objects = _make_core_objects(config, logger, "base")
+        adb = objects["adb"]
+        screenshot = objects["screenshot"]
+        vision = objects["vision"]
+        from nav import NavigationController
+        adb.connect()
+        controller = NavigationController(
+            adb=adb,
+            screenshot=screenshot,
+            vision=vision,
+            base_dir=config.base_dir,
+            logger=logger,
+        )
+        result = controller.navigate_from_current_screen(
+            location_id=location_id,
+            floor_number=floor_number,
+        )
+        print(result.message)
+        return 0 if result.ok else 1
+    except (ADBConnectionError, ADBCommandError, ADBError, ScreenshotError, Exception) as exc:
+        _print_error(str(exc))
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    if args.navigate:
+        if not args.location:
+            parser.error("--navigate requires --location")
+        if args.floor is None:
+            parser.error("--navigate requires --floor")
+        if args.floor < 1:
+            parser.error("--floor must be >= 1")
     try:
         config = load_config(args.config)
         logger = setup_logging(config)
     except FileNotFoundError:
-        _print_error(f"Не найден файл конфигурации: {args.config}. Укажите --config.")
+        _print_error(f"Конфигурация не найдена: {args.config}. Укажите существующий --config.")
         return 1
     except ConfigError as exc:
         _print_error(f"Ошибка конфигурации: {exc}")
         return 1
     except OSError as exc:
-        _print_error(f"Ошибка инициализации логирования: {exc}")
+        _print_error(f"Ошибка чтения конфигурации: {exc}")
         return 1
 
     try:
@@ -406,16 +454,16 @@ def main(argv: list[str] | None = None) -> int:
 
     mode_count = sum([
         args.check, args.capture, args.teach_only, args.list_profiles,
-        args.reset_knowledge, args.gui, args.teach,
+        args.reset_knowledge, args.gui, args.teach, args.navigate,
     ])
     if mode_count > 1:
-        _print_error(
-            "Укажите только один режим: --check, --capture, --teach, "
-            "--teach-only, --list-profiles, --reset-knowledge или --gui."
-        )
+        _print_error("Выберите только один режим: --check, --capture, --teach, "
+                     "--teach-only, --list-profiles, --reset-knowledge, --gui или --navigate.")
         return 1
 
     try:
+        if args.navigate:
+            return _run_navigation(config, args.location, args.floor)
         if args.gui:
             from gui import launch_gui
             return launch_gui(profile=args.profile)
@@ -431,17 +479,17 @@ def main(argv: list[str] | None = None) -> int:
             return _run_teach_only(config, logger, profile)
         return _run_teach(config, logger, profile, floor_from, floor_to)
     except (ADBConnectionError, ADBCommandError, ADBError, ScreenshotError) as exc:
-        _print_error(f"ADB/устройство: {exc}")
+        _print_error(f"ADB/скриншот: {exc}")
         return 2
     except Exception as exc:
         if exc.__class__.__name__ == "DangerDetectedError":
-            _print_error(f"Обнаружен danger: {exc}")
+            _print_error(f"Аварийная остановка: {exc}")
             return 3
         if isinstance(exc, (TeacherUIError, LabelingCancelledError)):
-            _print_error(f"Обучение отменено/ошибка: {exc}")
+            _print_error(f"Обучение отменено или не удалось: {exc}")
             return 4
         if isinstance(exc, (ExplorerError, KnowledgeError)):
-            _print_error(f"Ошибка исследования: {exc}")
+            _print_error(f"Исследование/знания: {exc}")
             return 5
         _print_error(str(exc))
         return 1
