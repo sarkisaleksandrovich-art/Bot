@@ -2,107 +2,278 @@ app:
   name: "dungeon2_bot"
   log_level: "INFO"
   data_dir: "./data"
-  captures_dir: "./data/captures"
+  profiles_dir: "./profiles"
+  screenshots_dir: "./data/screenshots"
   temp_dir: "./data/tmp"
 
 adb:
-  device_serial: "127.0.0.1:5555"
-  command_timeout_s: 15.0
-  connect_timeout_s: 10.0
-  adb_path: ""
-  post_tap_delay_ms: 250
-  post_swipe_delay_ms: 400
-  post_keyevent_delay_ms: 200
+  serial: ""
+  adb_path: "adb"
+  exec_timeout_s: 15
+  connect_on_start: false
+  device_resolution_cache: true
 
-screen:
-  expected_width: 1280
-  expected_height: 720
-  capture_format: "png"
-  rotation: 0
+ldplayer:
+  instance_name: ""
+  window_title: ""
+  expected_width: 0
+  expected_height: 0
+
+game:
+  name: "Выживание в подземелье 2"
+  team_size: 4
+  locations_count: 7
+  floors_per_location: 100
+  random_subfloors_per_level: 7
+  enter_all_doors: true
+  clear_room_immediately: true
+  skip_events_by_exit: true
+  never_return_to_opened_rooms: true
+  auto_battle_only: true
+  has_energy_system: false
+  use_next_floor_template_only: true
+  current_location: 1
+  current_level: 1
 
 motion:
   stable_frames: 3
-  stable_diff_threshold: 2.5
-  stable_poll_ms: 250
+  stable_diff_threshold: 0.015
+  stable_poll_ms: 350
   stable_timeout_s: 8.0
   max_stable_retries: 2
-  downscale_size: [64, 36]
+  downscale_size: [160, 90]
 
 matching:
-  default_threshold: 0.90
-  classify_threshold: 0.90
   method: "TM_CCOEFF_NORMED"
-  grayscale: true
+  default_threshold: 0.88
+  classify_threshold: 0.90
+  use_profile_rois: true
 
-teacher:
+timings:
+  tap_after_screenshot_delay_ms: 100
+  post_tap_delay_ms: 250
+  post_back_delay_ms: 350
+  after_room_enter_delay_ms: 300
+  after_exit_delay_ms: 300
+  next_floor_delay_ms: 500
+  auto_battle_check_interval_ms: 500
+  battle_timeout_s: 180
+
+teaching:
+  enabled: true
   pause_hotkey: "space"
-  knowledge_dir: "./data/knowledge"
-  save_unknown_frames: true
-  unknown_dir: "./data/knowledge/unknown"
+  allow_teach_on_unstable_timeout: true
+  unstable_screen_label: "экран не стабилизировался"
+  save_crops_as_templates: true
+  save_fullscreen_debug_copy: true
 
 safety:
-  block_purchases: true
-  block_ads: true
-  block_pvp: true
   stop_on_danger: true
-  enforce_safe_actions: false
+  forbid_purchases: true
+  forbid_ads: true
+  forbid_pvp: true
+  min_action_interval_ms: 250
+  allow_ads: false
+  allow_purchase: false
+  allow_premium_currency: false
+  allow_pvp: false
+  random_delay_min_ms: 0
+  random_delay_max_ms: 0
+  max_consecutive_network_errors: 3
+
+storage:
+  rules_file: "./data/rules.json"
+  features_file: "./data/features.json"
+  progress_file: "./data/progress.json"
+  floor_state_dir: "./data/floors"
+  knowledge_dir: "./data/knowledge"
+  backups_enabled: true
+  atomic_write: true
 
 profiles:
-  active: "default"
-  items:
-    default:
-      name: "default"
-      rois:
-        party_marker: [0, 0, 1280, 720]
-        room_open_big_icon: [0, 0, 1280, 720]
-        door_search: [0, 0, 1280, 720]
-        room_screen: [0, 0, 1280, 720]
-        passage_screen: [0, 0, 1280, 720]
-        event_screen: [0, 0, 1280, 720]
-        mob: [0, 0, 1280, 720]
-        boss: [0, 0, 1280, 720]
-        loot: [0, 0, 1280, 720]
-        exit: [0, 0, 1280, 720]
-        auto_battle: [0, 0, 1280, 720]
-        next_floor: [0, 0, 1280, 720]
-        danger: [0, 0, 1280, 720]
-      actions:
-        exit_tap: [100, 100]
-        auto_battle_tap: [1100, 650]
-        next_floor_tap: [1180, 660]
-      timings:
-        after_room_enter_ms: 500
-        after_exit_ms: 500
-        after_next_floor_ms: 1000
-        battle_settle_timeout_s: 120.0
-
-progress:
-  file: "./data/progress.json"
-
-knowledge:
-  rules_file: "./data/knowledge/rules.json"
-  features_file: "./data/knowledge/features.json"
-
-state:
-  dir: "./data/state"
-  floor_state_file_pattern: "floor_{floor_number}.json"
-
-exploration:
-  default_floor_from: 1
-  default_floor_to: 100
-  enter_all_doors: true
-  skip_events_by_exit: true
-  revisit_open_rooms: false
-  max_attempts_per_door: 1
-
-# добавлены по задаче как обязательные присутствующие ключи
-# даже если текущий код их не читает напрямую
-
-game:
-  current_location: ""
-  current_level: 1
+  active: "loc1"
+  available:
+    - "loc1"
+    - "loc2"
+    - "loc3"
+    - "loc4"
+    - "loc5"
+    - "loc6"
+    - "loc7"
+  list:
+    - id: "loc1"
+      name: "loc1"
+    - id: "loc2"
+      name: "loc2"
+    - id: "loc3"
+      name: "loc3"
+    - id: "loc4"
+      name: "loc4"
+    - id: "loc5"
+      name: "loc5"
+    - id: "loc6"
+      name: "loc6"
+    - id: "loc7"
+      name: "loc7"
+  ranges:
+    loc1:
+      floor_from: 1
+      floor_to: 100
+      run_all_floors: false
+    loc2:
+      floor_from: 1
+      floor_to: 100
+      run_all_floors: false
+    loc3:
+      floor_from: 1
+      floor_to: 100
+      run_all_floors: false
+    loc4:
+      floor_from: 1
+      floor_to: 100
+      run_all_floors: false
+    loc5:
+      floor_from: 1
+      floor_to: 100
+      run_all_floors: false
+    loc6:
+      floor_from: 1
+      floor_to: 100
+      run_all_floors: false
+    loc7:
+      floor_from: 1
+      floor_to: 100
+      run_all_floors: false
+  details:
+    loc1:
+      display_name: "loc1"
+      screen_width: null
+      screen_height: null
+      rois: {}
+      thresholds: {}
+      path_to_location: []
+      floor_selection:
+        mode: "untrained"
+        next_floor_action: null
+        list_roi: null
+        swipe_start_x: null
+        swipe_start_y: null
+        swipe_end_x: null
+        swipe_end_y: null
+        swipe_duration_ms: 300
+        swipe_step_limit: 0
+        floor_templates: []
+    loc2:
+      display_name: "loc2"
+      screen_width: null
+      screen_height: null
+      rois: {}
+      thresholds: {}
+      path_to_location: []
+      floor_selection:
+        mode: "untrained"
+        next_floor_action: null
+        list_roi: null
+        swipe_start_x: null
+        swipe_start_y: null
+        swipe_end_x: null
+        swipe_end_y: null
+        swipe_duration_ms: 300
+        swipe_step_limit: 0
+        floor_templates: []
+    loc3:
+      display_name: "loc3"
+      screen_width: null
+      screen_height: null
+      rois: {}
+      thresholds: {}
+      path_to_location: []
+      floor_selection:
+        mode: "untrained"
+        next_floor_action: null
+        list_roi: null
+        swipe_start_x: null
+        swipe_start_y: null
+        swipe_end_x: null
+        swipe_end_y: null
+        swipe_duration_ms: 300
+        swipe_step_limit: 0
+        floor_templates: []
+    loc4:
+      display_name: "loc4"
+      screen_width: null
+      screen_height: null
+      rois: {}
+      thresholds: {}
+      path_to_location: []
+      floor_selection:
+        mode: "untrained"
+        next_floor_action: null
+        list_roi: null
+        swipe_start_x: null
+        swipe_start_y: null
+        swipe_end_x: null
+        swipe_end_y: null
+        swipe_duration_ms: 300
+        swipe_step_limit: 0
+        floor_templates: []
+    loc5:
+      display_name: "loc5"
+      screen_width: null
+      screen_height: null
+      rois: {}
+      thresholds: {}
+      path_to_location: []
+      floor_selection:
+        mode: "untrained"
+        next_floor_action: null
+        list_roi: null
+        swipe_start_x: null
+        swipe_start_y: null
+        swipe_end_x: null
+        swipe_end_y: null
+        swipe_duration_ms: 300
+        swipe_step_limit: 0
+        floor_templates: []
+    loc6:
+      display_name: "loc6"
+      screen_width: null
+      screen_height: null
+      rois: {}
+      thresholds: {}
+      path_to_location: []
+      floor_selection:
+        mode: "untrained"
+        next_floor_action: null
+        list_roi: null
+        swipe_start_x: null
+        swipe_start_y: null
+        swipe_end_x: null
+        swipe_end_y: null
+        swipe_duration_ms: 300
+        swipe_step_limit: 0
+        floor_templates: []
+    loc7:
+      display_name: "loc7"
+      screen_width: null
+      screen_height: null
+      rois: {}
+      thresholds: {}
+      path_to_location: []
+      floor_selection:
+        mode: "untrained"
+        next_floor_action: null
+        list_roi: null
+        swipe_start_x: null
+        swipe_start_y: null
+        swipe_end_x: null
+        swipe_end_y: null
+        swipe_duration_ms: 300
+        swipe_step_limit: 0
+        floor_templates: []
 
 debug:
-  save_every_capture: false
-  save_matched_frames: false
-  annotate_matches: false
+  save_raw_screenshots: false
+  save_stability_samples: false
+  save_match_visualization: false
+  dry_run: false
