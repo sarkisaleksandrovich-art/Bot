@@ -1,0 +1,358 @@
+---
+research_ldplayer_bot_tech_stack:
+  description: 'Исследуй, как автоматизировать Android-игры в эмуляторе LD Player
+    на Windows с помощью Python: настройка ADB в LDPlayer (порты, adb.exe из папки
+    эмулятора), команды ldconsole/dnconsole, фиксация разрешения и DPI, получение
+    скриншотов (adb exec-out screencap), тапы/свайпы (adb shell input), распознавание
+    кнопок через OpenCV template matching, OCR при необходимости, библиотеки (ppadb/adbutils,
+    opencv-python, numpy). Сравни варианты и рекомендуй простой надёжный стек. Укажи
+    типичные проблемы и источники.'
+  expected_output: 'Технический отчёт на русском в markdown: рекомендуемый стек с
+    обоснованием, пошаговая настройка LDPlayer, примеры команд, список библиотек,
+    типичные проблемы и их решения, источники.'
+  agent: ldplayer_automation_researcher
+  async_execution: true
+design_architecture_and_contracts:
+  description: |-
+    Спроектируй архитектуру ОБУЧАЕМОГО бота для LDPlayer и игры «Выживание в подземелье 2». Модель игры (от пользователя): 4 героя в отряде; 7 локаций по 100 уровней, на уровне 7 случайных этажей; число комнат неизвестно, путь случайный. Двери снаружи неотличимы: комната (моб/лут/событие) или путь дальше, тип виден только после входа. Открытые комнаты на карте показываются большой иконкой, возвращаться в них нельзя. Бот заходит во все двери, комнату зачищает сразу, событие пропускает простым выходом из комнаты без запуска события (кнопки пропуска нет), затем идёт дальше по карте; когда unvisited дверей нет, переходит на следующий этаж. Бой только авто-боем игры, энергии нет.
+    ВАЖНО ПРО АНИМАЦИЮ И ВНЕШНИЙ ВИД: при движении отряда идёт анимация, а фон локаций всегда разный. Статичны только события, мобы, боссы, лут и интерфейс. Поэтому: (а) распознавание строится по СТАТИЧНЫМ объектам (поиск эталона-фрагмента в ROI через matchTemplate), а НЕ по сходству всего экрана; (б) после любого действия движения бот ждёт СТАБИЛИЗАЦИИ кадра (несколько подряд почти одинаковых скриншотов по сравнению уменьшенных копий с порогом из конфига, с общим таймаутом) и только потом классифицирует экран; (в) во время анимации бот НИКОГДА не вызывает окно обучения и не пишет правила; (г) окно обучения вызывается только если кадр стабилен И ни один эталон не найден; если стабильности нет до таймаута, подождать ещё ограниченное число раз и только потом спросить с пометкой «экран не стабилизировался»; (д) эталоны сохраняются как вырезанные рамкой фрагменты, а не весь экран.
+    ОБУЧЕНИЕ ПОЛЬЗОВАТЕЛЕМ: пользователь сам ставит бота на паузу клавишей Пробел и выделяет объекты рамкой, выбирая тип клавишей. Контракт teacher_ui: pause_requested() -> bool (проверяется на каждом шаге и в циклах ожидания explorer/floor), show_and_label(frame, knowledge) для разметки, teach_only(adb, screenshot, knowledge) для режима «только разметка» (бот ничего не нажимает, пользователь играет сам). Категории эталонов (единый список для knowledge, vision, floor, explorer): door_marker, party_marker, room_open_big_icon, room_screen, passage_screen, event_screen, mob, boss, loot, exit, auto_battle, next_floor, danger.
+    Выдай: 1) дерево проекта (main.py, config.yaml, requirements.txt, bot/__init__.py, config.py, logging_setup.py, adb_controller.py, screenshot.py, vision.py, safety.py, knowledge.py, teacher_ui.py, profiles.py, floor_state.py, floor.py, explorer.py) — всего 16 файлов; 2) config.yaml с комментариями, включая секцию motion: stable_frames, stable_diff_threshold, stable_poll_ms, stable_timeout_s, max_stable_retries, downscale_size; 3) форматы rules.json, features.json, floor_state.json (статусы дверей unvisited, passage, in_progress, cleared, skipped, failed), progress.json и список категорий эталонов выше; 4) КОНТРАКТ каждого модуля: точные имена классов, методов, типы аргументов, возвращаемые значения, исключения. Для floor_state.py: хранение графа дверей и статусов, атомарная запись floor_state.json, выбор следующей цели (никогда не выбирать in_progress, cleared, skipped, failed и room_open_big_icon), отметка in_progress на диск сразу после входа. Для floor.py: FloorExplorer(adb, screenshot, vision, knowledge, safety, teacher_ui, config, profile).run(floor_number) -> FloorResult(status, rooms_cleared, rooms_skipped, rooms_failed, reason), использует floor_state. В контракте vision обязательно: wait_until_stable(capture_fn, ...) -> (frame, is_stable), find(frame, template, roi, threshold) -> Match|None, classify_screen(frame, templates) -> имя экрана|None; 5) CLI режимы main.py: --config, --check, --capture, --teach (по умолчанию, с паузой по Пробелу), --teach-only, --profile, --floor-from, --floor-to, --list-profiles, --reset-knowledge; 6) правила: покупки, реклама и PvP заблокированы по умолчанию, danger останавливает бота, неизвестное (при стабильном кадре) идёт через разметку пользователя, внешний вид объектов не выдумывать.
+  expected_output: 'Документ на русском: дерево проекта из 16 файлов (включая floor_state.py),
+    config.yaml (с секцией motion), форматы файлов, единый список категорий эталонов,
+    контракт модулей (включая floor_state, wait_until_stable, classify_screen, pause_requested,
+    teach_only), режимы CLI, общие правила.'
+  agent: bot_architect
+  context:
+  - research_ldplayer_bot_tech_stack
+write_core_modules:
+  description: 'По контракту архитектора напиши ПОЛНЫЙ код файлов: bot/__init__.py,
+    bot/config.py (загрузка YAML, доступ к секциям, пути шаблонов, пороги, ROI, секция
+    motion, валидация), bot/logging_setup.py (консоль и файл). Файлы config.yaml и
+    requirements.txt пишет другой агент, их не пиши; в config.py используй ключи из
+    контракта и перечисли в ответе все ключи конфига, которые читает config.py. Используй
+    точные имена и сигнатуры из контракта. Мысленно проверь синтаксис и импорты. Каждый
+    файл выдай целиком в отдельном блоке кода.'
+  expected_output: Полный код bot/__init__.py, bot/config.py и bot/logging_setup.py,
+    каждый в своём блоке кода, и список ключей конфига, которые читает config.py,
+    с короткими пояснениями на русском.
+  agent: core_infrastructure_developer
+  async_execution: true
+  context:
+  - design_architecture_and_contracts
+write_vision_module:
+  description: 'По контракту архитектора напиши ПОЛНЫЙ код bot/vision.py с сохранением
+    отступов Python, в одном блоке кода. Фон локаций всегда разный и анимируется,
+    поэтому НЕ сравнивай весь экран с эталоном экрана. Требования: 1) загрузка шаблонов
+    (обязательные и необязательные) в оттенках серого, шаблон хранится вместе с категорией
+    и ROI; 2) find(frame, template, roi, threshold) -> Match|None через cv2.matchTemplate
+    (TM_CCOEFF_NORMED); кадр приводится к серому; если задан ROI (x, y, w, h), поиск
+    идёт внутри ROI, а координаты центра и рамки ОБЯЗАТЕЛЬНО смещаются на (x, y) в
+    координаты полного кадра; Match содержит центр, score, рамку; 3) find_any и find_all
+    по списку шаблонов (учитывать и обязательные, и необязательные); 4) classify_screen(frame,
+    templates) -> имя экрана|None: для каждого экрана ищет ИМЕННО его шаблон-фрагмент
+    в его ROI с его порогом, возвращает имя экрана с лучшим совпадением или None,
+    не возвращает первое попавшееся имя; 5) wait_until_stable(capture_fn, stable_frames,
+    diff_threshold, poll_ms, timeout_s) -> (frame, is_stable): capture_fn вызывается
+    без аргументов; кадры приводятся к серому и уменьшаются до downscale_size из секции
+    motion конфига (не зашитый размер); хранится предыдущий УМЕНЬШЕННЫЙ СЕРЫЙ кадр,
+    сравнение mean absdiff; кадр стабилен, когда stable_frames подряд различаются
+    меньше порога; пауза time.sleep(poll_ms/1000), не cv2.waitKey; при таймауте вернуть
+    последний полноразмерный кадр и False; 6) is_animating(prev, cur, threshold) ->
+    bool с теми же правилами приведения; 7) wait_for(capture_fn, template, roi, threshold,
+    timeout_s) -> Match|None: на каждой итерации делает НОВЫЙ кадр через capture_fn;
+    8) сохранение отладочного изображения с рамками совпадений и ROI. Все параметры
+    из секции motion конфига. Используй точные имена из контракта. Мысленно проверь
+    синтаксис и импорты.'
+  expected_output: Полный код bot/vision.py в блоке кода с правильными отступами и
+    краткое описание публичных методов (особенно wait_until_stable, classify_screen)
+    на русском.
+  agent: computer_vision_developer
+  async_execution: true
+  context:
+  - design_architecture_and_contracts
+write_safety_module:
+  description: 'По контракту архитектора напиши ПОЛНЫЙ код bot/safety.py: флаги allow_ads,
+    allow_purchase, allow_premium_currency, allow_pvp из конфига (по умолчанию все
+    false), проверка, можно ли выполнять действие для правила с учётом метки dangerous,
+    функция random_delay со случайной задержкой из конфига, счётчик подряд идущих
+    ошибок сети с ограничением повторов. Никаких названий кнопок не придумывай, всё
+    берётся из базы знаний. Мысленно проверь синтаксис и импорты.'
+  expected_output: Полный код bot/safety.py в блоке кода и описание защитных правил
+    на русском.
+  agent: safety_and_popups_developer
+  async_execution: true
+  context:
+  - design_architecture_and_contracts
+write_knowledge_base:
+  description: 'По контракту архитектора напиши ПОЛНЫЙ код bot/knowledge.py. Загрузка
+    и атомарное сохранение rules.json, features.json и PNG-фрагментов. Эталоны хранятся
+    как вырезанные рамкой фрагменты (не целый экран) с категорией и областью поиска.
+    Категории строго из контракта: door_marker, party_marker, room_open_big_icon,
+    room_screen, passage_screen, event_screen, mob, boss, loot, exit, auto_battle,
+    next_floor, danger. Поиск объектов по фрагментам на стабильном кадре, times_used,
+    поддержка папок профилей и knowledge/common. Событие (event_screen) бот не запускает,
+    а просто выходит из комнаты. Публичные методы нужны для teacher_ui.py: добавление
+    эталона по рамке и категории, добавление точки нажатия, отмена последней разметки,
+    сохранение. Окно обучения (teacher_ui.py) пишет другой агент, его не пиши. Используй
+    только OpenCV, NumPy и стандартную библиотеку. Мысленно проверь синтаксис и импорты.'
+  expected_output: Полный код bot/knowledge.py в блоке кода, формат features.json
+    и список публичных методов с сигнатурами на русском.
+  agent: knowledge_base_developer
+  async_execution: true
+  context:
+  - design_architecture_and_contracts
+write_adb_module:
+  description: 'По контракту архитектора напиши ПОЛНЫЙ код bot/adb_controller.py:
+    subprocess, serial, tap, swipe, keyevent, check_connection, get_screen_size, таймауты,
+    класс AdbError. Используй точные имена и сигнатуры из контракта; перечисли в ответе
+    публичные сигнатуры. Мысленно проверь синтаксис и импорты. Файл screenshot.py
+    пишет другой агент, его не пиши.'
+  expected_output: Полный код bot/adb_controller.py в блоке кода и список публичных
+    сигнатур на русском.
+  agent: adb_module_developer
+  async_execution: true
+  context:
+  - design_architecture_and_contracts
+write_location_profiles_module:
+  description: 'По контракту архитектора напиши ПОЛНЫЙ код bot/profiles.py. Профили
+    локаций: в config.yaml список из 7 профилей (id, name, по умолчанию loc1..loc7;
+    названия пользователь меняет сам). У каждого профиля своя папка knowledge/<profile_id>/
+    с rules.json и screens/, поэтому обучение для разных локаций не смешивается. Общие
+    правила (например, закрыть всплывающее окно) лежат в knowledge/common/ и доступны
+    всем профилям. Для профиля хранится: путь до локации из главного меню (последовательность
+    обученных шагов) и способ выбора этажа в открывшемся меню уровней. Способ выбора
+    этажа НЕ выдумывай: он обучается пользователем в режиме --teach. Поддержи оба
+    варианта: (а) кнопка «следующий этаж» после победы (обучается один раз), (б) выбор
+    этажа из списка: пользователь кликает по нужному номеру, бот сохраняет эталон
+    и при необходимости свайп для прокрутки списка (дополнительно, OCR не использовать).
+    Диапазон этажей задаётся в config.yaml: profile, floor_from, floor_to, run_all_floors.
+    Функции: загрузка профиля, список профилей, выбор профиля из командной строки
+    (--profile loc3), запись и чтение прогресса (последний пройденный этаж, файл progress.json
+    в папке профиля, чтобы можно было продолжить), остановка по достижении floor_to.
+    Используй только точные имена из контракта. Мысленно проверь синтаксис и импорты.'
+  expected_output: Полный код bot/profiles.py в блоке кода, формат progress.json,
+    секция profiles для config.yaml с комментариями и описание публичных методов на
+    русском.
+  agent: location_profiles_developer
+  context:
+  - design_architecture_and_contracts
+  - write_core_modules
+write_teacher_ui:
+  description: 'По контракту архитектора и API knowledge.py напиши ПОЛНЫЙ код bot/teacher_ui.py.
+    Окно OpenCV (imshow, setMouseCallback). Пользователь ставит бота на паузу клавишей
+    Пробел, выделяет объект рамкой мышью и клавишей выбирает тип: d дверь, m моб,
+    g босс, l лут, e событие (бот его не запускает, просто выходит из комнаты, кнопки
+    пропуска нет), x выход, a авто-бой, f следующий этаж, p маркер отряда, z опасное,
+    o большая иконка открытой комнаты, r экран комнаты, t экран пути дальше. Клик
+    без рамки обучает точку нажатия. Backspace отменяет последнюю разметку, Enter
+    сохраняет, Пробел продолжает работу, q выходит. Функции: pause_requested() ->
+    bool, show_and_label(frame, knowledge), teach_only(adb, screenshot, knowledge)
+    (бот ничего не нажимает, пользователь играет сам). Во время паузы анимация не
+    мешает. Окно закрывается корректно. Только OpenCV, NumPy и стандартная библиотека.
+    Мысленно проверь синтаксис и импорты.'
+  expected_output: Полный код bot/teacher_ui.py в блоке кода и список клавиш на русском.
+  agent: teacher_ui_developer
+  context:
+  - design_architecture_and_contracts
+  - write_knowledge_base
+write_screenshot_module:
+  description: 'По контракту архитектора и по РЕАЛЬНОМУ коду adb_controller.py из
+    контекста напиши ПОЛНЫЙ код bot/screenshot.py: захват через adb exec-out screencap
+    -p, декодирование OpenCV (cv2.imdecode), проверка размера кадра по config, функция/метод
+    получения кадра для vision.wait_until_stable (capture_fn без аргументов), сохранение
+    скриншотов в screenshots/ и аварийных скриншотов. Вызывай только те методы adb_controller,
+    которые реально есть; если нужного нет, напиши об этом явно. Мысленно проверь
+    синтаксис и импорты. Выдай код целиком в блоке и перечисли публичные сигнатуры.'
+  expected_output: Полный код bot/screenshot.py в блоке кода и список публичных сигнатур
+    на русском.
+  agent: screenshot_module_developer
+  context:
+  - design_architecture_and_contracts
+  - write_core_modules
+  - write_adb_module
+write_config_yaml_and_requirements:
+  description: 'Напиши config.yaml и requirements.txt. Сверяй каждый ключ с кодом
+    из контекста: config.py (какие ключи он читает), vision.py, safety.py, knowledge.py,
+    profiles.py. Обязательные секции: motion (stable_frames, stable_diff_threshold,
+    stable_poll_ms, stable_timeout_s, max_stable_retries, downscale_size), safety
+    (allow_ads, allow_purchase, allow_premium_currency, allow_pvp, все false, плюс
+    задержки и повторы), profiles (7 профилей loc1..loc7, profile, floor_from, floor_to,
+    run_all_floors), пути, adb (путь к adb.exe, serial), лимиты шагов и времени. Не
+    добавляй ключей, которые никто не читает; не придумывай значения внешнего вида
+    игры. Каждый параметр прокомментируй по-русски для новичка. В requirements.txt
+    только реально импортируемые библиотеки (opencv-python, numpy, PyYAML и то, что
+    реально импортирует код). В конце дай таблицу «ключ: кто читает».'
+  expected_output: 'Полный config.yaml одним блоком, requirements.txt в блоке и таблица
+    «ключ конфига: модуль, который его читает», на русском.'
+  agent: config_and_requirements_developer
+  context:
+  - design_architecture_and_contracts
+  - write_core_modules
+  - write_adb_module
+  - write_vision_module
+  - write_safety_module
+  - write_knowledge_base
+  - write_location_profiles_module
+write_floor_state_module:
+  description: 'По контракту архитектора и коду config.py и config.yaml из контекста
+    напиши ПОЛНЫЙ код bot/floor_state.py. Содержимое: класс FloorState (идентификатор
+    этажа, список дверей/узлов с id, наблюдаемыми координатами, статусом и счётчиком
+    попыток; фаза; прогресс); статусы строго unvisited, passage, in_progress, cleared,
+    skipped, failed; методы: добавить/обновить дверь по координатам с допуском, set_status
+    (in_progress сразу пишется на диск), next_target (ближайшая unvisited дверь к
+    маркеру отряда; НИКОГДА не возвращает in_progress, cleared, skipped, failed и
+    узлы с большой иконкой открытой комнаты), has_unvisited, increment_attempts и
+    пометка failed при превышении лимита, найденный при старте in_progress (метод,
+    который сообщает об этом вызывающему коду, сам он ничего не решает); атомарная
+    запись floor_state.json (временный файл + os.replace), загрузка с защитой от повреждённого
+    файла, очистка при новом этаже. Событие пропускается выходом, итоговый статус
+    skipped. Никакого внешнего вида игры не выдумывай, координаты приходят от вызывающего
+    кода. Выдай код целиком, затем список публичных сигнатур и формат floor_state.json.'
+  expected_output: Полный код bot/floor_state.py в блоке кода, точный список публичных
+    сигнатур и формат floor_state.json на русском.
+  agent: floor_state_developer
+  context:
+  - design_architecture_and_contracts
+  - write_core_modules
+  - write_config_yaml_and_requirements
+write_floor_exploration_module:
+  description: |-
+    По контракту архитектора и по РЕАЛЬНОМУ коду модулей из контекста (config, adb_controller, screenshot, vision, safety, knowledge, teacher_ui, profiles, floor_state) напиши ПОЛНЫЙ код bot/floor.py. Используй ТОЛЬКО имена, методы и сигнатуры, которые реально есть в этом коде; ничего не выдумывай, при отсутствии нужного метода напиши об этом явно. Состояние дверей и floor_state.json веди ТОЛЬКО через FloorState из floor_state.py, свою логику хранения не дублируй.
+    Интерфейс (его вызовет explorer.py, зафиксируй точно): класс FloorExplorer, конструктор принимает adb, screenshot, vision, knowledge, safety, teacher_ui, config, profile; метод run(floor_number) -> FloorResult (поля status, rooms_cleared, rooms_skipped, rooms_failed, reason).
+    Модель игры: отряд из 4 героев; на этаже случайные двери, снаружи неотличимые: комната (моб, лут или событие) либо путь дальше, тип видно только после входа; число комнат неизвестно; открытая комната на карте показывается БОЛЬШОЙ иконкой, возвращаться в неё нельзя.
+    Алгоритм: 1) найти на карте маркер отряда и маркеры дверей по эталонам из базы знаний; 2) обновлять FloorState; 3) идти к ближайшей unvisited двери и войти, сразу записать in_progress на диск; 4) после КАЖДОГО тапа движения и входа вызвать vision.wait_until_stable с параметрами секции motion; пока идёт анимация ничего не классифицировать и пользователя не спрашивать; 5) на стабильном кадре определить по статичным эталонам room_screen или passage_screen (классификация по фрагментам в ROI, не по всему экрану); при сомнении остановиться и дать разметить кадр через teacher_ui; 6) путь дальше: статус passage, продолжить; 7) комната: моб или босс — включить штатный авто-бой и ждать конца; лут — забрать тапом по эталону loot; событие (event_screen) — НЕ запускать, ничего не нажимать, просто выйти из комнаты через эталон exit, статус skipped; после выхода из моба или лута статус cleared; 8) room_open_big_icon никогда не цель; цели не выбираются для in_progress, cleared, skipped, failed; 9) в начале каждого шага и в каждом цикле ожидания вызывать teacher_ui.pause_requested(); при паузе остановить действия, показать кадр, дать разметить рамкой и продолжить по Пробелу; 10) при старте, если найден in_progress, спросить пользователя, не входить наугад; 11) счётчик попыток на дверь и экран, при превышении failed; 12) если маркер отряда не найден или нет известных объектов на СТАБИЛЬНОМ кадре — остановиться и дать разметить; 13) когда unvisited дверей нет — нажать next_floor; 14) danger останавливает бота; покупки, реклама и PvP блокируются через safety; 15) режим teach_only: ничего не нажимать. Энергию не проверять, бой только штатным авто-боем. Мысленно проверь синтаксис, импорты и отсутствие циклических импортов.
+  expected_output: Полный код bot/floor.py в блоке кода, точные сигнатуры FloorExplorer
+    и FloorResult, список вызовов других модулей с реальными именами, места вызовов
+    wait_until_stable и pause_requested; на русском.
+  agent: floor_exploration_developer
+  context:
+  - design_architecture_and_contracts
+  - write_core_modules
+  - write_adb_module
+  - write_screenshot_module
+  - write_vision_module
+  - write_safety_module
+  - write_knowledge_base
+  - write_teacher_ui
+  - write_location_profiles_module
+  - write_config_yaml_and_requirements
+  - write_floor_state_module
+write_explorer_loop:
+  description: |-
+    По контракту архитектора и по РЕАЛЬНОМУ коду модулей из контекста напиши ПОЛНЫЙ код bot/explorer.py. Используй только реально существующие имена и сигнатуры; FloorExplorer вызывай строго по сигнатуре из результата задачи Write Floor Exploration Module (конструктор и run(floor_number) -> FloorResult); при расхождении подстройся под floor.py и напиши об этом.
+    Задача explorer.py: оркестрация уровня локации, комнаты и карту обрабатывает floor.py. 1) собирает объекты (adb, screenshot, vision, knowledge, safety, teacher_ui, config) и профиль локации через profiles.py (правила сначала из профиля, затем из knowledge/common); 2) режимы run_explore (автономная разведка) и run_teach_only (бот ничего не нажимает, только показывает кадр и сохраняет разметку через teacher_ui.teach_only); 3) идёт по этажам от floor_from до floor_to: для каждого FloorExplorer.run, читает FloorResult, пишет прогресс через profiles.py (progress.json), при failed или danger останавливается с понятной причиной; 4) в начале каждой итерации и в каждом цикле ожидания вызывает teacher_ui.pause_requested(); при паузе останавливает действия, показывает кадр, даёт разметить и продолжает по Пробелу; 5) после любого тапа движения вызывает vision.wait_until_stable (параметры секции motion), во время анимации ничего не распознаёт и не спрашивает; 6) окно обучения открывается только на стабильном кадре без известных эталонов, при нестабильности до таймаута спрашивает с пометкой «экран не стабилизировался»; 7) защита: лимиты шагов и времени, детектор зависания (один и тот же СТАБИЛЬНЫЙ экран N шагов подряд, анимация зависанием не считается), аварийный скриншот при ошибке; покупки, реклама и PvP не нажимаются без разрешения в конфиге; danger останавливает бота; энергию не проверять; бой только штатным авто-боем. Мысленно проверь синтаксис, импорты, отсутствие циклических импортов.
+  expected_output: Полный код bot/explorer.py в блоке кода, список публичных функций
+    с сигнатурами (их вызовет main.py), схема шага цикла и условия остановки, места
+    вызовов wait_until_stable и pause_requested; на русском.
+  agent: explorer_logic_developer
+  context:
+  - design_architecture_and_contracts
+  - write_core_modules
+  - write_adb_module
+  - write_screenshot_module
+  - write_vision_module
+  - write_safety_module
+  - write_knowledge_base
+  - write_teacher_ui
+  - write_location_profiles_module
+  - write_config_yaml_and_requirements
+  - write_floor_state_module
+  - write_floor_exploration_module
+write_cli_entry_point:
+  description: 'По контракту архитектора и по РЕАЛЬНОМУ коду модулей из контекста
+    напиши ПОЛНЫЙ код main.py с argparse. Используй только реально существующие имена
+    и сигнатуры; если нужной функции нет, напиши об этом явно. Режимы: --config; --check
+    (adb.exe, serial, версия Android, размер экрана, папка knowledge и список профилей,
+    итог ОК или ошибки); --capture (скриншот в screenshots/ и вывод пути); --teach
+    (разведка с окном обучения и паузой по Пробелу, режим по умолчанию, вызывает explorer.run_explore);
+    --teach-only (только разметка: бот сам ничего не нажимает, пользователь играет
+    сам и размечает рамкой, вызывает explorer.run_teach_only); --profile <id> (например
+    loc3); --floor-from N; --floor-to N; --list-profiles (профили и число выученных
+    эталонов); --reset-knowledge (с подтверждением, резервная копия, только выбранный
+    профиль). Корректные коды возврата, понятные сообщения об ошибках. Каждый режим
+    из списка должен быть РЕАЛЬНО реализован и вызывать существующую функцию. Мысленно
+    проверь синтаксис и импорты.'
+  expected_output: Полный код main.py в блоке кода, таблица режимов (режим, какую
+    функцию какого модуля вызывает), примеры команд --check, --capture, --teach --profile
+    loc1, --teach-only --profile loc1, --list-profiles; на русском.
+  agent: cli_and_setup_tools_developer
+  context:
+  - design_architecture_and_contracts
+  - write_core_modules
+  - write_adb_module
+  - write_screenshot_module
+  - write_knowledge_base
+  - write_teacher_ui
+  - write_location_profiles_module
+  - write_config_yaml_and_requirements
+  - write_explorer_loop
+final_cross_module_audit:
+  description: |-
+    Проведи единый статический аудит ВСЕХ 16 файлов проекта (main.py, config.yaml, requirements.txt, bot/__init__.py, config.py, logging_setup.py, adb_controller.py, screenshot.py, vision.py, safety.py, knowledge.py, teacher_ui.py, profiles.py, floor_state.py, floor.py, explorer.py) по их коду из результатов задач-писателей. Не доверяй фразам «совпадает с контрактом», проверяй по тексту кода. Если файла нет в результатах, напиши «ФАЙЛ X ОТСУТСТВУЕТ» и напиши его сам.
+    Шаг 1. Таблица символов: для каждого класса и модуля все публичные и приватные методы с точной сигнатурой (число и имена аргументов, keyword-only), поля dataclass, свойства, исключения.
+    Шаг 2. Пройди по КАЖДОМУ файлу и КАЖДОМУ вызову obj.method(...), Class(...), module.func(...) и обращению obj.attr. Проверь: символ существует; число и имена аргументов совпадают; нет повторной передачи self или state; тип возврата используется правильно (кортеж распаковывается верно); метод вызывается у объекта нужного класса (FloorState или FloorStateStore).
+    Шаг 3. Каждый config.get/require/section ключ в коде должен быть в config.yaml; без ключа допустимо только явное значение по умолчанию, иначе добавь ключ в YAML.
+    Шаг 4. Импорты: каждое импортируемое имя определено; циклических импортов нет; все сторонние библиотеки есть в requirements.txt.
+    Шаг 5. Режимы main.py (--config, --check, --capture, --teach, --teach-only, --profile, --floor-from, --floor-to, --list-profiles, --reset-knowledge): проследи цепочку вызовов до самого глубокого и убедись, что каждое звено существует.
+    Шаг 6. Обязательные проверки поведения: (1) vision.wait_until_stable вызывается в floor.py и explorer.py после каждого тапа движения и входа в дверь; (2) teacher_ui.pause_requested() вызывается в начале каждого шага и в циклах ожидания; (3) окно обучения открывается только на стабильном кадре без известных эталонов; (4) распознавание идёт по фрагментам в ROI; (5) событие не запускается: выход через эталон exit, статус skipped; (6) в teach_only бот ничего не нажимает; (7) next_target не возвращает in_progress, cleared, skipped, failed и большие иконки открытых комнат; (8) покупки, реклама и PvP заблокированы по умолчанию, danger останавливает бота; (9) бот не падает на пустой базе знаний.
+    Известные баги, которые ОБЯЗАТЕЛЬНО проверь и исправь, если они ещё есть: (а) FloorStateStore.has_unvisited_doors вызывает state.has_unvisited_doors(state) с лишним аргументом; (б) floor.py вызывает self.state.in_progress_nodes(), которого нет в FloorState; (в) ключи game.current_location и game.current_level отсутствуют в config.yaml.
+    Исправляй минимальной правкой. Если исправление затрагивает контракт другого модуля, правь вызывающую сторону, а не определение, пока это не ломает логику.
+  expected_output: 'На русском в markdown: 1) таблица символов (кратко, по модулям);
+    2) таблица найденных расхождений: файл, строка или функция, что не так, как исправлено;
+    3) результаты проверок поведения (1)-(9) с названиями функций; 4) строка «Расхождений
+    после исправления: N» с честным числом; 5) ИСПРАВЛЕННЫЕ файлы целиком, каждый
+    в своём блоке кода, только те, что менялись; 6) список того, что нельзя проверить
+    без реального запуска.'
+  agent: cross_module_static_auditor
+  context:
+  - design_architecture_and_contracts
+  - write_core_modules
+  - write_adb_module
+  - write_screenshot_module
+  - write_vision_module
+  - write_safety_module
+  - write_knowledge_base
+  - write_teacher_ui
+  - write_location_profiles_module
+  - write_config_yaml_and_requirements
+  - write_floor_state_module
+  - write_floor_exploration_module
+  - write_explorer_loop
+  - write_cli_entry_point
+assemble_final_package:
+  description: 'Собери итоговый пакет на основе результата Final Cross-Module Audit
+    и задач-писателей. Для каждого из 16 файлов (main.py, config.yaml, requirements.txt,
+    bot/__init__.py, config.py, logging_setup.py, adb_controller.py, screenshot.py,
+    vision.py, safety.py, knowledge.py, teacher_ui.py, profiles.py, floor_state.py,
+    floor.py, explorer.py) выдай ПОЛНЫЙ актуальный код в отдельном блоке кода с заголовком-путём:
+    берёшь версию из аудита, если аудит исправил файл, иначе из задачи-писателя. Ничего
+    не сокращай и не пиши «без изменений». Если кода файла нигде нет, напиши «ФАЙЛ
+    X ОТСУТСТВУЕТ» и не заявляй, что всё проверено. Структура: 1) Резюме 5-7 строк;
+    2) Статус по 16 файлам (источник каждого); 3) Результат аудита: «Расхождений после
+    исправления: N» дословно из аудита, но если какой-то файл отсутствует, N не считается
+    достоверным, напиши это; 4) Что нужно от пользователя: LDPlayer с игрой, вывод
+    adb devices, wm size, wm density, путь к adb.exe; 5) Инструкция для новичка: Python,
+    LDPlayer, ADB, зависимости, python main.py --check, --capture, --teach-only --profile
+    loc1, затем --teach --profile loc1; 6) Честные ограничения: код не запускался
+    на реальном LDPlayer, проверка статическая, ручной бой не поддерживается, риск
+    бана; 7) Затем 16 блоков кода. Описывай только режимы, реально имеющиеся в main.py.'
+  expected_output: 'Markdown на русском: резюме, статус 16 файлов с источниками, результат
+    аудита, требования, инструкция, ограничения и полный код всех 16 файлов отдельными
+    блоками кода.'
+  agent: python_bot_developer
+  context:
+  - final_cross_module_audit
+  - write_core_modules
+  - write_adb_module
+  - write_screenshot_module
+  - write_vision_module
+  - write_safety_module
+  - write_knowledge_base
+  - write_teacher_ui
+  - write_location_profiles_module
+  - write_config_yaml_and_requirements
+  - write_floor_state_module
+  - write_floor_exploration_module
+  - write_explorer_loop
+  - write_cli_entry_point
