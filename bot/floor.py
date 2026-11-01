@@ -1,32 +1,38 @@
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
-from typing import Literal, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from bot.floor_state import FloorStateError, FloorStateStore
-from bot.safety import SafetyStop
+from .config import get_path
+from .floor_state import (
+    DoorNotFoundError,
+    FloorStateError,
+    FloorStateStore,
+    NoAvailableDoorError,
+)
+from .safety import DangerDetectedError, SafetyError
+from .teacher_ui import LabelingCancelledError, TeacherUIError
+from .vision import Match, VisionError
 
 if TYPE_CHECKING:
-    from bot.adb_controller import ADBController
-    from bot.config import Config
-    from bot.knowledge import KnowledgeBase
-    from bot.profiles import Profile
-    from bot.safety import SafetyService
-    from bot.screenshot import ScreenshotService
-    from bot.vision import Frame, Match, VisionService
+    from .adb_controller import ADBController
+    from .config import BotConfig
+    from .knowledge import KnowledgeBase, TemplateRecord
+    from .safety import SafetyManager
+    from .screenshot import Frame, ScreenshotProvider
+    from .teacher_ui import TeacherUI
+    from .vision import VisionEngine
 
 
-class FloorExploreError(Exception):
-    ...
-
-
-FloorStatus = Literal["completed", "stopped", "failed"]
+class FloorError(Exception):
+    pass
 
 
 @dataclass(frozen=True)
 class FloorResult:
-    status: FloorStatus
+    status: str
     rooms_cleared: int
     rooms_skipped: int
     rooms_failed: int
@@ -37,13 +43,13 @@ class FloorExplorer:
     def __init__(
         self,
         adb: "ADBController",
-        screenshot: "ScreenshotService",
-        vision: "VisionService",
+        screenshot: "ScreenshotProvider",
+        vision: "VisionEngine",
         knowledge: "KnowledgeBase",
-        safety: "SafetyService",
-        teacher_ui,
-        config: "Config",
-        profile: "Profile",
+        safety: "SafetyManager",
+        teacher_ui: "TeacherUI",
+        config: "BotConfig",
+        profile: str,
     ) -> None:
         self.adb = adb
         self.screenshot = screenshot
@@ -53,184 +59,476 @@ class FloorExplorer:
         self.teacher_ui = teacher_ui
         self.config = config
         self.profile = profile
-        if not hasattr(teacher_ui, "pause_requested") or not hasattr(teacher_ui, "show_and_label"):
-            raise FloorExploreError("teacher_ui must provide pause_requested and show_and_label")
+
+        self.logger = logging.getLogger("bot.floor")
+        self.floor_state = FloorStateStore(config, profile, self.logger)
+
+        self._motion_cfg = self._section("motion")
+        self._timeouts_cfg = self._section("timeouts")
+        self._teacher_cfg = self._section("teacher")
+        self._input_cfg = self._section("input")
+        self._debug_cfg = self._section("debug")
+        self._game_cfg = self._section("game")
+
+        self._stable_frames = int(self._motion_cfg.get("stable_frames", 3))
+        self._stable_diff_threshold = float(self._motion_cfg.get("stable_diff_threshold", 0.015))
+        self._stable_poll_ms = int(self._motion_cfg.get("stable_poll_ms", 350))
+        self._stable_timeout_s = float(self._motion_cfg.get("stable_timeout_s", 8.0))
+        self._max_stable_retries = int(self._motion_cfg.get("max_stable_retries", 2))
+        raw_downscale = self._motion_cfg.get("downscale_size", [64, 36])
+        self._downscale_size = (int(raw_downscale[0]), int(raw_downscale[1]))
+
+        self._battle_start_timeout_s = float(self._timeouts_cfg.get("battle_start_timeout_s", 8.0))
+        self._battle_finish_timeout_s = float(self._timeouts_cfg.get("battle_finish_timeout_s", 120.0))
+        self._room_enter_timeout_s = float(self._timeouts_cfg.get("room_enter_timeout_s", 12.0))
+        self._room_exit_timeout_s = float(self._timeouts_cfg.get("room_exit_timeout_s", 10.0))
+        self._next_floor_timeout_s = float(self._timeouts_cfg.get("next_floor_timeout_s", 15.0))
+
+        self._tap_jitter_px = int(self._input_cfg.get("tap_jitter_px", 0))
+        self._clamp_to_screen = bool(self._input_cfg.get("clamp_to_screen", True))
+        self._save_last_frame_on_error = bool(self._debug_cfg.get("save_last_frame_on_error", True))
+        self._party_size = int(self._game_cfg.get("party_size", 4))
+        self._teach_only = False
+        self._max_unknown_stable_screens = int(self._section("safety").get("max_unknown_stable_screens", 3))
 
     def run(self, floor_number: int) -> FloorResult:
-        store = FloorStateStore(self.config, self.profile.name, floor_number)
-        graph = store.load()
-        rooms_cleared = 0
-        rooms_skipped = 0
-        rooms_failed = 0
+        """
+        Исследует один этаж и возвращает итог.
+        """
+        self.safety.ensure_action_allowed("explore")
+
+        if getattr(self.teacher_ui, "pause_requested", None) is None:
+            raise FloorError("teacher_ui.pause_requested() отсутствует, продолжение по контракту невозможно")
+
+        try:
+            templates = self.knowledge.get_templates(enabled_only=True)
+        except TypeError:
+            templates = self.knowledge.get_templates()
+
+        state = self._load_or_reset_state(floor_number)
+        in_progress = self.floor_state.notify_in_progress_found_at_start(state)
+        if in_progress:
+            state = self.floor_state.set_progress_value(state, "has_in_progress_at_start", True)
+            self.floor_state.save(state)
+            frame = self._stable_capture_or_teach(reason_key="unknown_stable_prompt", templates=templates)
+            self.teacher_ui.notify(
+                "Найден door со статусом in_progress. Автоматически продолжать нельзя; разметьте кадр и продолжите вручную."
+            )
+            self._pause_and_label(frame)
+            templates = self._reload_templates()
+
+        unknown_stable_count = 0
 
         while True:
-            self._pause_check()
-            frame = self._wait_stable()
-            self._check_danger(frame)
-            self._scan_map(store, graph, frame)
+            self._handle_pause_on_step()
+            templates = self._reload_templates()
 
-            target = store.next_target(graph)
-            if target is None:
-                next_floor = self._find_best(frame, "next_floor")
-                if next_floor is None:
-                    self._teach_if_unknown(frame)
-                    next_floor = self._find_best(self._wait_stable(), "next_floor")
-                if next_floor is None:
-                    return FloorResult("failed", rooms_cleared, rooms_skipped, rooms_failed, "next_floor not found")
-                self.safety.ensure_action_allowed("next_floor")
-                self._tap_match(next_floor)
-                self._wait_stable()
-                return FloorResult("completed", rooms_cleared, rooms_skipped, rooms_failed, "floor completed")
+            frame = self._stable_capture_or_teach(reason_key="unknown_stable_prompt", templates=templates)
+            self.safety.ensure_safe_frame(frame, self.vision, templates)
+            self._apply_safety_blocks()
 
-            self.safety.ensure_action_allowed("enter_room")
-            self._tap_door(target)
-            entered_frame = self._wait_stable()
-            store.mark_in_progress_and_save(graph, target.door_id, notes="entered")
-            self._check_danger(entered_frame)
-            self._pause_check()
-
-            screen = self._classify(entered_frame)
-            if screen is None:
-                self._teach_if_unknown(entered_frame)
-                entered_frame = self._wait_stable()
-                screen = self._classify(entered_frame)
-
-            if screen == "event_screen":
-                exit_match = self._find_best(entered_frame, "exit")
-                if exit_match is None:
-                    store.set_status(graph, target.door_id, "failed", notes="event exit not found")
-                    store.save(graph)
-                    rooms_failed += 1
-                    continue
-                self._tap_match(exit_match)
-                self._wait_stable()
-                store.set_status(graph, target.door_id, "skipped", notes="event skipped by exit")
-                store.save(graph)
-                rooms_skipped += 1
+            map_info = self._detect_map_objects(frame, templates, state)
+            if not map_info["party_match"]:
+                self.teacher_ui.notify("На стабильном кадре не найден маркер отряда. Нужна разметка.")
+                self._pause_and_label(frame)
+                templates = self._reload_templates()
+                unknown_stable_count += 1
+                if unknown_stable_count > self._max_unknown_stable_screens:
+                    return self._result_from_state(state, "stopped", "слишком много неизвестных стабильных кадров")
                 continue
 
-            if screen == "passage_screen":
-                store.set_status(graph, target.door_id, "passage", notes="passage")
-                store.save(graph)
-                continue
-
-            if screen == "room_screen":
-                if self._find_best(entered_frame, "mob") is not None or self._find_best(entered_frame, "boss") is not None:
-                    auto_battle = self._find_best(entered_frame, "auto_battle")
-                    if auto_battle is None:
-                        store.set_status(graph, target.door_id, "failed", notes="auto_battle not found")
-                        store.save(graph)
-                        rooms_failed += 1
-                        continue
-                    self._tap_match(auto_battle)
-                    entered_frame = self._wait_battle_end()
-                loot = self._find_best(entered_frame, "loot")
-                if loot is not None:
-                    self._tap_match(loot)
-                    entered_frame = self._wait_stable()
-                exit_match = self._find_best(entered_frame, "exit")
-                if exit_match is None:
-                    store.set_status(graph, target.door_id, "failed", notes="room exit not found")
-                    store.save(graph)
-                    rooms_failed += 1
-                    continue
-                self._tap_match(exit_match)
-                self._wait_stable()
-                store.set_status(graph, target.door_id, "cleared", notes="room cleared")
-                store.save(graph)
-                rooms_cleared += 1
-                continue
-
-            store.set_status(graph, target.door_id, "failed", notes="screen not recognized")
-            store.save(graph)
-            rooms_failed += 1
-
-    def _scan_map(self, store: FloorStateStore, graph, frame: "Frame") -> None:
-        door_matches = self._find_all(frame, "door_marker")
-        open_matches = self._find_all(frame, "room_open_big_icon")
-        for index, match in enumerate(door_matches, start=1):
-            cx, cy = self.vision.center_of(match.rect)
-            is_open = any(self._overlaps(match.rect, icon.rect) for icon in open_matches)
-            store.upsert_door(
-                graph,
-                door_id=f"d_{index:04d}",
-                map_x=cx,
-                map_y=cy,
-                bbox_x=match.rect.x,
-                bbox_y=match.rect.y,
-                bbox_w=match.rect.w,
-                bbox_h=match.rect.h,
-                is_room_open_big_icon=is_open,
+            state = self.floor_state.set_progress_value(
+                state,
+                "party_marker",
+                list(map_info["party_match"].rect),
             )
-        store.save(graph)
+            state = self.floor_state.upsert_visible_doors(
+                state,
+                [match.rect for match in map_info["door_matches"]],
+            )
+            state = self._mark_open_big_icons(state, map_info["open_room_matches"])
+            self.floor_state.save(state)
 
-    def _classify(self, frame: "Frame") -> str | None:
-        return self.vision.classify_screen(frame, self.knowledge.get_templates_for_screen_classification())
+            known_on_map = bool(map_info["door_matches"] or map_info["party_match"] or map_info["next_floor_match"])
+            if not known_on_map:
+                self.teacher_ui.notify("На стабильном кадре нет известных объектов. Нужна разметка.")
+                self._pause_and_label(frame)
+                unknown_stable_count += 1
+                if unknown_stable_count > self._max_unknown_stable_screens:
+                    return self._result_from_state(state, "stopped", "на стабильном кадре нет известных объектов")
+                continue
 
-    def _find_all(self, frame: "Frame", category: str):
-        templates = self.knowledge.get_templates_for_category(category)
-        return self.vision.find_all(frame, templates, category=category)
+            unknown_stable_count = 0
 
-    def _find_best(self, frame: "Frame", category: str):
-        matches = self._find_all(frame, category)
-        return matches[0] if matches else None
+            try:
+                target = self.floor_state.choose_next_target(state)
+            except NoAvailableDoorError:
+                next_floor_match = map_info["next_floor_match"]
+                if next_floor_match is None:
+                    self.teacher_ui.notify("Непосещённых дверей нет, но next_floor не найден. Нужна разметка.")
+                    self._pause_and_label(frame)
+                    continue
+                if self._teach_only:
+                    return self._result_from_state(state, "stopped", "teach_only: next_floor найден, нажатие не выполнено")
+                self._tap_match(next_floor_match, frame)
+                next_frame = self._wait_after_motion("next_floor")
+                self.safety.ensure_safe_frame(next_frame, self.vision, self._reload_templates())
+                return self._result_from_state(state, "completed", "этаж завершён")
 
-    def _tap_match(self, match: "Match") -> None:
-        self.safety.ensure_action_allowed("tap")
-        x, y = self.vision.center_of(match.rect)
-        self.adb.tap(x, y)
+            state = self.floor_state.increment_attempts(state, target.door_id)
+            self.floor_state.save(state)
+            refreshed_target = self._find_door_record_by_id(state, target.door_id)
+            if refreshed_target is None:
+                raise FloorError(f"Не удалось повторно найти дверь {target.door_id} в FloorState")
+            if refreshed_target.status == "failed":
+                continue
 
-    def _tap_door(self, node) -> None:
-        self.safety.ensure_action_allowed("tap")
-        x = node.bbox_x + node.bbox_w // 2
-        y = node.bbox_y + node.bbox_h // 2
-        self.adb.tap(x, y)
+            if self._teach_only:
+                return self._result_from_state(state, "stopped", "teach_only: дверь выбрана, нажатие не выполнено")
 
-    def _wait_stable(self) -> "Frame":
-        retries = int(self.config.get("motion.max_stable_retries", 0))
+            self._tap_rect_center(target.marker_rect, frame)
+            entered_frame = self._wait_after_motion("enter_door")
+            self.safety.ensure_safe_frame(entered_frame, self.vision, self._reload_templates())
+
+            state = self.floor_state.mark_in_progress_and_flush(state, target.door_id, note="entered")
+
+            try:
+                state = self._handle_entered_door(state, target.door_id, entered_frame)
+            except DoorNotFoundError:
+                raise
+            except LabelingCancelledError as exc:
+                state = self._mark_failed_if_possible(state, target.door_id, f"labeling cancelled: {exc}")
+                return self._result_from_state(state, "stopped", "пользователь отменил разметку")
+            except DangerDetectedError:
+                raise
+            except Exception as exc:
+                state = self._mark_failed_if_possible(state, target.door_id, str(exc))
+                raise
+
+    def _handle_entered_door(self, state: dict, door_id: str, frame: "Frame") -> dict:
+        templates = self._reload_templates()
+        self._handle_pause_in_wait_loop(frame)
+        screen_name = self._classify_room_or_passage(frame, templates)
+
+        if screen_name is None:
+            self.teacher_ui.notify("Не удалось классифицировать стабильный кадр после входа. Нужна разметка.")
+            self._pause_and_label(frame)
+            templates = self._reload_templates()
+            frame = self._stable_capture_or_teach(reason_key="unknown_stable_prompt", templates=templates)
+            self.safety.ensure_safe_frame(frame, self.vision, templates)
+            screen_name = self._classify_room_or_passage(frame, templates)
+            if screen_name is None:
+                state = self.floor_state.mark_door_status(state, door_id, "failed", note="screen_classification_failed")
+                self.floor_state.save(state)
+                return state
+
+        if screen_name == "passage_screen":
+            state = self.floor_state.mark_door_status(state, door_id, "passage", note="passage_screen")
+            self.floor_state.save(state)
+            return state
+
+        if screen_name == "event_screen":
+            state = self._exit_event_room(state, door_id, frame, templates)
+            return state
+
+        if screen_name != "room_screen":
+            state = self.floor_state.mark_door_status(state, door_id, "failed", note=f"unsupported_screen:{screen_name}")
+            self.floor_state.save(state)
+            return state
+
+        state = self._clear_room(state, door_id, frame, templates)
+        return state
+
+    def _clear_room(self, state: dict, door_id: str, frame: "Frame", templates: list["TemplateRecord"]) -> dict:
+        loot_matches = self.vision.find_category(frame, templates, "loot")
+        mob_matches = self.vision.find_category(frame, templates, "mob")
+        boss_matches = self.vision.find_category(frame, templates, "boss")
+        auto_matches = self.vision.find_category(frame, templates, "auto_battle")
+
+        if boss_matches or mob_matches:
+            if self._teach_only:
+                return state
+            if auto_matches:
+                self._tap_match(auto_matches[0], frame)
+                frame = self._wait_after_motion("auto_battle")
+                templates = self._reload_templates()
+                self.safety.ensure_safe_frame(frame, self.vision, templates)
+            frame = self._wait_battle_end(templates)
+            templates = self._reload_templates()
+
+        elif loot_matches:
+            if self._teach_only:
+                return state
+            self._tap_match(loot_matches[0], frame)
+            frame = self._wait_after_motion("loot")
+            templates = self._reload_templates()
+            self.safety.ensure_safe_frame(frame, self.vision, templates)
+
+        else:
+            exit_matches = self.vision.find_category(frame, templates, "exit")
+            if not exit_matches and not loot_matches:
+                self.teacher_ui.notify("Комната распознана, но не найден mob/boss/loot/exit. Нужна разметка.")
+                self._pause_and_label(frame)
+                templates = self._reload_templates()
+                frame = self._stable_capture_or_teach(reason_key="unknown_stable_prompt", templates=templates)
+                self.safety.ensure_safe_frame(frame, self.vision, templates)
+
+        state = self._exit_room_with_status(state, door_id, frame, templates, final_status="cleared")
+        return state
+
+    def _exit_event_room(
+        self,
+        state: dict,
+        door_id: str,
+        frame: "Frame",
+        templates: list["TemplateRecord"],
+    ) -> dict:
+        state = self._exit_room_with_status(state, door_id, frame, templates, final_status="skipped")
+        return state
+
+    def _exit_room_with_status(
+        self,
+        state: dict,
+        door_id: str,
+        frame: "Frame",
+        templates: list["TemplateRecord"],
+        final_status: str,
+    ) -> dict:
+        exit_matches = self.vision.find_category(frame, templates, "exit")
+        if not exit_matches:
+            self.teacher_ui.notify("Не найден exit на стабильном кадре. Нужна разметка.")
+            self._pause_and_label(frame)
+            templates = self._reload_templates()
+            frame = self._stable_capture_or_teach(reason_key="unknown_stable_prompt", templates=templates)
+            self.safety.ensure_safe_frame(frame, self.vision, templates)
+            exit_matches = self.vision.find_category(frame, templates, "exit")
+
+        if not exit_matches:
+            state = self.floor_state.mark_door_status(state, door_id, "failed", note="exit_not_found")
+            self.floor_state.save(state)
+            return state
+
+        if self._teach_only:
+            return state
+
+        self._tap_match(exit_matches[0], frame)
+        map_frame = self._wait_after_motion("exit_room")
+        self.safety.ensure_safe_frame(map_frame, self.vision, self._reload_templates())
+        state = self.floor_state.mark_door_status(state, door_id, final_status, note=f"{final_status}_after_exit")
+        self.floor_state.save(state)
+        return state
+
+    def _wait_battle_end(self, templates: list["TemplateRecord"]) -> "Frame":
+        started = time.monotonic()
+        last_frame = self.screenshot.capture()
+
+        while True:
+            self._handle_pause_in_wait_loop(last_frame)
+            stable_frame = self._stable_capture_or_teach(reason_key="unknown_stable_prompt", templates=templates)
+            templates = self._reload_templates()
+            self.safety.ensure_safe_frame(stable_frame, self.vision, templates)
+
+            auto_matches = self.vision.find_category(stable_frame, templates, "auto_battle")
+            room_name = self._classify_room_or_passage(stable_frame, templates)
+            if room_name in {"room_screen", "event_screen", "passage_screen"} and not auto_matches:
+                return stable_frame
+
+            if time.monotonic() - started >= self._battle_finish_timeout_s:
+                return stable_frame
+
+            last_frame = stable_frame
+            time.sleep(max(0.05, self._stable_poll_ms / 1000.0))
+
+    def _detect_map_objects(self, frame: "Frame", templates: list["TemplateRecord"], state: dict) -> dict[str, Any]:
+        party_matches = self.vision.find_category(frame, templates, "party_marker")
+        door_matches = self.vision.find_category(frame, templates, "door_marker")
+        open_room_matches = self.vision.find_category(frame, templates, "room_open_big_icon")
+        next_floor_matches = self.vision.find_category(frame, templates, "next_floor")
+        return {
+            "party_match": party_matches[0] if party_matches else None,
+            "door_matches": door_matches,
+            "open_room_matches": open_room_matches,
+            "next_floor_match": next_floor_matches[0] if next_floor_matches else None,
+        }
+
+    def _classify_room_or_passage(self, frame: "Frame", templates: list["TemplateRecord"]) -> str | None:
+        direct = self.vision.classify_screen(frame, templates)
+        if direct in {"room_screen", "passage_screen", "event_screen"}:
+            return direct
+
+        room_matches = self.vision.find_category(frame, templates, "room_screen")
+        passage_matches = self.vision.find_category(frame, templates, "passage_screen")
+        event_matches = self.vision.find_category(frame, templates, "event_screen")
+
+        best: tuple[float, str] | None = None
+        for name, matches in (
+            ("room_screen", room_matches),
+            ("passage_screen", passage_matches),
+            ("event_screen", event_matches),
+        ):
+            if matches:
+                score = matches[0].score
+                if best is None or score > best[0]:
+                    best = (score, name)
+        return best[1] if best is not None else None
+
+    def _stable_capture_or_teach(self, reason_key: str, templates: list["TemplateRecord"]) -> "Frame":
         last_frame = None
-        for _ in range(retries + 1):
-            self._pause_check()
-            frame, stable = self.vision.wait_until_stable(self.screenshot.capture)
+        for _ in range(self._max_stable_retries + 1):
+            self._handle_pause_on_step()
+            frame, stable = self.vision.wait_until_stable(
+                self.screenshot.capture,
+                stable_frames=self._stable_frames,
+                stable_diff_threshold=self._stable_diff_threshold,
+                stable_poll_ms=self._stable_poll_ms,
+                stable_timeout_s=self._stable_timeout_s,
+                downscale_size=self._downscale_size,
+            )
             last_frame = frame
             if stable:
                 return frame
-        if bool(self.config.get("teaching.allow_teach_on_unstable_timeout", True)) and last_frame is not None:
-            self._pause_check(last_frame)
+
         if last_frame is None:
-            raise FloorExploreError("failed to capture frame")
-        return last_frame
+            raise FloorError("vision.wait_until_stable не вернул кадр")
 
-    def _wait_battle_end(self) -> "Frame":
-        timeout_s = float(self.config.get("timings.battle_timeout_s", 180))
-        poll_s = int(self.config.get("timings.auto_battle_check_interval_ms", 500)) / 1000.0
-        deadline = time.monotonic() + timeout_s
-        frame = self._wait_stable()
-        while True:
-            self._pause_check(frame)
-            if self._find_best(frame, "mob") is None and self._find_best(frame, "boss") is None:
-                return frame
-            if time.monotonic() >= deadline:
-                raise FloorExploreError("battle timeout")
-            time.sleep(poll_s)
-            frame = self._wait_stable()
-            self._check_danger(frame)
+        message = str(self._teacher_cfg.get(reason_key, "Экран не стабилизировался"))
+        self.teacher_ui.notify(message)
+        self._pause_and_label(last_frame)
+        frame, stable = self.vision.wait_until_stable(
+            self.screenshot.capture,
+            stable_frames=self._stable_frames,
+            stable_diff_threshold=self._stable_diff_threshold,
+            stable_poll_ms=self._stable_poll_ms,
+            stable_timeout_s=self._stable_timeout_s,
+            downscale_size=self._downscale_size,
+        )
+        if not stable:
+            return frame
+        return frame
 
-    def _check_danger(self, frame: "Frame") -> None:
-        self.safety.check_danger(frame, self.vision, self.knowledge.get_templates_for_category("danger"))
+    def _wait_after_motion(self, reason: str) -> "Frame":
+        del reason
+        frame = self._stable_capture_or_teach(reason_key="unknown_unstable_prompt", templates=self._reload_templates())
+        return frame
 
-    def _teach_if_unknown(self, frame: "Frame") -> None:
-        if self.knowledge.list_templates(enabled_only=True):
-            self.teacher_ui.show_and_label(frame, self.knowledge)
-        else:
-            self.teacher_ui.show_and_label(frame, self.knowledge)
+    def _pause_and_label(self, frame: "Frame") -> None:
+        self.safety.ensure_action_allowed("teach")
+        self.teacher_ui.show_and_label(frame, self.knowledge)
 
-    def _pause_check(self, frame: "Frame" | None = None) -> None:
+    def _handle_pause_on_step(self) -> None:
         if self.teacher_ui.pause_requested():
-            if frame is None:
-                frame, _ = self.vision.wait_until_stable(self.screenshot.capture)
-            self.teacher_ui.show_and_label(frame, self.knowledge)
+            frame = self.screenshot.capture()
+            self._pause_and_label(frame)
 
-    @staticmethod
-    def _overlaps(a, b) -> bool:
-        return not (a.x + a.w <= b.x or b.x + b.w <= a.x or a.y + a.h <= b.y or b.y + b.h <= a.y)
+    def _handle_pause_in_wait_loop(self, frame: "Frame") -> None:
+        if self.teacher_ui.pause_requested():
+            self._pause_and_label(frame)
+
+    def _mark_open_big_icons(self, state: dict, matches: list[Match]) -> dict:
+        if not matches:
+            return state
+        for match in matches:
+            door = self._closest_door_by_rect(state, match.rect)
+            if door is None:
+                continue
+            try:
+                state = self.floor_state.mark_open_room_icon(state, door.door_id, present=True)
+            except DoorNotFoundError:
+                continue
+        return state
+
+    def _closest_door_by_rect(self, state: dict, rect: tuple[int, int, int, int]):
+        best = None
+        rx = (rect[0] + rect[2]) / 2.0
+        ry = (rect[1] + rect[3]) / 2.0
+        for node in state.get("nodes", []):
+            for door in node.get("doors", []):
+                mx1, my1, mx2, my2 = door.get("marker_rect", [0, 0, 0, 0])
+                dx = ((mx1 + mx2) / 2.0) - rx
+                dy = ((my1 + my2) / 2.0) - ry
+                dist = dx * dx + dy * dy
+                if best is None or dist < best[0]:
+                    best = (dist, door.get("door_id"))
+        if best is None:
+            return None
+        return self._find_door_record_by_id(state, str(best[1]))
+
+    def _find_door_record_by_id(self, state: dict, door_id: str):
+        for node in state.get("nodes", []):
+            for door in node.get("doors", []):
+                if door.get("door_id") == door_id:
+                    from .floor_state import DoorRecord
+
+                    return DoorRecord(
+                        door_id=str(door["door_id"]),
+                        marker_rect=(
+                            int(door["marker_rect"][0]),
+                            int(door["marker_rect"][1]),
+                            int(door["marker_rect"][2]),
+                            int(door["marker_rect"][3]),
+                        ),
+                        status=str(door["status"]),
+                        target_node_id=str(door["target_node_id"]) if door.get("target_node_id") is not None else None,
+                        discovered_at=str(door["discovered_at"]),
+                        updated_at=str(door["updated_at"]),
+                        notes=str(door.get("notes", "")),
+                    )
+        return None
+
+    def _tap_match(self, match: Match, frame: "Frame") -> None:
+        self._tap_rect_center(match.rect, frame)
+
+    def _tap_rect_center(self, rect: tuple[int, int, int, int], frame: "Frame") -> None:
+        if self._teach_only:
+            return
+        h, w = frame.shape[:2]
+        x = int((rect[0] + rect[2]) / 2)
+        y = int((rect[1] + rect[3]) / 2)
+        if self._clamp_to_screen:
+            x = min(max(0, x), max(0, w - 1))
+            y = min(max(0, y), max(0, h - 1))
+        self.adb.tap(x, y)
+
+    def _apply_safety_blocks(self) -> None:
+        self.safety.ensure_action_allowed("explore")
+        for blocked_action in ("shop", "ads", "pvp"):
+            if self.safety.is_action_allowed(blocked_action):
+                raise SafetyError(f"Действие {blocked_action} разрешено, что противоречит требованию задачи")
+
+    def _reload_templates(self) -> list["TemplateRecord"]:
+        try:
+            return self.knowledge.get_templates(enabled_only=True)
+        except TypeError:
+            return self.knowledge.get_templates()
+
+    def _load_or_reset_state(self, floor_number: int) -> dict:
+        try:
+            state = self.floor_state.load()
+            if int(state.get("floor_number", 0)) != int(floor_number):
+                state = self.floor_state.reset_for_floor(floor_number)
+            return state
+        except FileNotFoundError:
+            return self.floor_state.reset_for_floor(floor_number)
+
+    def _mark_failed_if_possible(self, state: dict, door_id: str, note: str) -> dict:
+        try:
+            state = self.floor_state.mark_door_status(state, door_id, "failed", note=note)
+            self.floor_state.save(state)
+            return state
+        except Exception:
+            return state
+
+    def _result_from_state(self, state: dict, status: str, reason: str) -> FloorResult:
+        stats = state.get("stats", {})
+        return FloorResult(
+            status=status,
+            rooms_cleared=int(stats.get("rooms_cleared", 0)),
+            rooms_skipped=int(stats.get("rooms_skipped", 0)),
+            rooms_failed=int(stats.get("rooms_failed", 0)),
+            reason=reason,
+        )
+
+    def _section(self, name: str) -> dict[str, Any]:
+        raw = getattr(self.config, "raw", {})
+        section = raw.get(name, {}) if isinstance(raw, dict) else {}
+        return section if isinstance(section, dict) else {}
