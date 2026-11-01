@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
-from .config import BotConfig, get_path
+from .config import BotConfig
 
 
 def setup_logging(config: "BotConfig") -> logging.Logger:
@@ -19,7 +18,7 @@ def setup_logging(config: "BotConfig") -> logging.Logger:
 
     log_file = log_dir / "bot.log"
     level_name = config.log_level
-    level = getattr(logging, level_name, None)
+    level = getattr(logging, level_name, logging.INFO)
     if not isinstance(level, int):
         level = logging.INFO
 
@@ -49,9 +48,8 @@ def setup_logging(config: "BotConfig") -> logging.Logger:
     root_logger.addHandler(console_handler)
     root_logger.addHandler(file_handler)
 
-    logger_name = str(get_path(config, "app", "name")) if "name" in config.raw.get("app", {}) else "bot"
-    app_logger = logging.getLogger(logger_name)
+    app_logger = logging.getLogger("bot")
     app_logger.setLevel(level)
     app_logger.propagate = True
-    app_logger.debug("Logging initialized: level=%s, file=%s", level_name, Path(log_file))
+    app_logger.debug("Logging initialized: level=%s, file=%s", level_name, log_file)
     return app_logger
