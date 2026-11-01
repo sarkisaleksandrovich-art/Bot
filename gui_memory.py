@@ -33,9 +33,7 @@ def _validate_json(path: Path) -> dict[str, Any]:
 
 def _atomic_write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
-    )
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     temporary_path = Path(temporary)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
@@ -44,7 +42,7 @@ def _atomic_write_json(path: Path, value: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         _validate_json(temporary_path)
-        os.replace(temporary_path, path)
+        temporary_path.replace(path)
         _validate_json(path)
     finally:
         if temporary_path.exists():
@@ -52,22 +50,25 @@ def _atomic_write_json(path: Path, value: dict[str, Any]) -> None:
 
 
 def _backup(path: Path) -> Path:
+    _validate_json(path)
     backup = Path(f"{path}.bak")
-    if path.exists():
-        _validate_json(path)
-        shutil.copy2(path, backup)
-        _validate_json(backup)
+    shutil.copy2(path, backup)
+    _validate_json(backup)
     return backup
 
 
 def _profile_dir(profile: str, data_root: Path | str = Path("data/profiles")) -> Path:
-    if not isinstance(profile, str) or profile not in PROFILE_IDS:
-        raise ValueError(f"Unknown profile: {profile!r}")
+    if profile not in PROFILE_IDS:
+        raise ValueError(f"Unknown profile: {profile}")
     return Path(data_root) / profile
 
 
 def features_path(profile: str, data_root: Path | str = Path("data/profiles")) -> Path:
     return _profile_dir(profile, data_root) / "features.json"
+
+
+def load_features(profile: str, data_root: Path | str = Path("data/profiles")) -> dict[str, Any]:
+    return _validate_json(features_path(profile, data_root))
 
 
 def _records(data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -80,11 +81,6 @@ def _records(data: dict[str, Any]) -> list[dict[str, Any]]:
             raise ValueError("Each template must have a non-empty string id")
         result.append(record)
     return result
-
-
-def load_features(profile: str, data_root: Path | str = Path("data/profiles")) -> dict[str, Any]:
-    path = features_path(profile, data_root)
-    return _validate_json(path)
 
 
 def delete_one_feature(
@@ -115,43 +111,34 @@ def delete_one_feature(
         png = path.parent / png
     if png.suffix.lower() != ".png":
         raise ValueError(f"Refusing to delete non-PNG file: {png}")
-    if not png.exists() or not png.is_file():
+    if not png.is_file():
         raise FileNotFoundError(f"PNG is missing; JSON was not changed: {png}")
 
-    _validate_json(path)
     _backup(path)
     updated = copy.deepcopy(original)
     updated["templates"] = [record for record in records if record.get("id") != feature_id]
     updated["updated_at"] = _utc_now()
-    try:
-        _atomic_write_json(path, updated)
-        png.unlink()
-    except Exception:
-        backup = Path(f"{path}.bak")
-        if backup.exists():
-            shutil.copy2(backup, path)
-            _validate_json(path)
-        raise
+    _atomic_write_json(path, updated)
+    png.unlink()
     _validate_json(path)
 
 
 class MemoryTab(ttk.Frame):
-    """In-place memory editor: one selected icon can be deleted per confirmed action."""
+    """In-place editor: exactly one selected icon may be deleted after confirmation."""
 
     def __init__(self, parent: tk.Misc, app: Any) -> None:
         super().__init__(parent, padding=12)
         self.app = app
         self.profile_var = tk.StringVar(value=self._initial_profile())
-        self.status_var = tk.StringVar(value="")
+        self.status_var = tk.StringVar()
         self.listbox = tk.Listbox(self, selectmode=tk.SINGLE, exportselection=False)
         self._build()
         self.reload()
 
     def _initial_profile(self) -> str:
         value = getattr(self.app, "profile_var", None)
-        if value is not None and hasattr(value, "get") and value.get() in PROFILE_IDS:
-            return value.get()
-        return PROFILE_IDS[0]
+        selected = value.get() if hasattr(value, "get") else value
+        return selected if selected in PROFILE_IDS else PROFILE_IDS[0]
 
     def _data_root(self) -> Path:
         root = getattr(self.app, "data_root", None)
@@ -169,9 +156,9 @@ class MemoryTab(ttk.Frame):
 
     def _build(self) -> None:
         ttk.Label(self, text="Профиль:").pack(anchor=tk.W)
-        profile = ttk.Combobox(self, textvariable=self.profile_var, values=PROFILE_IDS, state="readonly")
-        profile.pack(fill=tk.X, pady=(0, 8))
-        profile.bind("<<ComboboxSelected>>", lambda _event: self.reload())
+        combo = ttk.Combobox(self, textvariable=self.profile_var, values=PROFILE_IDS, state="readonly")
+        combo.pack(fill=tk.X, pady=(0, 8))
+        combo.bind("<<ComboboxSelected>>", lambda _event: self.reload())
         self.listbox.pack(fill=tk.BOTH, expand=True)
         ttk.Button(self, text="Удалить выбранную", command=self.delete_selected).pack(anchor=tk.E, pady=(8, 0))
         ttk.Label(self, textvariable=self.status_var).pack(anchor=tk.W, pady=(8, 0))
@@ -184,7 +171,7 @@ class MemoryTab(ttk.Frame):
                 self.listbox.insert(tk.END, str(record["id"]))
             self.status_var.set(f"Иконок: {len(records)}")
         except Exception as exc:
-            self.status_var.set(f"Ошибка JSON: {exc}")
+            self.status_var.set(f"JSON: {exc}")
 
     def delete_selected(self) -> None:
         selection = self.listbox.curselection()
@@ -193,9 +180,9 @@ class MemoryTab(ttk.Frame):
             return
         feature_id = self.listbox.get(selection[0])
         if self._bot_running():
-            messagebox.showwarning("Удаление заблокировано", "Бот работает; остановите его перед изменением памяти.", parent=self.winfo_toplevel())
+            messagebox.showwarning("Удаление", "Бот работает: редактирование памяти заблокировано.", parent=self.winfo_toplevel())
             return
-        if not messagebox.askyesno("Подтверждение", f"Удалить иконку {feature_id} и её PNG?\nБудет создан файл .bak.", parent=self.winfo_toplevel()):
+        if not messagebox.askyesno("Подтверждение", f"Удалить иконку {feature_id} и её PNG?\nБудет создан .bak.", parent=self.winfo_toplevel()):
             return
         try:
             delete_one_feature(self.profile_var.get(), feature_id, self._data_root(), bot_running=self._bot_running)
@@ -203,20 +190,13 @@ class MemoryTab(ttk.Frame):
             messagebox.showerror("Удаление", str(exc), parent=self.winfo_toplevel())
             return
         self.reload()
-        self.status_var.set(f"Удалено: {feature_id}; JSON проверен до и после, PNG удалён")
+        self.status_var.set(f"Удалено: {feature_id}; JSON проверен, .bak создан")
 
 
 def open_memory_editor(parent: tk.Misc, app: Any) -> MemoryTab:
-    """Compatibility wrapper; returns the tab rather than opening a separate window."""
     tab = MemoryTab(parent, app)
     tab.pack(fill=tk.BOTH, expand=True)
     return tab
 
 
-__all__ = [
-    "MemoryTab",
-    "delete_one_feature",
-    "features_path",
-    "load_features",
-    "open_memory_editor",
-]
+__all__ = ["MemoryTab", "delete_one_feature", "features_path", "load_features", "open_memory_editor"]
