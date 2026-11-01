@@ -12,7 +12,7 @@ import numpy as np
 
 if TYPE_CHECKING:
     from bot.config import BotConfig
-    from bot.knowledge import TemplateRecord
+    from bot.knowledge import KnowledgeBase, TemplateRecord
 
 Frame = np.ndarray
 
@@ -71,7 +71,7 @@ class VisionEngine:
         Ждёт стабилизации кадра после движения/перехода.
 
         Стабилизация = несколько подряд почти одинаковых уменьшенных кадров.
-        Сравнение делается по уменьшенным копиям кадров.
+        Сравнение делается по усреднённым копиям кадров.
         При успехе возвращает последний кадр и True.
         При таймауте возвращает последний кадр и False.
 
@@ -152,7 +152,7 @@ class VisionEngine:
         threshold: float,
     ) -> Match | None:
         """
-        Ищет один шаблон template внутри ROI кадра через matchTemplate.
+        Ищет один шаблон внутри ROI кадра через matchTemplate.
 
         :param frame: текущий кадр
         :param template: шаблон-фрагмент
@@ -211,6 +211,20 @@ class VisionEngine:
         matches.sort(key=lambda item: item.score, reverse=True)
         return matches
 
+    def find_profile_matches(
+        self,
+        capture_fn: "Callable[[], Frame]",
+        knowledge: "KnowledgeBase",
+        threshold: float | None = None,
+        roi: tuple[int, int, int, int] | None = None,
+        enabled_only: bool = True,
+    ) -> tuple[Frame, list["TemplateRecord"], list[Match]]:
+        frame = capture_fn()
+        templates = knowledge.get_templates(enabled_only=enabled_only)
+        effective_threshold = threshold if threshold is not None else self.config.default_match_threshold
+        matches = self.find_all(frame=frame, templates=templates, threshold=effective_threshold, roi=roi)
+        return frame, templates, matches
+
     def find_category(
         self,
         frame: "Frame",
@@ -225,8 +239,8 @@ class VisionEngine:
         :param frame: текущий кадр
         :param templates: список шаблонов из knowledge
         :param category: категория
-        :param threshold: порог; если None, использовать config vision.default_match_threshold
-        :param roi: общий ROI; если None, использовать roi_hint шаблона или весь экран
+        :param threshold: порог; если None, используется config vision.default_match_threshold
+        :param roi: общий ROI; если None, используется roi_hint шаблона или весь экран
         :return: список Match, отсортированный по score по убыванию
         :raises VisionError: при ошибке поиска
         """
@@ -288,7 +302,7 @@ class VisionEngine:
         threshold: float | None = None,
     ) -> bool:
         """
-        Проверяет, найден ли хоть один шаблон из категорий.
+        Проверяет, найден ли хотя бы один шаблон из категорий.
 
         :return: bool
         :raises VisionError: при ошибке поиска
