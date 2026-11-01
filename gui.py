@@ -133,7 +133,6 @@ class BotGUI:
         self._add_action_button(row2, "Скриншот", lambda: self._run_main_flags(["--capture"]))
         self._add_action_button(row2, "Обучение", lambda: self._run_main_flags(["--teach"]))
         self._add_action_button(row2, "Обучение без кликов", lambda: self._run_main_flags(["--teach-only"]))
-        self._add_action_button(row2, "GUI-фарм", self._run_gui_mode)
 
         self.stop_button = ttk.Button(row2, text="Остановить процесс", command=self._stop_process, state=tk.DISABLED)
         self.stop_button.pack(side=tk.LEFT, padx=(8, 0))
@@ -283,36 +282,6 @@ class BotGUI:
 
         self._start_process(command, title=" ".join(extra_flags) or "main")
 
-    def _run_gui_mode(self) -> None:
-        if self.current_process is not None:
-            messagebox.showwarning("Процесс уже запущен", "Сначала остановите текущий процесс.")
-            return
-
-        profile = self.profile_var.get().strip()
-        location = self.location_var.get().strip()
-        floor_from = self.floor_var.get().strip()
-        floor_to = self.floor_to_var.get().strip()
-
-        if not profile:
-            messagebox.showerror("Ошибка", "Выберите профиль.")
-            return
-        if profile == "base":
-            messagebox.showerror("Ошибка", "Профиль base запрещён как профиль фарма.")
-            return
-        if location not in ALLOWED_LOCATION_IDS:
-            messagebox.showerror("Ошибка", "GUI-локация должна быть loc1 ... loc7.")
-            return
-
-        command = [sys.executable, "main.py", "--gui", "--profile", profile, "--gui-location", location]
-        if floor_from:
-            command.extend(["--gui-floor", floor_from])
-        if floor_to:
-            command.extend(["--floor-to", floor_to])
-        if self.config_path is not None:
-            command.extend(["--config", self.config_path])
-
-        self._start_process(command, title="--gui")
-
     def _start_process(self, command: list[str], *, title: str) -> None:
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
@@ -323,20 +292,26 @@ class BotGUI:
         self._log_local(f"[GUI] cwd={self.project_dir}")
         self._log_local(f"[GUI] cmd={' '.join(command)}")
 
-        process = subprocess.Popen(
-            command,
-            cwd=str(self.project_dir),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            env=env,
-        )
-        self.current_process = process
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(self.project_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                env=env,
+            )
+        except OSError as exc:
+            self._set_running_state(False)
+            self.status_var.set("Ошибка запуска")
+            self._log_local(f"[GUI] Не удалось запустить процесс: {exc}")
+            return
 
+        self.current_process = process
         thread = threading.Thread(target=self._reader_thread, args=(process,), daemon=True)
         self.current_thread = thread
         thread.start()
