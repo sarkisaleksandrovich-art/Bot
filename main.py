@@ -14,11 +14,18 @@ from typing import Any
 from bot.config import BotConfig, ConfigError, get_path, load_config
 from bot.logging_setup import setup_logging
 from bot.adb_controller import ADBCommandError, ADBConnectionError, ADBController, ADBError
-from bot.screenshot import ScreenshotError, ScreenshotProvider
 from bot.knowledge import KnowledgeBase, KnowledgeError
 from bot.teacher_ui import LabelingCancelledError, TeacherUI, TeacherUIError
 from bot.profiles import ProfileError, ProfileManager
 from bot.explorer import DungeonExplorer, ExplorerError
+
+try:
+    from bot.screenshot import ScreenshotError, ScreenshotProvider
+except ModuleNotFoundError as exc:
+    raise RuntimeError(
+        "Не удалось импортировать bot.screenshot. В репозитории отсутствует файл bot/screenshot.py. "
+        "Проверьте, что модуль добавлен в проект или восстановите этот файл."
+    ) from exc
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -164,7 +171,7 @@ def _make_core_objects(config: BotConfig, logger: Any, profile: str) -> dict[str
     except Exception as exc:
         raise RuntimeError(
             "Не удалось импортировать bot.vision.VisionEngine. "
-            "Без него режимы --teach и --check работают не полностью."
+            "Без него режимы --teach и --check работать не полностью."
         ) from exc
 
     try:
@@ -324,10 +331,10 @@ def _run_check(config: BotConfig, logger: Any, profile: str) -> int:
         errors.append(f"Не удалось прочитать знания или список профилей: {exc}")
 
     if adb_exists and adb_ok and shot_ok and knowledge_ok:
-        print("Итог: ОК")
+        print("Итог: OK")
         return 0
 
-    print("Итог: ОШИБКИ")
+    print("Итог: ОШИБКА")
     for item in errors:
         print(f"- {item}")
     return 2 if (adb_exists and (not adb_ok or not shot_ok)) or not adb_exists else 1
