@@ -33,25 +33,19 @@ class NavigationResult:
     state: ScreenState
     message: str = ""
     attempts: int = 0
+    location_id: str | None = None
+    floor_number: int | None = None
 
 
 _LOCATION_IDS = tuple(f"loc{i}" for i in range(1, 8))
-_STATE_KEYS = {
-    "main_base": ScreenState.MAIN_BASE,
-    "location_select": ScreenState.LOCATION_SELECT,
-    "location": ScreenState.LOCATION,
-    "floor": ScreenState.FLOOR,
-    "hero_menu": ScreenState.HERO_MENU,
-    "farm": ScreenState.FARM,
-}
 
 
-def _profile_path(project_dir: str | Path) -> Path:
+def _nav_path(project_dir: str | Path) -> Path:
     return Path(project_dir).resolve() / "data" / "base" / "nav.json"
 
 
-def _read_profile(project_dir: str | Path) -> tuple[dict[str, Any] | None, str | None]:
-    path = _profile_path(project_dir)
+def _read_nav(project_dir: str | Path) -> tuple[dict[str, Any] | None, str | None]:
+    path = _nav_path(project_dir)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -63,70 +57,62 @@ def _read_profile(project_dir: str | Path) -> tuple[dict[str, Any] | None, str |
     return data, None
 
 
-def _resolve(project_dir: str | Path, value: Any) -> Path:
-    path = Path(str(value))
-    return path if path.is_absolute() else Path(project_dir).resolve() / "data" / "base" / path
-
-
-def _png(value: Any, project_dir: str | Path) -> Path | None:
+def _resolve_png(project_dir: str | Path, value: Any) -> Path | None:
     if not isinstance(value, str) or not value.strip():
         return None
-    path = _resolve(project_dir, value)
+    path = Path(value)
+    if not path.is_absolute():
+        path = Path(project_dir).resolve() / "data" / "base" / path
     return path if path.is_file() else None
 
 
-def _locations(profile: dict[str, Any]) -> list[dict[str, Any]]:
-    value = profile.get("locations", [])
-    return value if isinstance(value, list) else []
+def _locations(data: dict[str, Any]) -> list[dict[str, Any]]:
+    value = data.get("locations", [])
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
 
 
-def _location(profile: dict[str, Any], name: str) -> dict[str, Any] | None:
-    for item in _locations(profile):
-        if isinstance(item, dict) and item.get("name") == name:
+def _location(data: dict[str, Any], name: str) -> dict[str, Any] | None:
+    for item in _locations(data):
+        if str(item.get("name", item.get("slot", ""))) == name or str(item.get("slot", "")) == name:
             return item
     return None
 
 
 def nav_status(project_dir: str | Path) -> dict[str, Any]:
-    """Return readiness of every navigation step; never raises for bad/missing data."""
-    profile, error = _read_profile(project_dir)
+    """Return readiness of every navigation step without accessing the device."""
+    data, error = _read_nav(project_dir)
     if error:
         return {"ready": False, "error": error, "steps": {"profile": False}}
-    locations = _locations(profile or {})
+    assert data is not None
     steps: dict[str, Any] = {
         "profile": True,
-        "base_to_locations": bool(_png((profile or {}).get("base_to_locations", {}).get("png"), project_dir)),
+        "base_to_locations": bool(_resolve_png(project_dir, (data.get("base_to_locations") or {}).get("png"))),
         "locations": [],
-        "enter_dungeon": bool(_png((profile or {}).get("enter_dungeon", {}).get("png"), project_dir)),
+        "enter_dungeon": bool(_resolve_png(project_dir, (data.get("enter_dungeon") or {}).get("png"))),
     }
-    for item in locations:
-        if not isinstance(item, dict):
-            continue
-        floors = item.get("floors", []) if isinstance(item.get("floors", []), list) else []
+    for item in _locations(data):
+        floors = []
+        for floor in item.get("floors", []) if isinstance(item.get("floors", []), list) else []:
+            if isinstance(floor, dict):
+                floors.append({"name": floor.get("name"), "ready": bool(_resolve_png(project_dir, floor.get("png")))})
         steps["locations"].append({
             "slot": item.get("slot"),
             "name": item.get("name"),
-            "png": bool(_png(item.get("png"), project_dir)),
-            "floors": [
-                {"name": f.get("name"), "png": bool(_png(f.get("png"), project_dir))}
-                for f in floors if isinstance(f, dict)
-            ],
+            "ready": bool(_resolve_png(project_dir, item.get("png"))) and bool(floors),
+            "floors": floors,
         })
-    steps["locations_ready"] = bool(steps["locations"]) and all(
-        x["png"] and any(f["png"] for f in x["floors"]) for x in steps["locations"]
-    )
+    steps["locations_ready"] = bool(steps["locations"]) and all(x["ready"] for x in steps["locations"])
     steps["ready"] = bool(steps["base_to_locations"] and steps["enter_dungeon"] and steps["locations_ready"])
     return {"ready": steps["ready"], "error": None, "steps": steps}
 
 
 class NavigationController:
-    """Template-driven navigation adapter. Device execution is intentionally lazy."""
+    """Small template-driven adapter; device execution is deliberately lazy."""
 
     def __init__(self, project_dir: str | Path, log: Callable[..., Any] = print, stop_event: Any = None):
         self.project_dir = Path(project_dir).resolve()
         self.log = log
         self.stop_event = stop_event
-        self.logger = logging.getLogger(__name__)
         self.max_attempts = 3
         self.timeout = 12.0
         self.poll = 0.5
@@ -134,296 +120,181 @@ class NavigationController:
         self._screenshot: Any = None
         self._vision: Any = None
         self._state = ScreenState.UNKNOWN
+        self._load_error: str | None = None
 
     def _cancelled(self) -> bool:
         return bool(self.stop_event is not None and self.stop_event.is_set())
-
-    def _log(self, message: str) -> None:
-        try:
-            self.log(message)
-        except Exception:
-            self.logger.debug(message, exc_info=True)
 
     def _ensure_device(self) -> str | None:
         if self._adb is not None:
             return None
         try:
             from bot.adb_controller import ADBController
+            from bot.config import load_config
             from bot.screenshot import ScreenshotProvider
             from bot.vision import VisionEngine
-            try:
-                from bot.config import load_config
-                config = load_config(str(self.project_dir / "config.yaml"))
-                self._adb = ADBController(config, self.logger)
-                self._screenshot = ScreenshotProvider(self._adb, config, self.logger)
-                self._vision = VisionEngine(config, self.logger)
-            except Exception as exc:
-                return f"cannot initialize device services: {exc}"
+            config = load_config(str(self.project_dir / "config.yaml"))
+            self._adb = ADBController(config, logging.getLogger(__name__))
+            self._screenshot = ScreenshotProvider(self._adb, config, logging.getLogger(__name__))
+            self._vision = VisionEngine(config, logging.getLogger(__name__))
             self._adb.connect()
+            return None
         except Exception as exc:
             return f"device is unavailable: {exc}"
-        return None
 
     def _capture(self) -> Any:
         return self._screenshot.capture()
 
-    def _match(self, frame: Any, path: Path) -> Any | None:
-        try:
-            import cv2
-            image = cv2.imread(str(path), cv2.IMREAD_COLOR)
-            if image is None:
-                return None
-            return self._vision.find(frame, image, (0, 0, frame.shape[1], frame.shape[0]), 0.88)
-        except Exception:
+    def _match(self, frame: Any, path: Path) -> Any:
+        import cv2
+        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if image is None:
             return None
+        return self._vision.find(frame, image, (0, 0, frame.shape[1], frame.shape[0]), 0.88)
 
-    def _tap_template(self, path: Path) -> bool:
-        frame = self._capture()
-        match = self._match(frame, path)
-        if match is None:
-            return False
-        x1, y1, x2, y2 = match.rect
-        self._adb.tap((x1 + x2) // 2, (y1 + y2) // 2)
-        return True
+    def _tap(self, path: Path | None, expected: tuple[ScreenState, ...], label: str) -> NavigationResult:
+        if path is None:
+            return NavigationResult(False, self._state, f"template is missing: {label}")
+        last = self._state
+        for attempt in range(1, self.max_attempts + 1):
+            if self._cancelled():
+                return NavigationResult(False, self._state, "cancelled", attempt)
+            device_error = self._ensure_device()
+            if device_error:
+                return NavigationResult(False, self._state, device_error, attempt)
+            try:
+                frame = self._capture()
+                match = self._match(frame, path)
+                if match is not None:
+                    x1, y1, x2, y2 = match.rect
+                    self._adb.tap((x1 + x2) // 2, (y1 + y2) // 2)
+                    deadline = time.monotonic() + self.timeout
+                    while time.monotonic() < deadline and not self._cancelled():
+                        last = self.detect_screen()
+                        if last in expected:
+                            self._state = last
+                            return NavigationResult(True, last, attempts=attempt)
+                        time.sleep(self.poll)
+            except Exception as exc:
+                self.log(f"navigation retry {label}: {exc}")
+            time.sleep(self.poll)
+        return NavigationResult(False, last, f"Navigation timeout: expected {','.join(x.value for x in expected)}", self.max_attempts)
 
     def detect_screen(self) -> ScreenState:
-        profile, error = _read_profile(self.project_dir)
-        if error or not profile:
+        data, error = _read_nav(self.project_dir)
+        if error:
+            self._load_error = error
             return ScreenState.UNKNOWN
-        if self._ensure_device():
+        device_error = self._ensure_device()
+        if device_error:
+            self._load_error = device_error
             return ScreenState.UNKNOWN
         try:
             frame = self._capture()
-        except Exception:
-            return ScreenState.UNKNOWN
-        candidates: list[tuple[float, ScreenState]] = []
-        records = [
-            (profile.get("base_to_locations", {}), ScreenState.MAIN_BASE),
-            (profile.get("enter_dungeon", {}), ScreenState.HERO_MENU),
-        ]
-        for item in _locations(profile):
-            if isinstance(item, dict):
-                records.append((item, ScreenState.LOCATION))
+            records = [((data.get("base_to_locations") or {}).get("png"), ScreenState.MAIN_BASE)]
+            records += [((data.get("enter_dungeon") or {}).get("png"), ScreenState.HERO_MENU)]
+            for item in _locations(data):
+                records.append((item.get("png"), ScreenState.LOCATION))
                 for floor in item.get("floors", []):
                     if isinstance(floor, dict):
-                        records.append((floor, ScreenState.FLOOR))
-        for record, state in records:
-            path = _png(record.get("png") if isinstance(record, dict) else None, self.project_dir)
-            if path is None:
-                continue
-            match = self._match(frame, path)
-            if match is not None:
-                candidates.append((float(getattr(match, "score", 1.0)), state))
-        if candidates:
-            self._state = max(candidates, key=lambda x: x[0])[1]
+                        records.append((floor.get("png"), ScreenState.FLOOR))
+            best: tuple[float, ScreenState] | None = None
+            for raw, state in records:
+                path = _resolve_png(self.project_dir, raw)
+                if path:
+                    match = self._match(frame, path)
+                    if match is not None and (best is None or match.score > best[0]):
+                        best = (match.score, state)
+            self._state = best[1] if best else ScreenState.UNKNOWN
+        except Exception:
+            self._state = ScreenState.UNKNOWN
         return self._state
-
-    def _result(self, ok: bool, state: ScreenState, message: str = "", attempts: int = 1) -> NavigationResult:
-        return NavigationResult(ok, state, message, attempts)
-
-    def _wait_state(self, expected: tuple[ScreenState, ...], deadline: float) -> ScreenState:
-        while time.monotonic() < deadline and not self._cancelled():
-            state = self.detect_screen()
-            if state in expected:
-                return state
-            time.sleep(self.poll)
-        return ScreenState.UNKNOWN
 
     def recover_to_main_base(self) -> NavigationResult:
         for attempt in range(1, self.max_attempts + 1):
-            if self._cancelled():
-                return self._result(False, ScreenState.UNKNOWN, "cancelled", attempt)
             state = self.detect_screen()
             if state == ScreenState.MAIN_BASE:
-                return self._result(True, state, attempts=attempt)
-            if self._ensure_device():
-                return self._result(False, state, "device is unavailable", attempt)
+                return NavigationResult(True, state, attempts=attempt)
+            error = self._ensure_device()
+            if error:
+                return NavigationResult(False, state, error, attempt)
             try:
                 self._adb.back()
             except Exception as exc:
-                return self._result(False, state, f"ADB back failed: {exc}", attempt)
+                return NavigationResult(False, state, f"ADB back failed: {exc}", attempt)
             time.sleep(self.poll)
-        return self._result(False, ScreenState.UNKNOWN, "main base was not detected during recovery", self.max_attempts)
-
-    def _click_step(self, path: Path | None, expected: tuple[ScreenState, ...], label: str) -> NavigationResult:
-        if path is None:
-            return self._result(False, self._state, f"template is missing: {label}")
-        for attempt in range(1, self.max_attempts + 1):
-            if self._cancelled():
-                return self._result(False, self._state, "cancelled", attempt)
-            if self._ensure_device():
-                return self._result(False, self._state, "device is unavailable", attempt)
-            try:
-                if not self._tap_template(path):
-                    time.sleep(self.poll)
-                    continue
-                state = self._wait_state(expected, time.monotonic() + self.timeout)
-                if state in expected:
-                    self._state = state
-                    return self._result(True, state, attempts=attempt)
-            except Exception as exc:
-                self._log(f"navigation retry {label}: {exc}")
-        return self._result(False, ScreenState.UNKNOWN, f"expected screen was not detected after {label}", self.max_attempts)
+        return NavigationResult(False, ScreenState.UNKNOWN, "main base was not detected during recovery", self.max_attempts)
 
     def go_to_location_select(self) -> NavigationResult:
-        profile, error = _read_profile(self.project_dir)
-        if error or not profile:
-            return self._result(False, ScreenState.UNKNOWN, error or "base knowledge file is missing")
-        state = self.detect_screen()
-        if state == ScreenState.LOCATION_SELECT:
-            return self._result(True, state)
-        if state != ScreenState.MAIN_BASE:
-            return self._result(False, state, "expected main_base")
-        return self._click_step(_png(profile.get("base_to_locations", {}).get("png"), self.project_dir), (ScreenState.LOCATION_SELECT,), "base_to_locations")
+        data, error = _read_nav(self.project_dir)
+        if error: return NavigationResult(False, ScreenState.UNKNOWN, error)
+        if self.detect_screen() == ScreenState.LOCATION_SELECT:
+            return NavigationResult(True, ScreenState.LOCATION_SELECT)
+        return self._tap(_resolve_png(self.project_dir, (data or {}).get("base_to_locations", {}).get("png")), (ScreenState.LOCATION_SELECT,), "base_to_locations")
 
     def select_location(self, location_id: str) -> NavigationResult:
-        if location_id not in _LOCATION_IDS:
-            raise ValueError(f"location_id must be one of {_LOCATION_IDS}")
-        profile, error = _read_profile(self.project_dir)
-        if error or not profile:
-            return self._result(False, ScreenState.UNKNOWN, error or "base knowledge file is missing")
-        state = self.detect_screen()
-        if state != ScreenState.LOCATION_SELECT:
-            return self._result(False, state, "expected location_select")
-        item = next((x for x in _locations(profile) if isinstance(x, dict) and str(x.get("slot")) == location_id), None)
-        if item is None:
-            return self._result(False, state, f"location template is missing: {location_id}")
-        return self._click_step(_png(item.get("png"), self.project_dir), (ScreenState.LOCATION,), location_id)
+        data, error = _read_nav(self.project_dir)
+        if error: return NavigationResult(False, ScreenState.UNKNOWN, error)
+        item = _location(data or {}, location_id)
+        if item is None: return NavigationResult(False, ScreenState.LOCATION_SELECT, f"Unknown location id: {location_id}")
+        return self._tap(_resolve_png(self.project_dir, item.get("png")), (ScreenState.LOCATION,), f"location:{location_id}")
 
     def select_floor(self, location_id: str, floor_number: int) -> NavigationResult:
-        if location_id not in _LOCATION_IDS:
-            raise ValueError(f"location_id must be one of {_LOCATION_IDS}")
-        if not isinstance(floor_number, int) or isinstance(floor_number, bool) or floor_number < 1:
-            raise ValueError("floor_number must be a positive integer")
-        profile, error = _read_profile(self.project_dir)
-        if error or not profile:
-            return self._result(False, ScreenState.UNKNOWN, error or "base knowledge file is missing")
-        item = next((x for x in _locations(profile) if isinstance(x, dict) and str(x.get("slot")) == location_id), None)
+        data, error = _read_nav(self.project_dir)
+        if error: return NavigationResult(False, ScreenState.UNKNOWN, error)
+        item = _location(data or {}, location_id)
         floor = next((x for x in (item or {}).get("floors", []) if isinstance(x, dict) and str(x.get("name")) == str(floor_number)), None)
-        state = self.detect_screen()
-        if floor is None:
-            return self._result(False, ScreenState.LOCATION, f"floor template is missing: {location_id}/{floor_number}")
-        return self._click_step(_png(floor.get("png"), self.project_dir), (ScreenState.FLOOR,), f"{location_id}/{floor_number}")
+        if floor is None: return NavigationResult(False, ScreenState.LOCATION, f"Floor template not found: {location_id}/{floor_number}")
+        return self._tap(_resolve_png(self.project_dir, floor.get("png")), (ScreenState.FLOOR, ScreenState.HERO_MENU), f"floor:{location_id}/{floor_number}")
 
     def open_hero_menu(self) -> NavigationResult:
-        profile, error = _read_profile(self.project_dir)
-        if error or not profile:
-            return self._result(False, ScreenState.UNKNOWN, error or "base knowledge file is missing")
-        state = self.detect_screen()
-        if state == ScreenState.HERO_MENU:
-            return self._result(True, state)
-        return self._click_step(_png(profile.get("enter_dungeon", {}).get("png"), self.project_dir), (ScreenState.HERO_MENU,), "enter_dungeon")
+        if self.detect_screen() == ScreenState.HERO_MENU:
+            return NavigationResult(True, ScreenState.HERO_MENU)
+        data, error = _read_nav(self.project_dir)
+        if error: return NavigationResult(False, ScreenState.UNKNOWN, error)
+        return self._tap(_resolve_png(self.project_dir, (data or {}).get("enter_dungeon", {}).get("png")), (ScreenState.HERO_MENU,), "enter_dungeon")
 
     def start_farm(self) -> NavigationResult:
-        profile, error = _read_profile(self.project_dir)
-        if error or not profile:
-            return self._result(False, ScreenState.UNKNOWN, error or "base knowledge file is missing")
-        state = self.detect_screen()
-        if state != ScreenState.HERO_MENU:
-            return self._result(False, state, "expected hero_menu")
-        # The compact nav.json contract has one final action: enter_dungeon.
-        return self._click_step(_png(profile.get("enter_dungeon", {}).get("png"), self.project_dir), (ScreenState.FARM,), "enter_dungeon")
+        if self.detect_screen() == ScreenState.FARM:
+            return NavigationResult(True, ScreenState.FARM)
+        return NavigationResult(False, self._state, "farm start confirmation is not available in data/base/nav.json")
 
-    def navigate_to_farm_start(self, target: NavigationTarget) -> NavigationResult:
-        state = self.detect_screen()
-        if state == ScreenState.FARM:
-            return self._result(True, state, "already in farm")
-        steps = (
-            self.recover_to_main_base,
-            self.go_to_location_select,
-            lambda: self.select_location(target.location_id),
-            lambda: self.select_floor(target.location_id, target.floor_number),
-            self.open_hero_menu,
-            self.start_farm,
-        )
-        attempts = 0
-        for step in steps:
+    def navigate_from_current_screen(self, location_id: str, floor_number: int) -> NavigationResult:
+        for step in (self.recover_to_main_base, self.go_to_location_select, lambda: self.select_location(location_id), lambda: self.select_floor(location_id, floor_number), self.open_hero_menu):
             result = step()
-            attempts += result.attempts
-            if not result.ok:
-                return NavigationResult(False, result.state, result.message, attempts)
-        return NavigationResult(True, ScreenState.FARM, "farm start confirmed", attempts)
+            if not result.ok: return result
+        return self.start_farm()
 
-
-def _controller(project_dir: str | Path, log: Callable[..., Any] = print, stop_event: Any = None) -> NavigationController:
-    return NavigationController(project_dir, log, stop_event)
-
-
-def detect_screen(project_dir: str | Path = ".") -> ScreenState:
-    return _controller(project_dir).detect_screen()
-
-
-def recover_to_main_base(project_dir: str | Path = ".") -> NavigationResult:
-    return _controller(project_dir).recover_to_main_base()
-
-
-def go_to_location_select(project_dir: str | Path = ".") -> NavigationResult:
-    return _controller(project_dir).go_to_location_select()
-
-
-def select_location(project_dir: str | Path, location_id: str) -> NavigationResult:
-    return _controller(project_dir).select_location(location_id)
-
-
-def select_floor(project_dir: str | Path, location_id: str, floor_number: int) -> NavigationResult:
-    return _controller(project_dir).select_floor(location_id, floor_number)
-
-
-def open_hero_menu(project_dir: str | Path = ".") -> NavigationResult:
-    return _controller(project_dir).open_hero_menu()
-
-
-def start_farm(project_dir: str | Path = ".") -> NavigationResult:
-    return _controller(project_dir).start_farm()
-
-
-def navigate_to_farm_start(project_dir: str | Path, target: NavigationTarget) -> NavigationResult:
-    return _controller(project_dir).navigate_to_farm_start(target)
-
-
-def verify_chain(project_dir: str | Path, location_name: str, floor_name: str, log: Callable[..., Any] = print) -> bool:
-    """Validate the complete profile chain without touching the device."""
-    profile, error = _read_profile(project_dir)
-    if error:
-        log(error)
-        return False
-    item = _location(profile or {}, location_name)
-    floor = next((f for f in (item or {}).get("floors", []) if isinstance(f, dict) and f.get("name") == floor_name), None)
-    checks = [
-        ("base_to_locations", _png((profile or {}).get("base_to_locations", {}).get("png"), project_dir)),
-        (f"location:{location_name}", _png((item or {}).get("png"), project_dir) if item else None),
-        (f"floor:{floor_name}", _png((floor or {}).get("png"), project_dir) if floor else None),
-        ("enter_dungeon", _png((profile or {}).get("enter_dungeon", {}).get("png"), project_dir)),
-    ]
-    ok = True
-    for label, path in checks:
-        ready = path is not None
-        log(f"{label}: {'OK' if ready else 'MISSING'}")
-        ok = ok and ready
-    return ok
+    navigate_to_farm = navigate_from_current_screen
 
 
 def go_to_dungeon(project_dir: str | Path, location_name: str, floor_name: str, log: Callable[..., Any] = print, stop_event: Any = None) -> bool:
-    """Run the device chain; returns False and logs the first honest reason on failure."""
-    profile, error = _read_profile(project_dir)
-    if error:
-        log(error)
-        return False
-    item = _location(profile or {}, location_name)
-    if item is None:
-        log(f"location is missing: {location_name}")
-        return False
     try:
-        slot = str(item.get("slot", ""))
-        floor = next(f for f in item.get("floors", []) if isinstance(f, dict) and f.get("name") == floor_name)
-        target = NavigationTarget(slot, int(floor_name))
-    except (StopIteration, ValueError, TypeError):
-        log(f"floor is missing or invalid: {location_name}/{floor_name}")
+        floor_number = int(floor_name)
+    except (TypeError, ValueError):
+        log(f"invalid floor: {floor_name}")
         return False
-    result = _controller(project_dir, log, stop_event).navigate_to_farm_start(target)
-    if not result.ok:
-        log(f"navigation failed: {result.message}")
+    result = NavigationController(project_dir, log, stop_event).navigate_from_current_screen(location_name, floor_number)
+    if not result.ok: log(result.message)
     return result.ok
+
+
+def verify_chain(project_dir: str | Path, location_name: str, floor_name: str, log: Callable[..., Any] = print) -> bool:
+    status = nav_status(project_dir)
+    if not status.get("ready"):
+        log(status.get("error") or "navigation profile is incomplete")
+        return False
+    data, error = _read_nav(project_dir)
+    item = _location(data or {}, location_name) if not error else None
+    floor = next((x for x in (item or {}).get("floors", []) if str(x.get("name")) == str(floor_name)), None)
+    if item is None:
+        log(f"Unknown location id: {location_name}")
+        return False
+    if floor is None or not _resolve_png(project_dir, floor.get("png")):
+        log(f"Floor template not found: {location_name}/{floor_name}")
+        return False
+    log("navigation chain is ready")
+    return True
 
 
 def _cli() -> int:
@@ -431,9 +302,7 @@ def _cli() -> int:
     parser.add_argument("--go", nargs=2, metavar=("LOCATION", "FLOOR"))
     parser.add_argument("--project-dir", default=".")
     args = parser.parse_args()
-    if not args.go:
-        parser.print_help()
-        return 0
+    if not args.go: parser.print_help(); return 0
     return 0 if go_to_dungeon(args.project_dir, args.go[0], args.go[1]) else 1
 
 
