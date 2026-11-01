@@ -2,283 +2,246 @@ from __future__ import annotations
 
 import random
 import time
-from typing import Any, Mapping, Optional, Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from bot.config import Config
+    from bot.vision import Frame, Template, VisionService
 
 
-class SafetyStop(RuntimeError):
-    pass
+class SafetyStop(Exception):
+    """Аварийная остановка по правилам безопасности."""
 
 
-class SafetyViolation(RuntimeError):
-    pass
+class SafetyConfigError(Exception):
+    """Ошибка конфигурации безопасности."""
 
 
-class NetworkRetryExceeded(RuntimeError):
-    pass
+@dataclass(frozen=True)
+class _Policy:
+    stop_on_danger: bool
+    allow_ads: bool
+    allow_purchase: bool
+    allow_premium_currency: bool
+    allow_pvp: bool
+    min_action_interval_ms: int
+    random_delay_min_ms: int
+    random_delay_max_ms: int
+    max_consecutive_network_errors: int
 
 
 class SafetyService:
-    """
-    Политики безопасности для бота.
+    """Сервис защитных правил для действий бота."""
 
-    По умолчанию:
-    - покупки заблокированы;
-    - реклама заблокирована;
-    - PvP заблокирован;
-    - при обнаружении danger бот останавливается.
+    _KNOWN_ACTIONS: frozenset[str] = frozenset(
+        {
+            "purchase",
+            "ad",
+            "pvp",
+            "tap",
+            "back",
+            "swipe",
+            "enter_room",
+            "next_floor",
+        }
+    )
 
-    Дополнительно:
-    - поддерживаются флаги allow_ads / allow_purchase /
-      allow_premium_currency / allow_pvp из конфига или словаря;
-    - есть случайные задержки из конфига;
-    - есть счётчик подряд идущих сетевых ошибок с ограничением повторов.
-    """
-
-    def __init__(
-        self,
-        block_purchases: bool = True,
-        block_ads: bool = True,
-        block_pvp: bool = True,
-        stop_on_danger: bool = True,
-        enforce_safe_actions: bool = False,
-        config: Optional[Mapping[str, Any]] = None,
-    ) -> None:
-        cfg = dict(config or {})
-
-        self.block_purchases = bool(block_purchases)
-        self.block_ads = bool(block_ads)
-        self.block_pvp = bool(block_pvp)
-        self.stop_on_danger = bool(stop_on_danger)
-        self.enforce_safe_actions = bool(enforce_safe_actions)
-
-        self.allow_ads = bool(cfg.get("allow_ads", False))
-        self.allow_purchase = bool(cfg.get("allow_purchase", False))
-        self.allow_premium_currency = bool(cfg.get("allow_premium_currency", False))
-        self.allow_pvp = bool(cfg.get("allow_pvp", False))
-
-        self.random_delay_min_s = float(cfg.get("random_delay_min_s", 0.0))
-        self.random_delay_max_s = float(cfg.get("random_delay_max_s", 0.0))
-        if self.random_delay_min_s < 0:
-            self.random_delay_min_s = 0.0
-        if self.random_delay_max_s < 0:
-            self.random_delay_max_s = 0.0
-        if self.random_delay_max_s < self.random_delay_min_s:
-            self.random_delay_min_s, self.random_delay_max_s = (
-                self.random_delay_max_s,
-                self.random_delay_min_s,
-            )
-
-        self.max_consecutive_network_errors = int(
-            cfg.get("max_consecutive_network_errors", 3)
-        )
-        if self.max_consecutive_network_errors < 1:
-            self.max_consecutive_network_errors = 1
-
-        self.consecutive_network_errors = 0
-
-    @classmethod
-    def from_config(cls, config: Any) -> "SafetyService":
+    def __init__(self, config: "Config") -> None:
         """
-        Удобный конструктор из AppConfig или словаря.
-        Поддерживает:
-        - AppConfig с полями контракта;
-        - dict-подобный объект.
+        Исключения:
+            - SafetyConfigError
         """
-        if config is None:
-            return cls()
+        self._config = config
+        self._policy = self._load_policy(config)
+        self._last_action_monotonic: float | None = None
+        self._consecutive_network_errors: int = 0
 
-        if isinstance(config, Mapping):
-            safety_cfg = config.get("safety", {})
-            return cls(
-                block_purchases=bool(safety_cfg.get("block_purchases", True)),
-                block_ads=bool(safety_cfg.get("block_ads", True)),
-                block_pvp=bool(safety_cfg.get("block_pvp", True)),
-                stop_on_danger=bool(safety_cfg.get("stop_on_danger", True)),
-                enforce_safe_actions=bool(safety_cfg.get("enforce_safe_actions", False)),
-                config=safety_cfg,
-            )
-
-        raw = getattr(config, "raw", {}) or {}
-        safety_cfg = raw.get("safety", {}) if isinstance(raw, dict) else {}
-        return cls(
-            block_purchases=bool(getattr(config, "block_purchases", True)),
-            block_ads=bool(getattr(config, "block_ads", True)),
-            block_pvp=bool(getattr(config, "block_pvp", True)),
-            stop_on_danger=bool(getattr(config, "stop_on_danger", True)),
-            enforce_safe_actions=bool(getattr(config, "enforce_safe_actions", False)),
-            config=safety_cfg,
-        )
-
-    def check_danger(self, frame, vision: "VisionService", templates: Sequence["Template"]) -> bool:
+    def check_danger(self, frame: "Frame", vision: "VisionService", templates: list["Template"]) -> None:
         """
-        Проверяет наличие category='danger'.
+        Если найден danger и stop_on_danger=true, выбрасывает SafetyStop.
 
         Возвращает:
-        - True, если danger найден
-        - False, если не найден
+            None
 
         Исключения:
-        - SafetyStop, если stop_on_danger=True и danger найден
+            - SafetyStop
+            - VisionError
         """
-        match = vision.best_match_by_category(frame=frame, templates=templates, category="danger")
-        found = match is not None
-        if found and self.stop_on_danger:
-            raise SafetyStop("Обнаружен danger. Работа бота остановлена политикой безопасности.")
-        return found
-
-    def validate_tap(self, x: int, y: int, allowed_rois: Optional[list] = None) -> None:
-        """
-        Проверяет, допустим ли тап по политике безопасности.
-
-        allowed_rois ожидается в формате:
-        [
-            [x, y, w, h],
-            ...
-        ]
-
-        Если enforce_safe_actions=False, проверка белых зон не применяется.
-        """
-        if not self.enforce_safe_actions:
+        if not self._policy.stop_on_danger:
             return
 
-        if not allowed_rois:
-            raise SafetyViolation(
-                "Тап запрещён: включён enforce_safe_actions, но список allowed_rois пуст."
+        danger_templates = [template for template in templates if template.enabled and template.category == "danger"]
+        if not danger_templates:
+            return
+
+        matches = vision.find_all(frame, danger_templates, category="danger")
+        if matches:
+            best = matches[0]
+            raise SafetyStop(
+                f"Обнаружен danger: category={best.category}, template_id={best.template_id}, score={best.score:.4f}"
             )
 
-        for roi in allowed_rois:
-            if not isinstance(roi, (list, tuple)) or len(roi) != 4:
-                continue
-            rx, ry, rw, rh = roi
-            if rx <= x <= rx + rw and ry <= y <= ry + rh:
-                return
-
-        raise SafetyViolation(
-            f"Тап в точку ({x}, {y}) запрещён политикой безопасности: точка вне allowed_rois."
-        )
-
-    def assert_action_allowed(self, action_name: str) -> None:
+    def ensure_action_allowed(self, action_name: str) -> None:
         """
-        Блокирует запрещённые действия по имени.
+        Проверяет, не запрещено ли действие политикой безопасности.
+        Используемые action_name:
+            'purchase'
+            'ad'
+            'pvp'
+            'tap'
+            'back'
+            'swipe'
+            'enter_room'
+            'next_floor'
 
-        Обязательные запрещаемые имена:
-        - purchase
-        - ad
-        - pvp
+        Возвращает:
+            None
+
+        Исключения:
+            - SafetyStop: если действие запрещено
         """
-        normalized = (action_name or "").strip().lower()
+        if not action_name or not isinstance(action_name, str):
+            raise SafetyStop("Пустое или невалидное имя действия запрещено политикой безопасности")
 
-        if normalized == "purchase":
-            if self.block_purchases or not self.allow_purchase:
-                raise SafetyViolation("Действие purchase запрещено политикой безопасности.")
-            return
+        normalized = action_name.strip().lower()
 
-        if normalized == "ad":
-            if self.block_ads or not self.allow_ads:
-                raise SafetyViolation("Действие ad запрещено политикой безопасности.")
-            return
+        if normalized == "purchase" and not self._policy.allow_purchase:
+            raise SafetyStop("Действие 'purchase' запрещено: allow_purchase=false")
 
-        if normalized == "pvp":
-            if self.block_pvp or not self.allow_pvp:
-                raise SafetyViolation("Действие pvp запрещено политикой безопасности.")
-            return
+        if normalized == "ad" and not self._policy.allow_ads:
+            raise SafetyStop("Действие 'ad' запрещено: allow_ads=false")
 
-    def is_action_allowed(
-        self,
-        action_name: str,
-        *,
-        dangerous: bool = False,
-        uses_premium_currency: bool = False,
-    ) -> bool:
-        """
-        Проверка, можно ли выполнять действие для правила с учётом dangerous.
+        if normalized == "pvp" and not self._policy.allow_pvp:
+            raise SafetyStop("Действие 'pvp' запрещено: allow_pvp=false")
 
-        Правила:
-        - dangerous блокируется, если stop_on_danger=True;
-        - purchase требует allow_purchase=True и отсутствие block_purchases;
-        - ad требует allow_ads=True и отсутствие block_ads;
-        - pvp требует allow_pvp=True и отсутствие block_pvp;
-        - действие с premium currency требует allow_premium_currency=True.
-        """
-        if dangerous and self.stop_on_danger:
-            return False
+        if normalized == "premium_currency" and not self._policy.allow_premium_currency:
+            raise SafetyStop("Действие 'premium_currency' запрещено: allow_premium_currency=false")
 
-        normalized = (action_name or "").strip().lower()
+        if normalized not in self._KNOWN_ACTIONS and normalized != "premium_currency":
+            raise SafetyStop(f"Неизвестное действие '{action_name}' запрещено политикой безопасности")
 
-        if uses_premium_currency and not self.allow_premium_currency:
-            return False
-
-        if normalized == "purchase":
-            return (not self.block_purchases) and self.allow_purchase
-
-        if normalized == "ad":
-            return (not self.block_ads) and self.allow_ads
-
-        if normalized == "pvp":
-            return (not self.block_pvp) and self.allow_pvp
-
-        return True
-
-    def assert_rule_action_allowed(
-        self,
-        action_name: str,
-        *,
-        dangerous: bool = False,
-        uses_premium_currency: bool = False,
-    ) -> None:
-        """
-        Строгая версия is_action_allowed(...): бросает исключение при запрете.
-        """
-        if not self.is_action_allowed(
-            action_name,
-            dangerous=dangerous,
-            uses_premium_currency=uses_premium_currency,
-        ):
-            raise SafetyViolation(
-                "Действие запрещено политикой безопасности: "
-                f"action_name={action_name!r}, dangerous={dangerous}, "
-                f"uses_premium_currency={uses_premium_currency}"
-            )
+        self._enforce_min_action_interval()
 
     def random_delay(self) -> float:
         """
-        Случайная задержка из конфига.
-        Возвращает фактическую длительность задержки в секундах.
+        Выполняет случайную задержку из конфига и возвращает её длительность в секундах.
+
+        Возвращает:
+            float
+
+        Исключения:
+            Нет
         """
-        delay = random.uniform(self.random_delay_min_s, self.random_delay_max_s)
-        if delay > 0:
-            time.sleep(delay)
-        return delay
+        min_ms = self._policy.random_delay_min_ms
+        max_ms = self._policy.random_delay_max_ms
+        delay_ms = random.randint(min_ms, max_ms)
+        delay_s = delay_ms / 1000.0
+        if delay_s > 0:
+            time.sleep(delay_s)
+        return delay_s
 
     def register_network_error(self) -> int:
         """
         Увеличивает счётчик подряд идущих сетевых ошибок.
 
+        Возвращает:
+            int: текущее число подряд идущих ошибок.
+
         Исключения:
-        - NetworkRetryExceeded, если превышен лимит повторов.
+            - SafetyStop: если превышен лимит повторов
         """
-        self.consecutive_network_errors += 1
-        if self.consecutive_network_errors > self.max_consecutive_network_errors:
-            raise NetworkRetryExceeded(
+        self._consecutive_network_errors += 1
+        if self._consecutive_network_errors > self._policy.max_consecutive_network_errors:
+            raise SafetyStop(
                 "Превышен лимит подряд идущих сетевых ошибок: "
-                f"{self.consecutive_network_errors} > {self.max_consecutive_network_errors}"
+                f"{self._consecutive_network_errors} > {self._policy.max_consecutive_network_errors}"
             )
-        return self.consecutive_network_errors
+        return self._consecutive_network_errors
 
     def reset_network_error_counter(self) -> None:
-        """
-        Сбрасывает счётчик подряд идущих сетевых ошибок после успешной операции.
-        """
-        self.consecutive_network_errors = 0
+        """Сбрасывает счётчик подряд идущих сетевых ошибок."""
+        self._consecutive_network_errors = 0
+
+    def consecutive_network_errors(self) -> int:
+        """Возвращает текущее число подряд идущих сетевых ошибок."""
+        return self._consecutive_network_errors
 
     def can_retry_after_network_error(self) -> bool:
         """
-        Возвращает True, если ещё можно делать повтор после сетевой ошибки.
+        Проверяет, можно ли ещё повторять операцию после сетевых ошибок.
         """
-        return self.consecutive_network_errors < self.max_consecutive_network_errors
+        return self._consecutive_network_errors < self._policy.max_consecutive_network_errors
 
-    def get_network_error_count(self) -> int:
-        """
-        Текущее число подряд идущих сетевых ошибок.
-        """
-        return self.consecutive_network_errors
+    def mark_action_executed(self) -> None:
+        """Фиксирует время последнего выполненного действия."""
+        self._last_action_monotonic = time.monotonic()
+
+    def _enforce_min_action_interval(self) -> None:
+        now = time.monotonic()
+        min_interval_s = self._policy.min_action_interval_ms / 1000.0
+
+        if self._last_action_monotonic is not None:
+            elapsed = now - self._last_action_monotonic
+            remaining = min_interval_s - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
+
+        self._last_action_monotonic = time.monotonic()
+
+    def _load_policy(self, config: "Config") -> _Policy:
+        stop_on_danger = self._get_bool(config, "safety.stop_on_danger", True)
+
+        forbid_ads = self._get_bool(config, "safety.forbid_ads", True)
+        forbid_purchases = self._get_bool(config, "safety.forbid_purchases", True)
+        forbid_pvp = self._get_bool(config, "safety.forbid_pvp", True)
+
+        allow_ads = self._get_bool(config, "safety.allow_ads", not forbid_ads)
+        allow_purchase = self._get_bool(config, "safety.allow_purchase", not forbid_purchases)
+        allow_pvp = self._get_bool(config, "safety.allow_pvp", not forbid_pvp)
+        allow_premium_currency = self._get_bool(config, "safety.allow_premium_currency", False)
+
+        min_action_interval_ms = self._get_int(config, "safety.min_action_interval_ms", 250, minimum=0)
+        random_delay_min_ms = self._get_int(config, "safety.random_delay_min_ms", 0, minimum=0)
+        random_delay_max_ms = self._get_int(config, "safety.random_delay_max_ms", random_delay_min_ms, minimum=0)
+        max_consecutive_network_errors = self._get_int(
+            config,
+            "safety.max_consecutive_network_errors",
+            3,
+            minimum=0,
+        )
+
+        if random_delay_max_ms < random_delay_min_ms:
+            raise SafetyConfigError(
+                "Некорректный диапазон случайной задержки: "
+                f"safety.random_delay_max_ms={random_delay_max_ms} < "
+                f"safety.random_delay_min_ms={random_delay_min_ms}"
+            )
+
+        return _Policy(
+            stop_on_danger=stop_on_danger,
+            allow_ads=allow_ads,
+            allow_purchase=allow_purchase,
+            allow_premium_currency=allow_premium_currency,
+            allow_pvp=allow_pvp,
+            min_action_interval_ms=min_action_interval_ms,
+            random_delay_min_ms=random_delay_min_ms,
+            random_delay_max_ms=random_delay_max_ms,
+            max_consecutive_network_errors=max_consecutive_network_errors,
+        )
+
+    @staticmethod
+    def _get_bool(config: "Config", key: str, default: bool) -> bool:
+        value = config.get(key, default)
+        if not isinstance(value, bool):
+            raise SafetyConfigError(f"Параметр '{key}' должен быть bool, получено: {type(value).__name__}")
+        return value
+
+    @staticmethod
+    def _get_int(config: "Config", key: str, default: int, minimum: int | None = None) -> int:
+        value = config.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise SafetyConfigError(f"Параметр '{key}' должен быть int, получено: {type(value).__name__}")
+        if minimum is not None and value < minimum:
+            raise SafetyConfigError(f"Параметр '{key}' должен быть >= {minimum}, получено: {value}")
+        return value
