@@ -1,0 +1,422 @@
+# Главный конфиг бота.
+# Ниже только те ключи, которые реально читает код из contract/config.py
+# и которые дополнительно требуются по задаче для safety/profiles.
+
+app:
+  # Имя приложения. Само по себе ни на что не влияет, но код читает секцию app целиком.
+  name: "dungeon2_bot"
+
+  # Уровень логов: DEBUG, INFO, WARNING, ERROR или CRITICAL.
+  log_level: "INFO"
+
+  # Корневая папка с данными бота.
+  data_dir: "./data"
+
+  # Куда сохранять скриншоты и захваты кадров.
+  captures_dir: "./data/captures"
+
+  # Временная папка для промежуточных файлов.
+  temp_dir: "./data/tmp"
+
+adb:
+  # Путь к adb.exe. Если adb уже лежит в PATH, можно оставить просто "adb".
+  adb_path: "C:/LDPlayer/LDPlayer9/adb.exe"
+
+  # Серийный номер устройства или эмулятора ADB.
+  device_serial: "127.0.0.1:5555"
+
+  # Таймаут обычных ADB-команд в секундах.
+  command_timeout_s: 15.0
+
+  # Таймаут подключения к ADB в секундах.
+  connect_timeout_s: 10.0
+
+  # Небольшая пауза после тапа, чтобы игра успела отреагировать.
+  post_tap_delay_ms: 250
+
+  # Небольшая пауза после свайпа.
+  post_swipe_delay_ms: 400
+
+  # Небольшая пауза после отправки keyevent.
+  post_keyevent_delay_ms: 200
+
+screen:
+  # Ожидаемая ширина экрана эмулятора.
+  expected_width: 1280
+
+  # Ожидаемая высота экрана эмулятора.
+  expected_height: 720
+
+  # Формат скриншота. По текущему коду разрешён только png.
+  capture_format: "png"
+
+  # Поворот изображения после захвата: 0, 90, 180 или 270.
+  rotation: 0
+
+motion:
+  # Сколько подряд почти одинаковых кадров нужно, чтобы считать экран стабильным.
+  stable_frames: 3
+
+  # Порог различия уменьшенных кадров. Меньше порога = кадры считаются похожими.
+  stable_diff_threshold: 2.5
+
+  # Как часто делать новый скриншот при ожидании стабилизации, в миллисекундах.
+  stable_poll_ms: 250
+
+  # Сколько секунд ждать стабилизации за одну попытку.
+  stable_timeout_s: 8.0
+
+  # Сколько дополнительных попыток ждать стабилизацию, если с первого раза не получилось.
+  max_stable_retries: 2
+
+  # До какого размера уменьшать кадр для быстрой проверки движения: [ширина, высота].
+  downscale_size: [64, 36]
+
+matching:
+  # Базовый порог совпадения шаблона при поиске.
+  default_threshold: 0.90
+
+  # Базовый порог для классификации типа экрана.
+  classify_threshold: 0.90
+
+  # Метод OpenCV для matchTemplate. Текущий vision.py поддерживает TM_CCOEFF_NORMED.
+  method: "TM_CCOEFF_NORMED"
+
+  # Переводить ли кадры в оттенки серого перед поиском.
+  grayscale: true
+
+teacher:
+  # Горячая клавиша паузы/разметки.
+  pause_hotkey: "space"
+
+  # Папка базы знаний: шаблоны, rules.json и features.json.
+  knowledge_dir: "./data/knowledge"
+
+  # Сохранять ли неизвестные, но уже стабильные кадры для последующей разметки.
+  save_unknown_frames: true
+
+  # Папка, куда складываются неизвестные кадры.
+  unknown_dir: "./data/knowledge/unknown"
+
+safety:
+  # Явное разрешение рекламы. По задаче должно быть false.
+  allow_ads: false
+
+  # Явное разрешение покупок. По задаче должно быть false.
+  allow_purchase: false
+
+  # Явное разрешение тратить премиум-валюту. По задаче должно быть false.
+  allow_premium_currency: false
+
+  # Явное разрешение PvP. По задаче должно быть false.
+  allow_pvp: false
+
+  # Блокировать покупки. Это поле читает config.py/AppConfig.
+  block_purchases: true
+
+  # Блокировать рекламу. Это поле читает config.py/AppConfig.
+  block_ads: true
+
+  # Блокировать PvP. Это поле читает config.py/AppConfig.
+  block_pvp: true
+
+  # Останавливать бота при нахождении danger.
+  stop_on_danger: true
+
+  # Разрешать тапы только в белых зонах, если такие зоны будут заданы кодом.
+  enforce_safe_actions: false
+
+  # Минимальная случайная задержка перед действием, если safety.py решит её применять.
+  random_delay_min_s: 0.0
+
+  # Максимальная случайная задержка перед действием.
+  random_delay_max_s: 0.0
+
+  # Сколько подряд сетевых ошибок допустимо до остановки повторов.
+  max_consecutive_network_errors: 3
+
+profiles:
+  # Активный профиль по умолчанию.
+  active: "loc1"
+
+  # Набор профилей. По задаче нужны ровно loc1..loc7.
+  items:
+    loc1:
+      # Человекочитаемое имя профиля.
+      name: "loc1"
+
+      # Прямоугольные области поиска [x, y, w, h].
+      # Здесь оставлены безопасные значения на весь экран, потому что внешний вид игры не выдумываем.
+      rois:
+        # Область поиска маркера отряда.
+        party_marker: [0, 0, 1280, 720]
+        # Область поиска значка уже открытой комнаты.
+        room_open_big_icon: [0, 0, 1280, 720]
+        # Область поиска дверей.
+        door_search: [0, 0, 1280, 720]
+        # Область классификации экрана комнаты.
+        room_screen: [0, 0, 1280, 720]
+        # Область классификации экрана прохода.
+        passage_screen: [0, 0, 1280, 720]
+        # Область классификации экрана события.
+        event_screen: [0, 0, 1280, 720]
+        # Область поиска мобов.
+        mob: [0, 0, 1280, 720]
+        # Область поиска босса.
+        boss: [0, 0, 1280, 720]
+        # Область поиска лута.
+        loot: [0, 0, 1280, 720]
+        # Область поиска кнопки выхода.
+        exit: [0, 0, 1280, 720]
+        # Область поиска кнопки автобоя.
+        auto_battle: [0, 0, 1280, 720]
+        # Область поиска перехода на следующий этаж.
+        next_floor: [0, 0, 1280, 720]
+        # Область поиска danger-сигнала.
+        danger: [0, 0, 1280, 720]
+
+      actions:
+        # Координата тапа для выхода из комнаты/события, если это действие задаётся вручную.
+        exit_tap: [100, 100]
+        # Координата тапа по кнопке автобоя.
+        auto_battle_tap: [1100, 650]
+        # Координата тапа по кнопке следующего этажа.
+        next_floor_tap: [1180, 660]
+
+      timings:
+        # Пауза после входа в комнату, мс.
+        after_room_enter_ms: 500
+        # Пауза после выхода из комнаты, мс.
+        after_exit_ms: 500
+        # Пауза после перехода на следующий этаж, мс.
+        after_next_floor_ms: 1000
+        # Сколько максимум ждать завершения боя, сек.
+        battle_settle_timeout_s: 120.0
+
+      # С какого этажа начинать для этого профиля.
+      floor_from: 1
+      # До какого этажа идти для этого профиля.
+      floor_to: 10
+      # Идти ли подряд по всем этажам диапазона.
+      run_all_floors: true
+
+    loc2:
+      name: "loc2"
+      rois:
+        party_marker: [0, 0, 1280, 720]
+        room_open_big_icon: [0, 0, 1280, 720]
+        door_search: [0, 0, 1280, 720]
+        room_screen: [0, 0, 1280, 720]
+        passage_screen: [0, 0, 1280, 720]
+        event_screen: [0, 0, 1280, 720]
+        mob: [0, 0, 1280, 720]
+        boss: [0, 0, 1280, 720]
+        loot: [0, 0, 1280, 720]
+        exit: [0, 0, 1280, 720]
+        auto_battle: [0, 0, 1280, 720]
+        next_floor: [0, 0, 1280, 720]
+        danger: [0, 0, 1280, 720]
+      actions:
+        exit_tap: [100, 100]
+        auto_battle_tap: [1100, 650]
+        next_floor_tap: [1180, 660]
+      timings:
+        after_room_enter_ms: 500
+        after_exit_ms: 500
+        after_next_floor_ms: 1000
+        battle_settle_timeout_s: 120.0
+      floor_from: 1
+      floor_to: 10
+      run_all_floors: true
+
+    loc3:
+      name: "loc3"
+      rois:
+        party_marker: [0, 0, 1280, 720]
+        room_open_big_icon: [0, 0, 1280, 720]
+        door_search: [0, 0, 1280, 720]
+        room_screen: [0, 0, 1280, 720]
+        passage_screen: [0, 0, 1280, 720]
+        event_screen: [0, 0, 1280, 720]
+        mob: [0, 0, 1280, 720]
+        boss: [0, 0, 1280, 720]
+        loot: [0, 0, 1280, 720]
+        exit: [0, 0, 1280, 720]
+        auto_battle: [0, 0, 1280, 720]
+        next_floor: [0, 0, 1280, 720]
+        danger: [0, 0, 1280, 720]
+      actions:
+        exit_tap: [100, 100]
+        auto_battle_tap: [1100, 650]
+        next_floor_tap: [1180, 660]
+      timings:
+        after_room_enter_ms: 500
+        after_exit_ms: 500
+        after_next_floor_ms: 1000
+        battle_settle_timeout_s: 120.0
+      floor_from: 1
+      floor_to: 10
+      run_all_floors: true
+
+    loc4:
+      name: "loc4"
+      rois:
+        party_marker: [0, 0, 1280, 720]
+        room_open_big_icon: [0, 0, 1280, 720]
+        door_search: [0, 0, 1280, 720]
+        room_screen: [0, 0, 1280, 720]
+        passage_screen: [0, 0, 1280, 720]
+        event_screen: [0, 0, 1280, 720]
+        mob: [0, 0, 1280, 720]
+        boss: [0, 0, 1280, 720]
+        loot: [0, 0, 1280, 720]
+        exit: [0, 0, 1280, 720]
+        auto_battle: [0, 0, 1280, 720]
+        next_floor: [0, 0, 1280, 720]
+        danger: [0, 0, 1280, 720]
+      actions:
+        exit_tap: [100, 100]
+        auto_battle_tap: [1100, 650]
+        next_floor_tap: [1180, 660]
+      timings:
+        after_room_enter_ms: 500
+        after_exit_ms: 500
+        after_next_floor_ms: 1000
+        battle_settle_timeout_s: 120.0
+      floor_from: 1
+      floor_to: 10
+      run_all_floors: true
+
+    loc5:
+      name: "loc5"
+      rois:
+        party_marker: [0, 0, 1280, 720]
+        room_open_big_icon: [0, 0, 1280, 720]
+        door_search: [0, 0, 1280, 720]
+        room_screen: [0, 0, 1280, 720]
+        passage_screen: [0, 0, 1280, 720]
+        event_screen: [0, 0, 1280, 720]
+        mob: [0, 0, 1280, 720]
+        boss: [0, 0, 1280, 720]
+        loot: [0, 0, 1280, 720]
+        exit: [0, 0, 1280, 720]
+        auto_battle: [0, 0, 1280, 720]
+        next_floor: [0, 0, 1280, 720]
+        danger: [0, 0, 1280, 720]
+      actions:
+        exit_tap: [100, 100]
+        auto_battle_tap: [1100, 650]
+        next_floor_tap: [1180, 660]
+      timings:
+        after_room_enter_ms: 500
+        after_exit_ms: 500
+        after_next_floor_ms: 1000
+        battle_settle_timeout_s: 120.0
+      floor_from: 1
+      floor_to: 10
+      run_all_floors: true
+
+    loc6:
+      name: "loc6"
+      rois:
+        party_marker: [0, 0, 1280, 720]
+        room_open_big_icon: [0, 0, 1280, 720]
+        door_search: [0, 0, 1280, 720]
+        room_screen: [0, 0, 1280, 720]
+        passage_screen: [0, 0, 1280, 720]
+        event_screen: [0, 0, 1280, 720]
+        mob: [0, 0, 1280, 720]
+        boss: [0, 0, 1280, 720]
+        loot: [0, 0, 1280, 720]
+        exit: [0, 0, 1280, 720]
+        auto_battle: [0, 0, 1280, 720]
+        next_floor: [0, 0, 1280, 720]
+        danger: [0, 0, 1280, 720]
+      actions:
+        exit_tap: [100, 100]
+        auto_battle_tap: [1100, 650]
+        next_floor_tap: [1180, 660]
+      timings:
+        after_room_enter_ms: 500
+        after_exit_ms: 500
+        after_next_floor_ms: 1000
+        battle_settle_timeout_s: 120.0
+      floor_from: 1
+      floor_to: 10
+      run_all_floors: true
+
+    loc7:
+      name: "loc7"
+      rois:
+        party_marker: [0, 0, 1280, 720]
+        room_open_big_icon: [0, 0, 1280, 720]
+        door_search: [0, 0, 1280, 720]
+        room_screen: [0, 0, 1280, 720]
+        passage_screen: [0, 0, 1280, 720]
+        event_screen: [0, 0, 1280, 720]
+        mob: [0, 0, 1280, 720]
+        boss: [0, 0, 1280, 720]
+        loot: [0, 0, 1280, 720]
+        exit: [0, 0, 1280, 720]
+        auto_battle: [0, 0, 1280, 720]
+        next_floor: [0, 0, 1280, 720]
+        danger: [0, 0, 1280, 720]
+      actions:
+        exit_tap: [100, 100]
+        auto_battle_tap: [1100, 650]
+        next_floor_tap: [1180, 660]
+      timings:
+        after_room_enter_ms: 500
+        after_exit_ms: 500
+        after_next_floor_ms: 1000
+        battle_settle_timeout_s: 120.0
+      floor_from: 1
+      floor_to: 10
+      run_all_floors: true
+
+progress:
+  # Путь к общему файлу прогресса исследования.
+  file: "./data/progress.json"
+
+knowledge:
+  # Путь к rules.json с эталонами и правилами.
+  rules_file: "./data/knowledge/rules.json"
+
+  # Путь к features.json со служебными метаданными эталонов.
+  features_file: "./data/knowledge/features.json"
+
+state:
+  # Папка, где будут храниться состояния этажей.
+  dir: "./data/state"
+
+  # Шаблон имени файла состояния этажа. {floor_number} подставляется кодом.
+  floor_state_file_pattern: "floor_{floor_number}.json"
+
+exploration:
+  # Стартовый этаж по умолчанию, если его не передали через CLI.
+  default_floor_from: 1
+
+  # Последний этаж по умолчанию, если его не передали через CLI.
+  default_floor_to: 10
+
+  # Заходить во все найденные двери.
+  enter_all_doors: true
+
+  # Пропускать события через выход, не запускать их.
+  skip_events_by_exit: true
+
+  # Не возвращаться в уже открытые комнаты.
+  revisit_open_rooms: false
+
+  # Сколько раз максимум пытаться обработать одну дверь.
+  max_attempts_per_door: 1
+
+debug:
+  # Сохранять каждый скриншот.
+  save_every_capture: false
+
+  # Сохранять кадры, где были найдены совпадения шаблонов.
+  save_matched_frames: false
+
+  # Рисовать отладочные рамки совпадений на сохранённых кадрах.
+  annotate_matches: false
