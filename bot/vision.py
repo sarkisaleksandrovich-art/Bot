@@ -1,455 +1,501 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Callable, Iterable, TYPE_CHECKING
+import logging
+import os
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Callable
 
 import cv2
 import numpy as np
-from numpy.typing import NDArray
 
 if TYPE_CHECKING:
-    from bot.config import Config
+    from bot.config import BotConfig
+    from bot.knowledge import TemplateRecord
+
+Frame = np.ndarray
 
 
 class VisionError(Exception):
     pass
 
 
-Frame = NDArray[np.uint8]
-
-
-@dataclass(frozen=True)
-class Rect:
-    x: int
-    y: int
-    w: int
-    h: int
-
-
 @dataclass(frozen=True)
 class Match:
     category: str
     score: float
-    rect: Rect
-    template_id: str | None = None
+    rect: tuple[int, int, int, int]
+    template_id: str
 
 
 @dataclass(frozen=True)
-class Template:
-    id: str
+class LoadedTemplate:
+    template_id: str
     category: str
-    image: Frame
-    roi: Rect
+    image_gray: Frame
+    roi: tuple[int, int, int, int] | None
     threshold: float
-    enabled: bool = True
+    optional: bool
 
 
-class VisionService:
-    SCREEN_CATEGORIES: tuple[str, ...] = (
-        "room_screen",
-        "passage_screen",
-        "event_screen",
-    )
+class VisionEngine:
+    SCREEN_CATEGORIES = ("room_screen", "passage_screen", "event_screen")
 
-    def __init__(self, config: "Config") -> None:
+    def __init__(self, config: "BotConfig", logger: "logging.Logger") -> None:
         self.config = config
-
-        try:
-            self.default_threshold = float(config.get("matching.default_threshold"))
-            self.classify_threshold = float(config.get("matching.classify_threshold"))
-            self.motion_stable_frames = int(config.get("motion.stable_frames"))
-            self.motion_stable_diff_threshold = float(config.get("motion.stable_diff_threshold"))
-            self.motion_stable_poll_ms = int(config.get("motion.stable_poll_ms"))
-            self.motion_stable_timeout_s = float(config.get("motion.stable_timeout_s"))
-            downscale = config.get("motion.downscale_size")
-        except Exception as exc:
-            raise VisionError("Missing or invalid matching/motion configuration") from exc
-
-        if not isinstance(downscale, (list, tuple)) or len(downscale) != 2:
-            raise VisionError("motion.downscale_size must be a sequence of two integers")
-
-        self.motion_downscale_size = (int(downscale[0]), int(downscale[1]))
-        self._validate_runtime_params(
-            stable_frames=self.motion_stable_frames,
-            stable_diff_threshold=self.motion_stable_diff_threshold,
-            stable_poll_ms=self.motion_stable_poll_ms,
-            stable_timeout_s=self.motion_stable_timeout_s,
-            downscale_size=self.motion_downscale_size,
+        self.logger = logger
+        self._vision_cfg = self._get_section("vision")
+        self._motion_cfg = self._get_section("motion")
+        self._debug_cfg = self._get_section("debug", required=False)
+        self._default_threshold = float(self._vision_cfg.get("default_match_threshold", 0.88))
+        self._template_method = self._resolve_template_method(
+            str(self._vision_cfg.get("template_method", "TM_CCOEFF_NORMED"))
         )
+        self._save_debug_images = bool(self._vision_cfg.get("save_debug_images", False))
+        self._debug_dir = str(self._vision_cfg.get("debug_dir", "./debug"))
+        self._min_roi_area = int(self._vision_cfg.get("min_roi_area", 100))
+        self._verbose_vision = bool(self._debug_cfg.get("verbose_vision", False)) if self._debug_cfg else False
+        self._template_cache: dict[str, LoadedTemplate] = {}
 
     def wait_until_stable(
         self,
-        capture_fn: Callable[[], Frame],
+        capture_fn: "Callable[[], Frame]",
         stable_frames: int | None = None,
         stable_diff_threshold: float | None = None,
         stable_poll_ms: int | None = None,
         stable_timeout_s: float | None = None,
         downscale_size: tuple[int, int] | None = None,
-    ) -> tuple[Frame, bool]:
-        stable_frames = self.motion_stable_frames if stable_frames is None else stable_frames
-        stable_diff_threshold = (
-            self.motion_stable_diff_threshold
-            if stable_diff_threshold is None
-            else stable_diff_threshold
-        )
-        stable_poll_ms = self.motion_stable_poll_ms if stable_poll_ms is None else stable_poll_ms
-        stable_timeout_s = self.motion_stable_timeout_s if stable_timeout_s is None else stable_timeout_s
-        downscale_size = self.motion_downscale_size if downscale_size is None else downscale_size
+    ) -> tuple["Frame", bool]:
+        """
+        Ждёт стабилизации кадра после движения/перехода.
 
-        self._validate_runtime_params(
-            stable_frames=stable_frames,
-            stable_diff_threshold=stable_diff_threshold,
-            stable_poll_ms=stable_poll_ms,
-            stable_timeout_s=stable_timeout_s,
-            downscale_size=downscale_size,
-        )
+        Стабилизация = несколько подряд почти одинаковых уменьшенных кадров.
+        Сравнение делается по уменьшенным копиям кадров.
+        При успехе возвращает последний кадр и True.
+        При таймауте возвращает последний кадр и False.
 
-        deadline = time.monotonic() + float(stable_timeout_s)
+        :param capture_fn: функция захвата текущего кадра
+        :param stable_frames: override из motion.stable_frames
+        :param stable_diff_threshold: override из motion.stable_diff_threshold
+        :param stable_poll_ms: override из motion.stable_poll_ms
+        :param stable_timeout_s: override из motion.stable_timeout_s
+        :param downscale_size: override из motion.downscale_size
+        :return: (frame, is_stable)
+        :raises ScreenshotError: если capture_fn не смог получить кадр
+        :raises VisionError: при внутренних ошибках сравнения
+        """
+        target_stable_frames = int(stable_frames or self._motion_cfg.get("stable_frames", 3))
+        diff_threshold = float(
+            stable_diff_threshold
+            if stable_diff_threshold is not None
+            else self._motion_cfg.get("stable_diff_threshold", 0.015)
+        )
+        poll = int(stable_poll_ms if stable_poll_ms is not None else self._motion_cfg.get("stable_poll_ms", 350))
+        timeout = float(
+            stable_timeout_s if stable_timeout_s is not None else self._motion_cfg.get("stable_timeout_s", 8.0)
+        )
+        ds_size = downscale_size or self._motion_downscale_size()
+
+        if target_stable_frames <= 0:
+            raise VisionError("stable_frames must be > 0")
+        if diff_threshold < 0:
+            raise VisionError("stable_diff_threshold must be >= 0")
+        if poll < 0:
+            raise VisionError("stable_poll_ms must be >= 0")
+        if timeout < 0:
+            raise VisionError("stable_timeout_s must be >= 0")
+
+        started = time.monotonic()
         prev_small_gray: Frame | None = None
-        consecutive_stable = 0
-        last_full_frame: Frame | None = None
+        stable_count = 0
+        last_frame: Frame | None = None
 
         while True:
-            frame = capture_fn()
-            self._validate_frame(frame)
-            last_full_frame = frame
+            last_frame = capture_fn()
+            cur_small_gray = self._prepare_motion_frame(last_frame, ds_size)
 
-            small_gray = self._prepare_motion_frame(frame, downscale_size)
-
-            if prev_small_gray is not None:
-                diff = self._mean_absdiff(prev_small_gray, small_gray)
-                if diff <= float(stable_diff_threshold):
-                    consecutive_stable += 1
+            if prev_small_gray is None:
+                stable_count = 1
+            else:
+                mean_diff = self._mean_absdiff_normalized(prev_small_gray, cur_small_gray)
+                if mean_diff < diff_threshold:
+                    stable_count += 1
                 else:
-                    consecutive_stable = 0
+                    stable_count = 1
 
-                if consecutive_stable >= int(stable_frames):
-                    return last_full_frame, True
+                if self._verbose_vision:
+                    self.logger.debug(
+                        "wait_until_stable: mean_diff=%.6f stable_count=%d/%d",
+                        mean_diff,
+                        stable_count,
+                        target_stable_frames,
+                    )
 
-            prev_small_gray = small_gray
+            prev_small_gray = cur_small_gray
 
-            if time.monotonic() >= deadline:
-                return last_full_frame, False
+            if stable_count >= target_stable_frames:
+                return last_frame, True
 
-            time.sleep(float(stable_poll_ms) / 1000.0)
+            if time.monotonic() - started >= timeout:
+                if last_frame is None:
+                    raise VisionError("wait_until_stable timed out before receiving any frame")
+                return last_frame, False
 
-    def is_animating(self, prev: Frame, cur: Frame, threshold: float) -> bool:
-        self._validate_frame(prev)
-        self._validate_frame(cur)
-
-        if threshold < 0:
-            raise VisionError("threshold must be >= 0")
-
-        prev_small = self._prepare_motion_frame(prev, self.motion_downscale_size)
-        cur_small = self._prepare_motion_frame(cur, self.motion_downscale_size)
-        diff = self._mean_absdiff(prev_small, cur_small)
-        return diff > float(threshold)
+            time.sleep(poll / 1000.0)
 
     def find(
         self,
-        frame: Frame,
-        template: Template,
-        roi: Rect | None = None,
-        threshold: float | None = None,
+        frame: "Frame",
+        template: "Frame",
+        roi: tuple[int, int, int, int],
+        threshold: float,
     ) -> Match | None:
-        self._validate_frame(frame)
+        """
+        Ищет один шаблон template внутри ROI кадра через matchTemplate.
 
-        if not template.enabled:
-            return None
-
-        if template.image is None or template.image.size == 0:
-            raise VisionError(f"Template '{template.id}' has empty image")
-
-        threshold = template.threshold if threshold is None else threshold
-        search_roi = template.roi if roi is None else roi
-
-        if threshold < -1.0 or threshold > 1.0:
-            raise VisionError("threshold must be in range [-1.0, 1.0]")
-
+        :param frame: текущий кадр
+        :param template: шаблон-фрагмент
+        :param roi: (x1, y1, x2, y2)
+        :param threshold: порог совпадения
+        :return: Match или None
+        :raises VisionError: если ROI невалиден или template больше ROI
+        """
+        validated_roi = self._normalize_roi(frame, roi)
         frame_gray = self._to_gray(frame)
-        template_gray = self._to_gray(template.image)
-        roi_fixed = self._fit_rect_to_frame(search_roi, frame_gray)
-
-        haystack = self.crop(frame_gray, roi_fixed)
-
-        th, tw = template_gray.shape[:2]
-        hh, hw = haystack.shape[:2]
-
-        if th <= 0 or tw <= 0:
-            raise VisionError(f"Template '{template.id}' has invalid size")
-        if hh < th or hw < tw:
-            raise VisionError(
-                f"Template '{template.id}' size {tw}x{th} is larger than ROI {hw}x{hh}"
-            )
-
-        result = cv2.matchTemplate(haystack, template_gray, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
-
-        if float(max_val) < float(threshold):
-            return None
-
-        local_x, local_y = int(max_loc[0]), int(max_loc[1])
-        full_x = roi_fixed.x + local_x
-        full_y = roi_fixed.y + local_y
-        rect = Rect(x=full_x, y=full_y, w=tw, h=th)
-
-        return Match(
-            category=template.category,
-            score=float(max_val),
-            rect=rect,
-            template_id=template.id,
+        template_gray = self._to_gray(template)
+        return self._match_template(
+            frame_gray=frame_gray,
+            template_gray=template_gray,
+            roi=validated_roi,
+            threshold=threshold,
+            category="",
+            template_id="",
         )
 
     def find_any(
         self,
-        frame: Frame,
-        templates: Iterable[Template],
-        category: str | None = None,
+        frame: "Frame",
+        templates: list["TemplateRecord"],
+        threshold: float | None = None,
+        roi: tuple[int, int, int, int] | None = None,
     ) -> Match | None:
-        matches = self.find_all(frame=frame, templates=templates, category=category)
-        return matches[0] if matches else None
+        matches = self.find_all(frame=frame, templates=templates, threshold=threshold, roi=roi)
+        if not matches:
+            return None
+        return matches[0]
 
     def find_all(
         self,
-        frame: Frame,
-        templates: Iterable[Template],
-        category: str | None = None,
+        frame: "Frame",
+        templates: list["TemplateRecord"],
+        threshold: float | None = None,
+        roi: tuple[int, int, int, int] | None = None,
     ) -> list[Match]:
-        self._validate_frame(frame)
-
+        frame_gray = self._to_gray(frame)
         matches: list[Match] = []
-        for template in templates:
-            if not template.enabled:
-                continue
-            if category is not None and template.category != category:
-                continue
-
-            try:
-                match = self.find(frame=frame, template=template)
-            except VisionError:
-                continue
-
+        for record in templates:
+            loaded = self._load_template_record(record, threshold_override=threshold)
+            effective_roi = self._merge_rois(frame, roi, loaded.roi)
+            match = self._match_template(
+                frame_gray=frame_gray,
+                template_gray=loaded.image_gray,
+                roi=effective_roi,
+                threshold=loaded.threshold,
+                category=loaded.category,
+                template_id=loaded.template_id,
+            )
             if match is not None:
                 matches.append(match)
 
         matches.sort(key=lambda item: item.score, reverse=True)
         return matches
 
+    def find_category(
+        self,
+        frame: "Frame",
+        templates: list["TemplateRecord"],
+        category: str,
+        threshold: float | None = None,
+        roi: tuple[int, int, int, int] | None = None,
+    ) -> list[Match]:
+        """
+        Ищет все активные шаблоны указанной категории.
+
+        :param frame: текущий кадр
+        :param templates: список шаблонов из knowledge
+        :param category: категория
+        :param threshold: порог; если None, использовать config vision.default_match_threshold
+        :param roi: общий ROI; если None, использовать roi_hint шаблона или весь экран
+        :return: список Match, отсортированный по score по убыванию
+        :raises VisionError: при ошибке поиска
+        """
+        filtered = [tpl for tpl in templates if getattr(tpl, "enabled", True) and tpl.category == category]
+        return self.find_all(frame=frame, templates=filtered, threshold=threshold, roi=roi)
+
     def classify_screen(
         self,
-        frame: Frame,
-        templates: Iterable[Template],
+        frame: "Frame",
+        templates: list["TemplateRecord"],
     ) -> str | None:
-        self._validate_frame(frame)
+        """
+        Классифицирует экран по наличию шаблонов экранных категорий.
 
-        best_by_category: dict[str, Match] = {}
-        any_screen_template = False
+        Допустимые возвращаемые имена:
+          "room_screen"
+          "passage_screen"
+          "event_screen"
+          None
 
-        for template in templates:
-            if not template.enabled:
-                continue
-            if template.category not in self.SCREEN_CATEGORIES:
-                continue
+        danger не является именем экрана; его надо проверять отдельно через safety/vision.
 
-            any_screen_template = True
-            threshold = max(float(template.threshold), float(self.classify_threshold))
+        :param frame: текущий кадр
+        :param templates: шаблоны знаний
+        :return: имя экрана или None
+        :raises VisionError: при ошибке поиска
+        """
+        frame_gray = self._to_gray(frame)
+        best_match: Match | None = None
+        best_screen: str | None = None
 
-            try:
-                match = self.find(
-                    frame=frame,
-                    template=template,
-                    roi=template.roi,
-                    threshold=threshold,
+        for screen_name in self.SCREEN_CATEGORIES:
+            screen_templates = [
+                tpl for tpl in templates if getattr(tpl, "enabled", True) and tpl.category == screen_name
+            ]
+            for record in screen_templates:
+                loaded = self._load_template_record(record)
+                match = self._match_template(
+                    frame_gray=frame_gray,
+                    template_gray=loaded.image_gray,
+                    roi=loaded.roi,
+                    threshold=loaded.threshold,
+                    category=loaded.category,
+                    template_id=loaded.template_id,
                 )
-            except VisionError:
-                continue
+                if match is None:
+                    continue
+                if best_match is None or match.score > best_match.score:
+                    best_match = match
+                    best_screen = screen_name
 
-            if match is None:
-                continue
+        return best_screen
 
-            current_best = best_by_category.get(template.category)
-            if current_best is None or match.score > current_best.score:
-                best_by_category[template.category] = match
+    def has_any(
+        self,
+        frame: "Frame",
+        templates: list["TemplateRecord"],
+        categories: list[str],
+        threshold: float | None = None,
+    ) -> bool:
+        """
+        Проверяет, найден ли хоть один шаблон из категорий.
 
-        if not any_screen_template or not best_by_category:
-            return None
+        :return: bool
+        :raises VisionError: при ошибке поиска
+        """
+        for category in categories:
+            if self.find_category(frame, templates, category, threshold=threshold):
+                return True
+        return False
 
-        best_match = max(best_by_category.values(), key=lambda item: item.score)
-        return best_match.category
+    def crop(
+        self,
+        frame: "Frame",
+        rect: tuple[int, int, int, int],
+    ) -> "Frame":
+        """
+        Возвращает вырезанный фрагмент кадра.
 
-    def crop(self, frame: Frame, rect: Rect) -> Frame:
-        self._validate_frame(frame)
-        self._validate_rect(rect)
+        :raises VisionError: если rect невалиден
+        """
+        x1, y1, x2, y2 = self._normalize_roi(frame, rect)
+        return frame[y1:y2, x1:x2].copy()
 
-        height, width = frame.shape[:2]
-        if rect.x < 0 or rect.y < 0:
-            raise VisionError("rect coordinates must be non-negative")
-        if rect.w <= 0 or rect.h <= 0:
-            raise VisionError("rect width and height must be positive")
-        if rect.x + rect.w > width or rect.y + rect.h > height:
-            raise VisionError("rect is out of frame bounds")
+    def wait_for(
+        self,
+        capture_fn: "Callable[[], Frame]",
+        template: Any,
+        roi: tuple[int, int, int, int] | None,
+        threshold: float,
+        timeout_s: float,
+    ) -> Match | None:
+        started = time.monotonic()
+        poll_ms = int(self._motion_cfg.get("stable_poll_ms", 350))
 
-        return frame[rect.y:rect.y + rect.h, rect.x:rect.x + rect.w].copy()
+        while True:
+            frame = capture_fn()
 
-    def center_of(self, rect: Rect) -> tuple[int, int]:
-        self._validate_rect(rect)
-        return rect.x + rect.w // 2, rect.y + rect.h // 2
+            if isinstance(template, np.ndarray):
+                effective_roi = roi or (0, 0, frame.shape[1], frame.shape[0])
+                match = self.find(frame, template, effective_roi, threshold)
+            else:
+                loaded = self._load_template_record(template, threshold_override=threshold)
+                effective_roi = self._merge_rois(frame, roi, loaded.roi)
+                frame_gray = self._to_gray(frame)
+                match = self._match_template(
+                    frame_gray=frame_gray,
+                    template_gray=loaded.image_gray,
+                    roi=effective_roi,
+                    threshold=loaded.threshold,
+                    category=loaded.category,
+                    template_id=loaded.template_id,
+                )
+
+            if match is not None:
+                return match
+
+            if time.monotonic() - started >= timeout_s:
+                return None
+
+            time.sleep(poll_ms / 1000.0)
+
+    def is_animating(self, prev: "Frame", cur: "Frame", threshold: float) -> bool:
+        ds_size = self._motion_downscale_size()
+        prev_small = self._prepare_motion_frame(prev, ds_size)
+        cur_small = self._prepare_motion_frame(cur, ds_size)
+        mean_diff = self._mean_absdiff_normalized(prev_small, cur_small)
+        return mean_diff >= threshold
 
     def load_templates(
         self,
-        items: Iterable[dict],
-        *,
-        optional: bool = True,
-    ) -> list[Template]:
-        templates: list[Template] = []
-
-        for item in items:
-            try:
-                template_id = str(item["id"])
-                category = str(item["category"])
-                image_path = Path(item["image_path"])
-                threshold = float(item.get("match", {}).get("threshold", self.default_threshold))
-                enabled = bool(item.get("enabled", True))
-                roi_data = item["roi"]
-                roi = Rect(
-                    x=int(roi_data["x"]),
-                    y=int(roi_data["y"]),
-                    w=int(roi_data["w"]),
-                    h=int(roi_data["h"]),
-                )
-            except Exception as exc:
-                if optional:
-                    continue
-                raise VisionError("Invalid template metadata") from exc
-
-            image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
-            if image is None or image.size == 0:
-                if optional:
-                    continue
-                raise VisionError(f"Failed to load template image: {image_path}")
-
-            templates.append(
-                Template(
-                    id=template_id,
-                    category=category,
-                    image=image,
-                    roi=roi,
-                    threshold=threshold,
-                    enabled=enabled,
+        records: list["TemplateRecord"],
+        thresholds_by_category: dict[str, float] | None = None,
+        optional_categories: set[str] | None = None,
+    ) -> list[LoadedTemplate]:
+        loaded: list[LoadedTemplate] = []
+        for record in records:
+            threshold_override = None
+            if thresholds_by_category and record.category in thresholds_by_category:
+                threshold_override = thresholds_by_category[record.category]
+            tpl = self._load_template_record(record, threshold_override=threshold_override)
+            loaded.append(
+                LoadedTemplate(
+                    template_id=tpl.template_id,
+                    category=tpl.category,
+                    image_gray=tpl.image_gray,
+                    roi=tpl.roi,
+                    threshold=tpl.threshold,
+                    optional=record.category in (optional_categories or set()),
                 )
             )
-
-        return templates
+        return loaded
 
     def save_debug_image(
         self,
-        frame: Frame,
-        path: str | Path,
-        matches: Iterable[Match] | None = None,
-        rois: Iterable[Rect] | None = None,
-    ) -> None:
-        self._validate_frame(frame)
+        frame: "Frame",
+        path: str | None = None,
+        matches: list[Match] | None = None,
+        rois: list[tuple[int, int, int, int]] | None = None,
+        label: str = "vision",
+    ) -> str:
+        canvas = frame.copy()
 
-        vis = frame.copy()
-        if vis.ndim == 2:
-            vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
-
-        if rois is not None:
+        if rois:
             for roi in rois:
-                self._validate_rect(roi)
-                cv2.rectangle(
-                    vis,
-                    (roi.x, roi.y),
-                    (roi.x + roi.w, roi.y + roi.h),
-                    (255, 0, 0),
-                    2,
-                )
+                x1, y1, x2, y2 = self._normalize_roi(frame, roi)
+                cv2.rectangle(canvas, (x1, y1), (x2, y2), (255, 255, 0), 2)
 
-        if matches is not None:
+        if matches:
             for match in matches:
-                rect = match.rect
-                center = self.center_of(rect)
-                cv2.rectangle(
-                    vis,
-                    (rect.x, rect.y),
-                    (rect.x + rect.w, rect.y + rect.h),
-                    (0, 255, 0),
-                    2,
-                )
-                cv2.circle(vis, center, 4, (0, 0, 255), -1)
-                label = f"{match.category}:{match.score:.3f}"
+                x1, y1, x2, y2 = match.rect
+                cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                text = f"{match.category}:{match.score:.3f}:{match.template_id}"
                 cv2.putText(
-                    vis,
-                    label,
-                    (rect.x, max(15, rect.y - 6)),
+                    canvas,
+                    text,
+                    (x1, max(15, y1 - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
+                    0.45,
                     (0, 255, 0),
                     1,
                     cv2.LINE_AA,
                 )
 
-        output_path = Path(path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        ok = cv2.imwrite(str(output_path), vis)
+        if path is None:
+            os.makedirs(self._debug_dir, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+            path = os.path.join(self._debug_dir, f"{label}_{stamp}.png")
+        else:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+        ok = cv2.imwrite(path, canvas)
         if not ok:
-            raise VisionError(f"Failed to save debug image to {output_path}")
+            raise VisionError(f"Failed to save debug image: {path}")
 
-    def wait_for(
+        if self._save_debug_images or self._verbose_vision:
+            self.logger.debug("Saved vision debug image: %s", path)
+        return path
+
+    def _load_template_record(
         self,
-        capture_fn: Callable[[], Frame],
-        template: Template,
-        roi: Rect | None = None,
-        threshold: float | None = None,
-        timeout_s: float = 5.0,
+        record: "TemplateRecord",
+        threshold_override: float | None = None,
+    ) -> LoadedTemplate:
+        cache_key = f"{record.id}:{threshold_override if threshold_override is not None else 'default'}"
+        cached = self._template_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        image = cv2.imread(record.file, cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            raise VisionError(f"Template image is unreadable: {record.file}")
+        if image.size == 0:
+            raise VisionError(f"Template image is empty: {record.file}")
+
+        roi = self._rect_to_xyxy(tuple(record.roi_hint)) if getattr(record, "roi_hint", None) else None
+        loaded = LoadedTemplate(
+            template_id=record.id,
+            category=record.category,
+            image_gray=image,
+            roi=roi,
+            threshold=float(threshold_override if threshold_override is not None else self._default_threshold),
+            optional=False,
+        )
+        self._template_cache[cache_key] = loaded
+        return loaded
+
+    def _match_template(
+        self,
+        frame_gray: Frame,
+        template_gray: Frame,
+        roi: tuple[int, int, int, int] | None,
+        threshold: float,
+        category: str,
+        template_id: str,
     ) -> Match | None:
-        if timeout_s <= 0:
-            raise VisionError("timeout_s must be > 0")
+        h, w = frame_gray.shape[:2]
+        effective_roi = roi if roi is not None else (0, 0, w, h)
+        x1, y1, x2, y2 = self._normalize_roi(frame_gray, effective_roi)
+        search = frame_gray[y1:y2, x1:x2]
 
-        deadline = time.monotonic() + float(timeout_s)
-        poll_s = float(self.motion_stable_poll_ms) / 1000.0
+        th, tw = template_gray.shape[:2]
+        rh, rw = search.shape[:2]
+        if tw > rw or th > rh:
+            raise VisionError("template is larger than ROI")
 
-        while True:
-            frame = capture_fn()
-            match = self.find(frame=frame, template=template, roi=roi, threshold=threshold)
-            if match is not None:
-                return match
+        try:
+            result = cv2.matchTemplate(search, template_gray, self._template_method)
+        except cv2.error as exc:
+            raise VisionError(f"matchTemplate failed: {exc}") from exc
 
-            if time.monotonic() >= deadline:
-                return None
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        score = float(max_val)
+        if score < threshold:
+            return None
 
-            time.sleep(poll_s)
-
-    def _prepare_motion_frame(self, frame: Frame, downscale_size: tuple[int, int]) -> Frame:
-        self._validate_frame(frame)
-
-        if (
-            not isinstance(downscale_size, tuple)
-            or len(downscale_size) != 2
-            or int(downscale_size[0]) <= 0
-            or int(downscale_size[1]) <= 0
-        ):
-            raise VisionError("downscale_size must be a tuple of two positive integers")
-
-        gray = self._to_gray(frame)
-        return cv2.resize(
-            gray,
-            (int(downscale_size[0]), int(downscale_size[1])),
-            interpolation=cv2.INTER_AREA,
+        top_left_x = x1 + int(max_loc[0])
+        top_left_y = y1 + int(max_loc[1])
+        rect = (top_left_x, top_left_y, top_left_x + tw, top_left_y + th)
+        return Match(
+            category=category,
+            score=score,
+            rect=rect,
+            template_id=template_id,
         )
 
-    def _mean_absdiff(self, prev_gray: Frame, cur_gray: Frame) -> float:
-        if prev_gray.shape != cur_gray.shape:
-            raise VisionError("Frames for diff must have identical shapes")
-
-        diff = cv2.absdiff(prev_gray, cur_gray)
-        return float(np.mean(diff.astype(np.float32) / 255.0))
-
     def _to_gray(self, frame: Frame) -> Frame:
-        self._validate_frame(frame)
-
+        if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+            raise VisionError("frame must be a non-empty numpy.ndarray")
         if frame.ndim == 2:
             return frame
         if frame.ndim == 3 and frame.shape[2] == 1:
@@ -458,65 +504,100 @@ class VisionService:
             return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if frame.ndim == 3 and frame.shape[2] == 4:
             return cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
+        raise VisionError(f"Unsupported frame shape for grayscale conversion: {frame.shape}")
 
-        raise VisionError("Unsupported frame format for grayscale conversion")
+    def _prepare_motion_frame(self, frame: Frame, downscale_size: tuple[int, int]) -> Frame:
+        gray = self._to_gray(frame)
+        width, height = downscale_size
+        if width <= 0 or height <= 0:
+            raise VisionError("downscale_size must contain positive integers")
+        try:
+            resized = cv2.resize(gray, (width, height), interpolation=cv2.INTER_AREA)
+        except cv2.error as exc:
+            raise VisionError(f"Failed to resize motion frame: {exc}") from exc
+        return resized
 
-    def _fit_rect_to_frame(self, rect: Rect, frame: Frame) -> Rect:
-        self._validate_rect(rect)
-        height, width = frame.shape[:2]
+    def _mean_absdiff_normalized(self, prev_gray: Frame, cur_gray: Frame) -> float:
+        if prev_gray.shape != cur_gray.shape:
+            raise VisionError("Motion frames must have identical shape for comparison")
+        diff = cv2.absdiff(prev_gray, cur_gray)
+        return float(np.mean(diff) / 255.0)
 
-        if rect.x < 0 or rect.y < 0:
-            raise VisionError("ROI coordinates must be non-negative")
-        if rect.w <= 0 or rect.h <= 0:
-            raise VisionError("ROI width and height must be positive")
-
-        x = min(rect.x, width)
-        y = min(rect.y, height)
-        w = min(rect.w, width - x)
-        h = min(rect.h, height - y)
-
-        if w <= 0 or h <= 0:
-            raise VisionError("ROI is outside frame bounds")
-
-        return Rect(x=x, y=y, w=w, h=h)
-
-    def _validate_frame(self, frame: Frame) -> None:
-        if frame is None:
-            raise VisionError("frame is None")
-        if not isinstance(frame, np.ndarray):
-            raise VisionError("frame must be numpy.ndarray")
-        if frame.size == 0:
-            raise VisionError("frame is empty")
-        if frame.ndim not in (2, 3):
-            raise VisionError("frame must have 2 or 3 dimensions")
-
-    def _validate_rect(self, rect: Rect) -> None:
-        if not isinstance(rect, Rect):
-            raise VisionError("rect must be Rect")
-        if rect.w <= 0 or rect.h <= 0:
-            raise VisionError("rect width and height must be positive")
-
-    def _validate_runtime_params(
+    def _normalize_roi(
         self,
-        *,
-        stable_frames: int,
-        stable_diff_threshold: float,
-        stable_poll_ms: int,
-        stable_timeout_s: float,
-        downscale_size: tuple[int, int],
-    ) -> None:
-        if int(stable_frames) <= 0:
-            raise VisionError("stable_frames must be > 0")
-        if float(stable_diff_threshold) < 0:
-            raise VisionError("stable_diff_threshold must be >= 0")
-        if int(stable_poll_ms) < 0:
-            raise VisionError("stable_poll_ms must be >= 0")
-        if float(stable_timeout_s) <= 0:
-            raise VisionError("stable_timeout_s must be > 0")
-        if (
-            not isinstance(downscale_size, tuple)
-            or len(downscale_size) != 2
-            or int(downscale_size[0]) <= 0
-            or int(downscale_size[1]) <= 0
-        ):
-            raise VisionError("downscale_size must contain two positive integers")
+        frame: Frame,
+        roi: tuple[int, int, int, int] | None,
+    ) -> tuple[int, int, int, int]:
+        if roi is None:
+            h, w = frame.shape[:2]
+            return 0, 0, w, h
+
+        if len(roi) != 4:
+            raise VisionError("ROI must contain exactly 4 integers")
+
+        x1, y1, x2, y2 = (int(roi[0]), int(roi[1]), int(roi[2]), int(roi[3]))
+        h, w = frame.shape[:2]
+        x1 = max(0, min(x1, w))
+        x2 = max(0, min(x2, w))
+        y1 = max(0, min(y1, h))
+        y2 = max(0, min(y2, h))
+
+        if x2 <= x1 or y2 <= y1:
+            raise VisionError(f"Invalid ROI after clamping: {(x1, y1, x2, y2)}")
+
+        if (x2 - x1) * (y2 - y1) < self._min_roi_area:
+            raise VisionError(f"ROI area is below configured minimum: {(x1, y1, x2, y2)}")
+
+        return x1, y1, x2, y2
+
+    def _merge_rois(
+        self,
+        frame: Frame,
+        roi_a: tuple[int, int, int, int] | None,
+        roi_b: tuple[int, int, int, int] | None,
+    ) -> tuple[int, int, int, int] | None:
+        if roi_a is None and roi_b is None:
+            return None
+        if roi_a is None:
+            return self._normalize_roi(frame, roi_b)
+        if roi_b is None:
+            return self._normalize_roi(frame, roi_a)
+
+        ax1, ay1, ax2, ay2 = self._normalize_roi(frame, roi_a)
+        bx1, by1, bx2, by2 = self._normalize_roi(frame, roi_b)
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        return self._normalize_roi(frame, (ix1, iy1, ix2, iy2))
+
+    def _motion_downscale_size(self) -> tuple[int, int]:
+        raw = self._motion_cfg.get("downscale_size", [64, 36])
+        if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+            raise VisionError("motion.downscale_size must be a 2-item list/tuple")
+        return int(raw[0]), int(raw[1])
+
+    def _resolve_template_method(self, method_name: str) -> int:
+        if method_name != "TM_CCOEFF_NORMED":
+            self.logger.warning(
+                "Unsupported template method '%s'; falling back to TM_CCOEFF_NORMED",
+                method_name,
+            )
+        return cv2.TM_CCOEFF_NORMED
+
+    def _rect_to_xyxy(self, rect: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+        x1, y1, x2, y2 = (int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3]))
+        if x2 <= x1 or y2 <= y1:
+            raise VisionError(f"Invalid rect/roi_hint: {rect}")
+        return x1, y1, x2, y2
+
+    def _get_section(self, key: str, required: bool = True) -> dict[str, Any]:
+        raw = getattr(self.config, "raw", None)
+        if not isinstance(raw, dict):
+            raise VisionError("config.raw must be a dict")
+        section = raw.get(key)
+        if section is None:
+            if required:
+                raise VisionError(f"Missing config section: {key}")
+            return {}
+        if not isinstance(section, dict):
+            raise VisionError(f"Config section must be a dict: {key}")
+        return section
