@@ -1,190 +1,422 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
-from bot.adb_controller import ADBController, ADBError
-from bot.config import get_profile, load_config
-from bot.explorer import GameExplorer
+from bot.adb_controller import ADBController, ADBError, ADBTimeoutError, DeviceNotFoundError
+from bot.config import Config, ConfigError, ensure_directories, load_config
+from bot.explorer import ExploreResult, ExplorerError, run_explore, run_teach_only
 from bot.knowledge import KnowledgeBase, KnowledgeError
 from bot.logging_setup import setup_logging
-from bot.profiles import list_profiles, resolve_profile
+from bot.profiles import ProfileError, get_active_profile_name, list_profiles, load_profile
 from bot.safety import SafetyStop, SafetyService
 from bot.screenshot import ScreenshotError, ScreenshotService
-from bot.teacher_ui import TeacherUI, TeacherUIError
+from bot import teacher_ui
 from bot.vision import VisionError, VisionService
 
 
-def build_arg_parser():
-    parser = argparse.ArgumentParser(prog="main.py")
-    parser.add_argument("--config", default="config.yaml")
-    parser.add_argument("--check", action="store_true")
-    parser.add_argument("--capture", action="store_true")
-    parser.add_argument("--teach", action="store_true")
-    parser.add_argument("--teach-only", action="store_true")
-    parser.add_argument("--profile", default=None)
-    parser.add_argument("--floor-from", type=int, default=None)
-    parser.add_argument("--floor-to", type=int, default=None)
-    parser.add_argument("--list-profiles", action="store_true")
-    parser.add_argument("--reset-knowledge", action="store_true")
+def build_arg_parser() -> argparse.ArgumentParser:
+    """
+    Возвращает настроенный CLI parser.
+    """
+    parser = argparse.ArgumentParser(
+        description=(
+            "CLI для обучаемого бота-исследователя. "
+            "Если режим не указан, по умолчанию используется --teach."
+        )
+    )
+    parser.add_argument(
+        "--config",
+        default="config.yaml",
+        help="Путь к config.yaml (по умолчанию: ./config.yaml)",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Проверить конфиг, ADB, профиль и базу знаний",
+    )
+    parser.add_argument(
+        "--capture",
+        action="store_true",
+        help="Сделать один скриншот и сохранить его в screenshots_dir",
+    )
+    parser.add_argument(
+        "--teach",
+        action="store_true",
+        help="Режим исследования с окном обучения и паузой по Пробелу",
+    )
+    parser.add_argument(
+        "--teach-only",
+        action="store_true",
+        help="Только разметка: бот сам ничего не нажимает",
+    )
+    parser.add_argument(
+        "--profile",
+        help="Профиль, например loc1",
+    )
+    parser.add_argument(
+        "--floor-from",
+        type=int,
+        help="Начальный этаж диапазона",
+    )
+    parser.add_argument(
+        "--floor-to",
+        type=int,
+        help="Конечный этаж диапазона",
+    )
+    parser.add_argument(
+        "--list-profiles",
+        action="store_true",
+        help="Показать профили и число выученных эталонов",
+    )
+    parser.add_argument(
+        "--reset-knowledge",
+        action="store_true",
+        help="Сбросить знания выбранного профиля после подтверждения",
+    )
     return parser
 
 
-def _ensure_dirs(config) -> None:
-    for path in [
-        config.data_dir,
-        config.captures_dir,
-        config.temp_dir,
-        config.knowledge_dir,
-        config.unknown_dir,
-        config.state_dir,
-        str(Path(config.progress_file).parent),
-        str(Path(config.rules_file).parent),
-        str(Path(config.features_file).parent),
-    ]:
-        Path(path).mkdir(parents=True, exist_ok=True)
+def _print_error(message: str) -> None:
+    print(f"Ошибка: {message}", file=sys.stderr)
 
 
-def _create_services(config_path: str, profile_name: str | None):
-    config = load_config(config_path)
-    setup_logging(config.log_level)
-    profile = resolve_profile(config, profile_name)
+def _resolve_path(config: Config, value: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = (config.path.parent / path).resolve()
+    return path
+
+
+def _apply_cli_profile(config: Config, cli_profile: str | None) -> str:
+    profile_name = get_active_profile_name(config, cli_profile)
+    config.raw.setdefault("profiles", {})
+    config.raw["profiles"]["active"] = profile_name
+    return profile_name
+
+
+def _build_services(config: Config) -> tuple[ADBController, ScreenshotService, VisionService, SafetyService]:
     adb = ADBController(
-        device_serial=config.adb_device_serial,
-        adb_path=config.adb_path,
-        command_timeout_s=config.adb_command_timeout_s,
-        connect_timeout_s=config.adb_connect_timeout_s,
-        post_tap_delay_ms=config.post_tap_delay_ms,
-        post_swipe_delay_ms=config.post_swipe_delay_ms,
-        post_keyevent_delay_ms=config.post_keyevent_delay_ms,
+        adb_path=str(config.get("adb.adb_path")),
+        serial=str(config.get("adb.serial") or "").strip() or None,
+        exec_timeout_s=float(config.get("adb.exec_timeout_s", 15.0)),
     )
-    screenshot = ScreenshotService(
-        rotation=config.rotation,
-        save_every_capture=config.save_every_capture,
-        captures_dir=config.captures_dir,
-    )
-    vision = VisionService(
-        default_threshold=config.matching_default_threshold,
-        classify_threshold=config.matching_classify_threshold,
-        method=config.matching_method,
-        grayscale=config.matching_grayscale,
-    )
-    safety = SafetyService(
-        block_purchases=config.block_purchases,
-        block_ads=config.block_ads,
-        block_pvp=config.block_pvp,
-        stop_on_danger=config.stop_on_danger,
-        enforce_safe_actions=config.enforce_safe_actions,
-    )
-    knowledge = KnowledgeBase(
-        rules_file=config.rules_file,
-        features_file=config.features_file,
-        knowledge_dir=config.knowledge_dir,
-    )
-    teacher_ui = TeacherUI(pause_hotkey=config.teacher_pause_hotkey)
-    return config, profile, adb, screenshot, vision, knowledge, safety, teacher_ui
+    screenshot = ScreenshotService(adb)
+    screenshot.set_screenshots_dir(_resolve_path(config, str(config.get("app.screenshots_dir"))))
+    vision = VisionService(config)
+    safety = SafetyService(config)
+    return adb, screenshot, vision, safety
 
 
-def run_check(config_path: str, profile_name: str | None) -> int:
+def _connect_device(adb: ADBController, screenshot: ScreenshotService) -> Any:
+    info = adb.connect()
+    screenshot.set_expected_size(info.width, info.height)
+    return info
+
+
+def _run_check(config: Config, profile_name: str, logger: logging.Logger) -> int:
+    logger.info("Запуск проверки окружения")
+    ok = True
+
+    print("[1/6] Конфиг: ОК")
+
+    adb, screenshot, _vision, _safety = _build_services(config)
+
+    device_info = None
     try:
-        config, _profile, adb, screenshot, _vision, knowledge, _safety, _teacher_ui = _create_services(config_path, profile_name)
-        _ensure_dirs(config)
-        adb.connect()
-        frame = screenshot.capture(adb)
-        height, width = frame.shape[:2]
-        if width != config.expected_width or height != config.expected_height:
-            return 1
+        device_info = _connect_device(adb, screenshot)
+        print(f"[2/6] ADB: ОК ({config.get('adb.adb_path')})")
+        print(f"[3/6] Устройство: serial={device_info.serial}")
+    except FileNotFoundError:
+        ok = False
+        print("[2/6] ADB: ошибка")
+        _print_error("adb.exe не найден. Проверьте путь в adb.adb_path или установите Android Platform Tools.")
+    except DeviceNotFoundError as exc:
+        ok = False
+        print("[2/6] ADB: ошибка")
+        _print_error(f"Устройство не найдено: {exc}. Подключите LDPlayer/устройство и проверьте 'adb devices'.")
+    except (ADBTimeoutError, ADBError) as exc:
+        ok = False
+        print("[2/6] ADB: ошибка")
+        _print_error(f"Не удалось проверить ADB: {exc}")
+
+    if device_info is not None:
         try:
-            knowledge.load()
-        except FileNotFoundError:
-            knowledge.reset()
-            knowledge.save()
+            android_version = adb.shell("getprop ro.build.version.release").strip() or "не удалось определить"
+        except (ADBError, ADBTimeoutError) as exc:
+            android_version = f"не удалось определить ({exc})"
+            ok = False
+        print(f"[4/6] Android: {android_version}")
+        print(f"[5/6] Экран: {device_info.width}x{device_info.height}")
+    else:
+        print("[4/6] Android: недоступно")
+        print("[5/6] Экран: недоступно")
+
+    try:
+        profile = load_profile(config, profile_name)
+        kb = KnowledgeBase(config, profile.name)
+        templates_count = len(kb.list_templates(enabled_only=False))
+        print(f"[6/6] Профиль: {profile.name}, эталонов: {templates_count}")
+    except (ProfileError, KnowledgeError) as exc:
+        ok = False
+        print("[6/6] Профиль/знания: ошибка")
+        _print_error(str(exc))
+
+    knowledge_dir = _resolve_path(config, str(config.get("storage.knowledge_dir")))
+    try:
+        profiles_list = list_profiles(config)
+    except ProfileError as exc:
+        ok = False
+        profiles_list = []
+        _print_error(f"Не удалось получить список профилей: {exc}")
+
+    print(f"Папка knowledge: {knowledge_dir}")
+    print("Профили:", ", ".join(profiles_list) if profiles_list else "нет")
+
+    if ok:
+        print("Итог: ОК")
         return 0
-    except Exception:
+
+    print("Итог: есть ошибки")
+    return 1
+
+
+def _run_capture(config: Config, logger: logging.Logger) -> int:
+    adb, screenshot, _vision, _safety = _build_services(config)
+    _connect_device(adb, screenshot)
+    frame = screenshot.capture()
+    path = screenshot.save_capture(frame=frame, prefix="capture")
+    logger.info("Скриншот сохранён: %s", path)
+    print(path)
+    return 0
+
+
+def _run_list_profiles(config: Config) -> int:
+    profiles = list_profiles(config)
+    if not profiles:
+        print("Профили не найдены.")
         return 1
 
-
-def run_capture(config_path: str, profile_name: str | None) -> int:
-    try:
-        config, _profile, adb, screenshot, _vision, _knowledge, _safety, _teacher_ui = _create_services(config_path, profile_name)
-        _ensure_dirs(config)
-        adb.connect()
-        frame = screenshot.capture(adb)
-        path = Path(config.captures_dir) / f"capture_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-        screenshot.save(frame, str(path))
-        return 0
-    except Exception:
-        return 1
-
-
-def run_teach(config_path: str, profile_name: str | None, floor_from: int | None, floor_to: int | None) -> int:
-    try:
-        config, profile, adb, screenshot, vision, knowledge, safety, teacher_ui = _create_services(config_path, profile_name)
-        _ensure_dirs(config)
+    for name in profiles:
         try:
-            knowledge.load()
-        except FileNotFoundError:
-            knowledge.reset()
-            knowledge.save()
-        adb.connect()
-        explorer = GameExplorer(adb, screenshot, vision, knowledge, safety, teacher_ui, config, profile)
-        explorer.run(
-            floor_from if floor_from is not None else config.default_floor_from,
-            floor_to if floor_to is not None else config.default_floor_to,
-        )
-        return 0
-    except Exception:
-        return 1
+            kb = KnowledgeBase(config, name)
+            count = len(kb.list_templates(enabled_only=False))
+            print(f"{name}\t{count}")
+        except KnowledgeError as exc:
+            print(f"{name}\tошибка чтения знаний: {exc}")
+    return 0
 
 
-def run_teach_only(config_path: str, profile_name: str | None) -> int:
-    try:
-        config, _profile, adb, screenshot, _vision, knowledge, _safety, teacher_ui = _create_services(config_path, profile_name)
-        _ensure_dirs(config)
-        try:
-            knowledge.load()
-        except FileNotFoundError:
-            knowledge.reset()
-            knowledge.save()
-        adb.connect()
-        teacher_ui.teach_only(adb, screenshot, knowledge)
-        return 0
-    except Exception:
+def _run_reset_knowledge(config: Config, profile_name: str) -> int:
+    answer = input(
+        f"Вы действительно хотите сбросить знания профиля '{profile_name}'? "
+        "Будет создана резервная копия. Для подтверждения введите YES: "
+    ).strip()
+    if answer != "YES":
+        print("Сброс отменён.")
         return 1
+
+    kb = KnowledgeBase(config, profile_name)
+    knowledge_dir = _resolve_path(config, str(config.get("storage.knowledge_dir"))) / profile_name
+    backup_root = knowledge_dir.parent / "backups"
+    backup_root.mkdir(parents=True, exist_ok=True)
+    backup_dir = backup_root / f"{profile_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    if knowledge_dir.exists():
+        shutil.copytree(knowledge_dir, backup_dir, dirs_exist_ok=True)
+        print(f"Резервная копия: {backup_dir}")
+    else:
+        print("Папка знаний профиля ещё не создана, резервировать нечего.")
+
+    kb.reset()
+    print(f"Знания профиля '{profile_name}' сброшены.")
+    return 0
+
+
+def _resolve_floor_range(args: argparse.Namespace, config: Config) -> tuple[int, int]:
+    if (args.floor_from is None) != (args.floor_to is None):
+        raise ValueError("Нужно указать сразу оба параметра: --floor-from и --floor-to.")
+
+    if args.floor_from is not None and args.floor_to is not None:
+        floor_from = int(args.floor_from)
+        floor_to = int(args.floor_to)
+    else:
+        ranges = config.get("profiles.ranges", {})
+        active = str(config.get("profiles.active"))
+        profile_range = ranges.get(active, {}) if isinstance(ranges, dict) else {}
+        floor_from = int(profile_range.get("floor_from", 1))
+        floor_to = int(profile_range.get("floor_to", floor_from))
+
+    if floor_from <= 0 or floor_to <= 0:
+        raise ValueError("Номера этажей должны быть больше 0.")
+    if floor_from > floor_to:
+        raise ValueError("--floor-from не может быть больше --floor-to.")
+    return floor_from, floor_to
+
+
+def _run_teach(config: Config, profile_name: str, logger: logging.Logger, floor_from: int, floor_to: int) -> int:
+    adb, screenshot, vision, safety = _build_services(config)
+    _connect_device(adb, screenshot)
+    knowledge = KnowledgeBase(config, profile_name)
+    result: ExploreResult = run_explore(
+        adb=adb,
+        screenshot=screenshot,
+        vision=vision,
+        knowledge=knowledge,
+        safety=safety,
+        teacher_ui=teacher_ui,
+        config=config,
+        floor_from=floor_from,
+        floor_to=floor_to,
+    )
+    logger.info("Режим teach завершён: %s", result)
+    print(result.reason)
+    return 0 if result.status == "completed" else 1
+
+
+def _run_teach_only(config: Config, profile_name: str, logger: logging.Logger) -> int:
+    adb, screenshot, vision, safety = _build_services(config)
+    _connect_device(adb, screenshot)
+    knowledge = KnowledgeBase(config, profile_name)
+    result = run_teach_only(
+        adb=adb,
+        screenshot=screenshot,
+        vision=vision,
+        knowledge=knowledge,
+        safety=safety,
+        teacher_ui=teacher_ui,
+        config=config,
+    )
+    logger.info("Режим teach-only завершён: %s", result)
+    print(result.reason)
+    return 0 if result.status == "completed" else 1
 
 
 def main() -> int:
+    """
+    Основной сценарий запуска.
+
+    Поведение режимов:
+    --check
+        Проверка конфига, ADB, загрузки профиля и базы знаний.
+        Код возврата 0 при успехе, 1 при ошибке.
+
+    --capture
+        Делает один скриншот и сохраняет его в screenshots_dir.
+        Код возврата 0/1.
+
+    --teach
+        Режим по умолчанию.
+        Бот работает как исследователь, но пользователь может ставить паузу пробелом
+        и размечать неизвестные стабильные экраны.
+
+    --teach-only
+        Бот ничего не нажимает, пользователь играет сам, бот только помогает размечать.
+
+    --list-profiles
+        Печатает доступные профили и завершает работу.
+
+    --reset-knowledge
+        Очищает знания активного профиля и завершает работу.
+
+    Возвращает:
+        int: exit code
+
+    Исключения:
+        Не должно пробрасывать необработанные исключения наружу;
+        все переводятся в код возврата != 0 и лог.
+    """
     parser = build_arg_parser()
     args = parser.parse_args()
 
-    if args.list_profiles:
-        try:
-            config = load_config(args.config)
-            for name in list_profiles(config):
-                print(name)
-            return 0
-        except Exception:
-            return 1
+    try:
+        config = load_config(args.config)
+        ensure_directories(config)
+        profile_name = _apply_cli_profile(config, args.profile)
+        logger = setup_logging(config)
 
-    if args.reset_knowledge:
-        try:
-            config = load_config(args.config)
-            knowledge = KnowledgeBase(config.rules_file, config.features_file, config.knowledge_dir)
-            knowledge.reset()
-            knowledge.save()
-            return 0
-        except Exception:
-            return 1
+        selected_modes = [
+            flag
+            for flag, enabled in [
+                ("check", args.check),
+                ("capture", args.capture),
+                ("teach", args.teach),
+                ("teach-only", args.teach_only),
+                ("list-profiles", args.list_profiles),
+                ("reset-knowledge", args.reset_knowledge),
+            ]
+            if enabled
+        ]
 
-    if args.check:
-        return run_check(args.config, args.profile)
-    if args.capture:
-        return run_capture(args.config, args.profile)
-    if args.teach_only:
-        return run_teach_only(args.config, args.profile)
-    return run_teach(args.config, args.profile, args.floor_from, args.floor_to)
+        if args.teach and args.teach_only:
+            _print_error("Нельзя использовать одновременно --teach и --teach-only.")
+            return 2
+
+        if len(selected_modes) > 1 and not (
+            args.teach is False and args.teach_only is False and len(selected_modes) == 1
+        ):
+            non_run_modes = sum(
+                1
+                for enabled in [args.check, args.capture, args.list_profiles, args.reset_knowledge]
+                if enabled
+            )
+            if non_run_modes > 1 or ((args.teach or args.teach_only) and non_run_modes > 0):
+                _print_error("Укажите только один основной режим за запуск.")
+                return 2
+
+        if args.list_profiles:
+            return _run_list_profiles(config)
+
+        if args.reset_knowledge:
+            return _run_reset_knowledge(config, profile_name)
+
+        if args.check:
+            return _run_check(config, profile_name, logger)
+
+        if args.capture:
+            return _run_capture(config, logger)
+
+        if args.teach_only:
+            return _run_teach_only(config, profile_name, logger)
+
+        floor_from, floor_to = _resolve_floor_range(args, config)
+        return _run_teach(config, profile_name, logger, floor_from, floor_to)
+
+    except KeyboardInterrupt:
+        _print_error("Операция прервана пользователем.")
+        return 130
+    except FileNotFoundError as exc:
+        _print_error(f"Файл не найден: {exc}")
+        return 1
+    except ConfigError as exc:
+        _print_error(f"Проблема в конфиге: {exc}")
+        return 1
+    except (ProfileError, KnowledgeError, VisionError) as exc:
+        _print_error(str(exc))
+        return 1
+    except (DeviceNotFoundError, ADBTimeoutError, ADBError) as exc:
+        _print_error(f"Проблема с ADB или устройством: {exc}")
+        return 1
+    except ScreenshotError as exc:
+        _print_error(f"Не удалось сделать скриншот: {exc}")
+        return 1
+    except SafetyStop as exc:
+        _print_error(f"Бот остановлен по безопасности: {exc}")
+        return 1
+    except ExplorerError as exc:
+        _print_error(f"Ошибка режима исследования: {exc}")
+        return 1
+    except ValueError as exc:
+        _print_error(str(exc))
+        return 2
+    except Exception as exc:
+        _print_error(f"Непредвиденная ошибка: {exc}")
+        return 1
 
 
 if __name__ == "__main__":
