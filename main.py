@@ -273,6 +273,14 @@ def _knowledge_paths(config: BotConfig, profile: str) -> tuple[Path, Path, Path]
     return profiles_root, profile_dir, profile_templates_dir
 
 
+def _tap_match_center(adb: ADBController, match: Any) -> tuple[int, int]:
+    x1, y1, x2, y2 = match.rect
+    x = (x1 + x2) // 2
+    y = (y1 + y2) // 2
+    adb.tap(x, y)
+    return x, y
+
+
 def _run_check(config: BotConfig, logger: Any, profile: str) -> int:
     print("Проверка окружения...")
     profile_manager = ProfileManager(config, logger)
@@ -280,18 +288,20 @@ def _run_check(config: BotConfig, logger: Any, profile: str) -> int:
     adb_ok = False
     shot_ok = False
     knowledge_ok = False
+    vision_ok = False
     errors: list[str] = []
 
     adb_exists, adb_path_msg = _adb_executable_status(config)
-    print(f"[1/7] adb.exe: {'OK' if adb_exists else 'ОШИБКА'} - {adb_path_msg}")
+    print(f"[1/8] adb.exe: {'OK' if adb_exists else 'ОШИБКА'} - {adb_path_msg}")
     if not adb_exists:
         errors.append("adb.exe не найден. Добавьте папку с adb в PATH или установите Android Platform Tools / LDPlayer adb.")
 
-    print(f"[2/7] serial: {get_path(config, 'adb', 'device_serial')}")
+    print(f"[2/8] serial: {get_path(config, 'adb', 'device_serial')}")
 
     objects = _make_core_objects(config, logger, profile)
     adb = objects["adb"]
     screenshot = objects["screenshot"]
+    vision = objects["vision"]
     knowledge = objects["knowledge"]
 
     try:
@@ -300,45 +310,65 @@ def _run_check(config: BotConfig, logger: Any, profile: str) -> int:
     except ADBConnectionError as exc:
         errors.append(f"Не удалось подключиться к ADB-устройству: {exc}")
 
+    frame = None
     if adb_ok:
         try:
             android_version = _android_version(adb)
-            print(f"[3/7] версия Android: {android_version}")
+            print(f"[3/8] версия Android: {android_version}")
         except ADBError as exc:
             errors.append(f"Не удалось получить версию Android: {exc}")
-            print("[3/7] версия Android: ОШИБКА")
+            print("[3/8] версия Android: ОШИБКА")
 
         try:
             width, height = adb.screen_size()
-            print(f"[4/7] размер экрана: {width}x{height}")
+            print(f"[4/8] размер экрана: {width}x{height}")
         except ADBCommandError as exc:
             errors.append(f"Не удалось получить размер экрана: {exc}")
-            print("[4/7] размер экрана: ОШИБКА")
+            print("[4/8] размер экрана: ОШИБКА")
 
         try:
-            _ = screenshot.capture()
+            frame = screenshot.capture()
             shot_ok = True
-            print("[5/7] скриншот: OK")
+            print("[5/8] скриншот: OK")
         except ScreenshotError as exc:
             errors.append(f"Не удалось сделать скриншот: {exc}")
-            print("[5/7] скриншот: ОШИБКА")
+            print("[5/8] скриншот: ОШИБКА")
     else:
-        print("[3/7] версия Android: пропущено, потому что ADB не подключён")
-        print("[4/7] размер экрана: пропущено, потому что ADB не подключён")
-        print("[5/7] скриншот: пропущено, потому что ADB не подключён")
+        print("[3/8] версия Android: пропущено, потому что ADB не подключён")
+        print("[4/8] размер экрана: пропущено, потому что ADB не подключён")
+        print("[5/8] скриншот: пропущено, потому что ADB не подключён")
 
     try:
         profiles = profile_manager.list_profiles()
         _, profile_dir, profile_templates_dir = _knowledge_paths(config, profile)
-        print(f"[6/7] папка knowledge/profile: {profile_dir}")
+        print(f"[6/8] папка knowledge/profile: {profile_dir}")
         print(f"      templates/{profile}: {profile_templates_dir}")
-        print(f"[7/7] профили: {', '.join(profiles) if profiles else '(нет профилей)'}")
-        _ = knowledge.get_templates(enabled_only=False)
+        print(f"[7/8] профили: {', '.join(profiles) if profiles else '(нет профилей)'}")
+        templates = knowledge.get_templates(enabled_only=False)
         knowledge_ok = True
+        print(f"[8/8] templates loaded: {len(templates)}")
     except (ProfileError, KnowledgeError, KeyError) as exc:
+        templates = []
         errors.append(f"Не удалось прочитать знания или список профилей: {exc}")
+        print("[8/8] templates loaded: ОШИБКА")
 
-    if adb_exists and adb_ok and shot_ok and knowledge_ok:
+    if shot_ok and knowledge_ok:
+        try:
+            matches = vision.find_all(
+                frame=frame,
+                templates=templates,
+                threshold=config.default_match_threshold,
+            )
+            vision_ok = True
+            print(f"Найдено совпадений: {len(matches)}")
+            for match in matches:
+                print(
+                    f"- {match.template_id}: score={match.score:.3f}, rect={match.rect}"
+                )
+        except Exception as exc:
+            errors.append(f"Не удалось выполнить поиск шаблонов: {exc}")
+
+    if adb_exists and adb_ok and shot_ok and knowledge_ok and vision_ok:
         print("Итог: OK")
         return 0
 
