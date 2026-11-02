@@ -12,7 +12,7 @@ from typing import Any, Callable
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-PROFILE_IDS = tuple(f"loc{i}" for i in range(1, 8))
+PROFILE_IDS = tuple(f"block{i}" for i in range(1, 8))
 
 
 def _utc_now() -> str:
@@ -33,20 +33,19 @@ def _validate_json(path: Path) -> dict[str, Any]:
 
 def _atomic_write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
-    temporary_path = Path(temporary)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    temporary = Path(name)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
             json.dump(value, handle, ensure_ascii=False, indent=2)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        _validate_json(temporary_path)
-        temporary_path.replace(path)
+        _validate_json(temporary)
+        temporary.replace(path)
         _validate_json(path)
     finally:
-        if temporary_path.exists():
-            temporary_path.unlink()
+        temporary.unlink(missing_ok=True)
 
 
 def _backup(path: Path) -> Path:
@@ -83,26 +82,18 @@ def _records(data: dict[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
-def delete_one_feature(
-    profile: str,
-    feature_id: str,
-    data_root: Path | str = Path("data/profiles"),
-    *,
-    bot_running: Callable[[], bool] | bool = False,
-) -> None:
+def delete_one_feature(profile: str, feature_id: str, data_root: Path | str = Path("data/profiles"), *, bot_running: Callable[[], bool] | bool = False) -> None:
     running = bot_running() if callable(bot_running) else bool(bot_running)
     if running:
         raise RuntimeError("Bot is running; memory editing is locked")
     if not isinstance(feature_id, str) or not feature_id.strip():
         raise ValueError("A single feature id is required")
-
     path = features_path(profile, data_root)
     original = _validate_json(path)
     records = _records(original)
     matches = [record for record in records if record.get("id") == feature_id]
     if len(matches) != 1:
         raise ValueError(f"Expected exactly one feature {feature_id!r}, found {len(matches)}")
-
     filename = matches[0].get("file")
     if not isinstance(filename, str) or not filename.strip():
         raise ValueError(f"Feature {feature_id!r} has no PNG path")
@@ -113,7 +104,6 @@ def delete_one_feature(
         raise ValueError(f"Refusing to delete non-PNG file: {png}")
     if not png.is_file():
         raise FileNotFoundError(f"PNG is missing; JSON was not changed: {png}")
-
     _backup(path)
     updated = copy.deepcopy(original)
     updated["templates"] = [record for record in records if record.get("id") != feature_id]
@@ -124,7 +114,7 @@ def delete_one_feature(
 
 
 class MemoryTab(ttk.Frame):
-    """In-place editor: exactly one selected icon may be deleted after confirmation."""
+    """In-place editor allowing deletion of exactly one selected icon."""
 
     def __init__(self, parent: tk.Misc, app: Any) -> None:
         super().__init__(parent, padding=12)
@@ -180,9 +170,9 @@ class MemoryTab(ttk.Frame):
             return
         feature_id = self.listbox.get(selection[0])
         if self._bot_running():
-            messagebox.showwarning("Удаление", "Бот работает: редактирование памяти заблокировано.", parent=self.winfo_toplevel())
+            messagebox.showwarning("Удаление заблокировано", "Нельзя изменять память при работающем боте.", parent=self.winfo_toplevel())
             return
-        if not messagebox.askyesno("Подтверждение", f"Удалить иконку {feature_id} и её PNG?\nБудет создан .bak.", parent=self.winfo_toplevel()):
+        if not messagebox.askyesno("Подтверждение", f"Удалить иконку {feature_id} и её PNG?\nБудет создан features.json.bak.", parent=self.winfo_toplevel()):
             return
         try:
             delete_one_feature(self.profile_var.get(), feature_id, self._data_root(), bot_running=self._bot_running)
@@ -190,7 +180,7 @@ class MemoryTab(ttk.Frame):
             messagebox.showerror("Удаление", str(exc), parent=self.winfo_toplevel())
             return
         self.reload()
-        self.status_var.set(f"Удалено: {feature_id}; JSON проверен, .bak создан")
+        self.status_var.set(f"Удалено: {feature_id}; JSON проверен, создан .bak")
 
 
 def open_memory_editor(parent: tk.Misc, app: Any) -> MemoryTab:
