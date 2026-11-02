@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -113,7 +114,17 @@ def _run_navigation(config: BotConfig, location_id: str, floor_number: int) -> i
         vision = objects["vision"]
         from nav import NavigationController
         adb.connect()
-        controller = NavigationController(adb=adb, screenshot=screenshot, vision=vision, base_dir=config.base_dir, logger=logger)
+        stop_event = threading.Event()
+        controller = NavigationController(
+            project_dir=config.base_dir,
+            log=print,
+            stop_event=stop_event,
+            adb=adb,
+            screenshot=screenshot,
+            vision=vision,
+            base_dir=config.base_dir,
+            logger=logger,
+        )
         result = controller.navigate_from_current_screen(location_id=location_id, floor_number=floor_number)
         print(result.message)
         return 0 if result.ok else 1
