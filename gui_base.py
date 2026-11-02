@@ -40,7 +40,6 @@ Exports:
 """
 
 import json
-import math
 import os
 import queue
 import shlex
@@ -105,6 +104,7 @@ def _ensure_dirs() -> None:
     LIVE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
+
 def _empty_nav() -> dict[str, Any]:
     return {
         "base_screenshot": {"png": ""},
@@ -123,6 +123,7 @@ def _empty_nav() -> dict[str, Any]:
         },
         "settings": dict(DEFAULT_SETTINGS),
     }
+
 
 
 def _normalize_locations(value: Any) -> list[dict[str, Any]]:
@@ -145,12 +146,14 @@ def _normalize_locations(value: Any) -> list[dict[str, Any]]:
     return result
 
 
+
 def _sanitize_threshold(value: Any) -> float:
     try:
         number = float(value)
     except (TypeError, ValueError):
         return float(DEFAULT_SETTINGS["match_threshold"])
     return max(0.05, min(0.99, number))
+
 
 
 def _normalize_settings(value: Any) -> dict[str, Any]:
@@ -167,6 +170,7 @@ def _normalize_settings(value: Any) -> dict[str, Any]:
         if "match_threshold" in value:
             data["match_threshold"] = _sanitize_threshold(value["match_threshold"])
     return data
+
 
 
 def _load_nav() -> dict[str, Any]:
@@ -200,6 +204,7 @@ def _load_nav() -> dict[str, Any]:
     return data
 
 
+
 def _save_nav(data: dict[str, Any]) -> None:
     _ensure_dirs()
     fd, tmp_name = tempfile.mkstemp(prefix=".nav-", suffix=".tmp", dir=BASE_DIR)
@@ -215,11 +220,13 @@ def _save_nav(data: dict[str, Any]) -> None:
             os.unlink(tmp_name)
 
 
+
 def _append_live_log(text: str) -> None:
     _ensure_dirs()
     ts = time.strftime("%H:%M:%S")
     with LIVE_LOG_PATH.open("a", encoding="utf-8", newline="\n") as fh:
         fh.write(f"{ts} {text}\n")
+
 
 
 def _write_png(crop_bgr, prefix: str) -> str:
@@ -228,6 +235,7 @@ def _write_png(crop_bgr, prefix: str) -> str:
     if cv2 is None or not cv2.imwrite(str(path), crop_bgr):
         raise RuntimeError("Не удалось сохранить PNG.")
     return path.name
+
 
 
 def _make_provider() -> Any:
@@ -240,9 +248,11 @@ def _make_provider() -> Any:
     return ScreenshotProvider(adb, config, logger)
 
 
+
 def _nearest_match_level(threshold: float) -> int:
     threshold = _sanitize_threshold(threshold)
     return min(MATCH_LEVELS, key=lambda level: abs(MATCH_LEVELS[level] - threshold))
+
 
 
 def _threshold_from_user(value: str) -> float:
@@ -252,6 +262,7 @@ def _threshold_from_user(value: str) -> float:
     if not (0.05 <= number <= 0.99):
         raise ValueError("match_threshold должен быть от 0.05 до 0.99 или от 5 до 99 как проценты.")
     return round(number, 2)
+
 
 
 def capture_region(parent, prompt):
@@ -306,6 +317,7 @@ def capture_region(parent, prompt):
     if state["result"] is None and state.get("selector") is not None:
         owner.wait_window(state["selector"])
     return state["result"]
+
 
 
 def _open_crop_window(parent, prompt: str, frame, state: dict[str, Any]) -> None:
@@ -377,7 +389,7 @@ class SettingsTab(ttk.Frame):
         self._console_history: list[str] = []
         self._console_history_index = 0
         self._tail_buffer: deque[str] = deque(maxlen=MAX_CONSOLE_LINES)
-        self._console_queue: "queue.Queue[tuple[str, str]]" = queue.Queue()
+        self._console_queue: "queue.Queue[tuple[str, Any]]" = queue.Queue()
         self._joystick_preview_bbox: tuple[int, int, int, int] | None = None
         self._joystick_preview_frame = None
         self._build_vars()
@@ -764,20 +776,22 @@ class SettingsTab(ttk.Frame):
 
         def run() -> None:
             try:
-                ok = verify(getattr(self.app, "project_dir", "."), first_name, "1", log=self._threadsafe_console_log)
-                self._console_queue.put(("log", "Проверка цепочки: успешно." if ok else "Проверка цепочки: неуспешно."))
+                ok, reason = verify(getattr(self.app, "project_dir", "."), first_name, log=self._threadsafe_console_log)
+                self._console_queue.put(("log", f"Проверка цепочки: ok={ok}, reason={reason}"))
             except Exception as exc:
                 self._console_queue.put(("log", f"Проверка цепочки завершилась ошибкой: {exc}"))
 
         threading.Thread(target=run, daemon=True).start()
 
     def _poll_app_log_queue(self) -> None:
-        try:
-            while True:
-                msg = self.app.log_queue.get_nowait()
-                self._log_console(str(msg))
-        except queue.Empty:
-            pass
+        app_log_queue = getattr(self.app, "log_queue", None)
+        if app_log_queue is not None:
+            try:
+                while True:
+                    msg = app_log_queue.get_nowait()
+                    self._log_console(str(msg))
+            except queue.Empty:
+                pass
         try:
             while True:
                 kind, payload = self._console_queue.get_nowait()
@@ -913,8 +927,7 @@ class SettingsTab(ttk.Frame):
                 parsed = int(value)
             elif name == "match_threshold":
                 parsed = _threshold_from_user(value)
-                self.after(0, lambda: self.level_var.set(_nearest_match_level(parsed)))
-                self.after(0, self._refresh_level_text_only)
+                self._console_queue.put(("set_match_level", _nearest_match_level(parsed)))
             elif name == "match_level":
                 parsed_level = int(value)
                 if not 1 <= parsed_level <= 10:
@@ -927,9 +940,9 @@ class SettingsTab(ttk.Frame):
         except ValueError as exc:
             self._console_queue.put(("log", str(exc)))
             return
-        settings[name if name != "match_level" else "match_threshold"] = parsed
-        if name == "match_level":
-            settings["match_threshold"] = parsed
+        settings["match_threshold"] = parsed if name in {"match_threshold", "match_level"} else settings.get("match_threshold", DEFAULT_SETTINGS["match_threshold"])
+        if name not in {"match_threshold", "match_level"}:
+            settings[name] = parsed
         _save_nav(self.data)
         self._console_queue.put(("log", f"Сохранено {name} = {parsed}"))
 
@@ -956,12 +969,19 @@ class SettingsTab(ttk.Frame):
         if func is None:
             self._console_queue.put(("log", "В nav.py нет функции take_screenshot."))
             return
-        result = func()  # type: ignore[misc]
+        result = func(getattr(self.app, "project_dir", "."))
         self._console_queue.put(("log", f"take_screenshot: {result}"))
 
     def _cmd_find(self, args: list[str]) -> None:
         if len(args) != 1:
             self._console_queue.put(("log", "Использование: find имя_шаблона"))
+            return
+        key = args[0]
+        template = self.data.get(key)
+        if isinstance(template, dict):
+            template = template.get("png")
+        if not template:
+            self._console_queue.put(("log", f"Шаблон не найден в gui_base.py: {key}"))
             return
         try:
             import nav
@@ -972,8 +992,8 @@ class SettingsTab(ttk.Frame):
         if func is None:
             self._console_queue.put(("log", "В nav.py нет функции find_template."))
             return
-        result = func(args[0])  # type: ignore[misc]
-        self._console_queue.put(("log", f"find_template({args[0]}): {result}"))
+        result = func(getattr(self.app, "project_dir", "."), template)
+        self._console_queue.put(("log", f"find_template({key}): {result}"))
 
     def _cmd_hold(self, args: list[str]) -> None:
         if len(args) != 2:
@@ -991,30 +1011,122 @@ class SettingsTab(ttk.Frame):
         if ms < 1 or ms > 5000:
             self._console_queue.put(("log", "Максимум 5000 мс, минимум 1 мс."))
             return
-        self._console_queue.put(("log", f"hold {side} {ms}: команда принята. Автоматический release обязателен после удержания."))
-        time.sleep(ms / 1000.0)
-        self._cmd_release([])
+        try:
+            import nav
+        except Exception as exc:
+            self._console_queue.put(("log", str(exc)))
+            return
+        hold_func = getattr(nav, "hold", None)
+        release_func = getattr(nav, "release", None)
+        if hold_func is None or release_func is None:
+            self._console_queue.put(("log", "В nav.py нет функций hold/release."))
+            return
+        project_dir = getattr(self.app, "project_dir", ".")
+        hold_ok = False
+        try:
+            hold_ok = bool(hold_func(side, project_dir=project_dir, log=self._threadsafe_console_log))
+            if not hold_ok:
+                self._console_queue.put(("log", f"hold {side} {ms}: nav.hold вернул False."))
+                return
+            self._console_queue.put(("log", f"hold {side} {ms}: команда принята. Автоматический release обязателен после удержания."))
+            time.sleep(ms / 1000.0)
+        finally:
+            try:
+                release_func(project_dir=project_dir, log=self._threadsafe_console_log)
+            except Exception as exc:
+                self._console_queue.put(("log", f"release завершился ошибкой: {exc}"))
 
     def _cmd_release(self, args: list[str]) -> None:
         del args
+        try:
+            import nav
+        except Exception as exc:
+            self._console_queue.put(("log", str(exc)))
+            return
+        func = getattr(nav, "release", None)
+        if func is None:
+            self._console_queue.put(("log", "В nav.py нет функции release."))
+            return
+        func(project_dir=getattr(self.app, "project_dir", "."), log=self._threadsafe_console_log)
         self._console_queue.put(("log", "release: команда выполнена."))
 
     def _cmd_stop(self, args: list[str]) -> None:
         del args
-        self.after(0, self.app.stop_process)
+        stop_process = getattr(self.app, "stop_process", None)
+        if stop_process is None:
+            self._console_queue.put(("log", "У app нет метода stop_process."))
+            return
+        self.after(0, stop_process)
         self._console_queue.put(("log", "stop: отправлена команда остановки."))
 
     def _cmd_loot(self, args: list[str]) -> None:
-        del args
-        self._console_queue.put(("log", "loot: команда зарегистрирована, но обработчик в nav.py не найден."))
+        if len(args) != 1:
+            self._console_queue.put(("log", "Использование: loot имя_шаблона"))
+            return
+        key = args[0]
+        template = self.data.get(key)
+        if isinstance(template, dict):
+            template = template.get("png")
+        if not template:
+            self._console_queue.put(("log", f"Шаблон не найден в gui_base.py: {key}"))
+            return
+        try:
+            import nav
+        except Exception as exc:
+            self._console_queue.put(("log", str(exc)))
+            return
+        func = getattr(nav, "click_loot", None)
+        if func is None:
+            self._console_queue.put(("log", "В nav.py нет функции click_loot."))
+            return
+        result = func(getattr(self.app, "project_dir", "."), template, log=self._threadsafe_console_log)
+        self._console_queue.put(("log", f"loot: {result}"))
 
     def _cmd_mob(self, args: list[str]) -> None:
-        del args
-        self._console_queue.put(("log", "mob: команда зарегистрирована, но обработчик в nav.py не найден."))
+        if len(args) != 1:
+            self._console_queue.put(("log", "Использование: mob имя_шаблона"))
+            return
+        key = args[0]
+        template = self.data.get(key)
+        if isinstance(template, dict):
+            template = template.get("png")
+        if not template:
+            self._console_queue.put(("log", f"Шаблон не найден в gui_base.py: {key}"))
+            return
+        try:
+            import nav
+        except Exception as exc:
+            self._console_queue.put(("log", str(exc)))
+            return
+        func = getattr(nav, "attack_mob", None)
+        if func is None:
+            self._console_queue.put(("log", "В nav.py нет функции attack_mob."))
+            return
+        result = func(getattr(self.app, "project_dir", "."), template, log=self._threadsafe_console_log)
+        self._console_queue.put(("log", f"mob: {result}"))
 
     def _cmd_event(self, args: list[str]) -> None:
-        del args
-        self._console_queue.put(("log", "event: команда зарегистрирована, но обработчик в nav.py не найден."))
+        if len(args) != 1:
+            self._console_queue.put(("log", "Использование: event имя_шаблона"))
+            return
+        key = args[0]
+        template = self.data.get(key)
+        if isinstance(template, dict):
+            template = template.get("png")
+        if not template:
+            self._console_queue.put(("log", f"Шаблон не найден в gui_base.py: {key}"))
+            return
+        try:
+            import nav
+        except Exception as exc:
+            self._console_queue.put(("log", str(exc)))
+            return
+        func = getattr(nav, "handle_event", None)
+        if func is None:
+            self._console_queue.put(("log", "В nav.py нет функции handle_event."))
+            return
+        result = func(getattr(self.app, "project_dir", "."), template, log=self._threadsafe_console_log)
+        self._console_queue.put(("log", f"event: {result}"))
 
     def _cmd_go(self, args: list[str]) -> None:
         if len(args) != 1:
@@ -1028,7 +1140,7 @@ class SettingsTab(ttk.Frame):
         if not hasattr(nav, "go_to_dungeon"):
             self._console_queue.put(("log", "В nav.py нет функции go_to_dungeon."))
             return
-        ok, reason = nav.go_to_dungeon(getattr(self.app, "project_dir", "."), args[0], "1", log=self._threadsafe_console_log)
+        ok, reason = nav.go_to_dungeon(getattr(self.app, "project_dir", "."), args[0], log=self._threadsafe_console_log)
         self._console_queue.put(("log", f"go: ok={ok}, reason={reason}"))
 
     def _cmd_memory(self, args: list[str]) -> None:
@@ -1042,7 +1154,7 @@ class SettingsTab(ttk.Frame):
         if func is None:
             self._console_queue.put(("log", "В nav.py нет функции memory_summary."))
             return
-        result = func()  # type: ignore[misc]
+        result = func(getattr(self.app, "project_dir", "."))
         self._console_queue.put(("log", str(result)))
 
 
