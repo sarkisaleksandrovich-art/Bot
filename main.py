@@ -40,7 +40,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reset-knowledge", dest="reset_knowledge", action="store_true")
     parser.add_argument("--gui", action="store_true", help="Запустить GUI с выбором профиля и режимов")
     parser.add_argument("--navigate", action="store_true", help="Navigate from current screen to farm start")
-    parser.add_argument("--location", type=str, choices=[f"loc{i}" for i in range(1, 8)], help="Location for --navigate")
+    parser.add_argument("--location", type=str, help="Location for --navigate")
     parser.add_argument("--floor", type=int, help="Floor for --navigate")
     return parser
 
@@ -259,7 +259,6 @@ def _count_templates(knowledge: KnowledgeBase) -> int:
     try: return len(knowledge.get_templates(enabled_only=False))
     except Exception: return -1
 
-
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser(); args = parser.parse_args(argv)
     if args.navigate:
@@ -284,5 +283,4 @@ def main(argv: list[str] | None = None) -> int:
         if args.teach_only: return _run_teach_only(config, logger, profile)
         return _run_teach(config, logger, profile, floor_from, floor_to)
     except (ADBConnectionError, ADBCommandError, ADBError, ScreenshotError, ProfileError, KnowledgeError, TeacherUIError, LabelingCancelledError, ExplorerError, Exception) as exc: _print_error(str(exc)); return 1
-
 if __name__ == "__main__": raise SystemExit(main())
