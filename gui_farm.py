@@ -16,7 +16,7 @@ class FarmTab(ttk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent, padding=12)
         self.app = app
-        self.project_dir = Path(getattr(app, "project_dir", Path(__file__).resolve().parent))
+        self.project_dir = Path(getattr(app, "project_dir", Path(__file__).resolve().parent)).resolve()
         self.running = False
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
