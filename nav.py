@@ -721,7 +721,10 @@ def _run_known_objects(project_dir: str | Path, frame: Any, log: Callable[..., A
 def _go_path(project_dir: str | Path, location_name: str, log: Callable[..., Any], stop_event: Any, launch: bool) -> tuple[bool, str]:
     runtime = _build_runtime(project_dir, log=log)
     nav, _ = _read_nav(project_dir)
-    floor_number = int(nav.get("selected_floor", DEFAULT_FLOOR_NUMBER) or DEFAULT_FLOOR_NUMBER)
+    try:
+        floor_number = int(nav.get("selected_floor", DEFAULT_FLOOR_NUMBER) or DEFAULT_FLOOR_NUMBER)
+    except (TypeError, ValueError):
+        floor_number = DEFAULT_FLOOR_NUMBER
     chain = _nav_chain_templates(project_dir, location_name, floor_number=floor_number)
     for key, value in chain.items():
         if value is None and key not in {"base", "locations_map"}:
@@ -795,7 +798,6 @@ def go_to_dungeon(project_dir: str | Path, location_name: str, log: Callable[...
 
 def verify_chain(project_dir: str | Path, location_name: str, log: Callable[..., Any] = print, stop_event: Any = None) -> tuple[bool, str]:
     return _go_path(project_dir, location_name, log, stop_event, False)
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
