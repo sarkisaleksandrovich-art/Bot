@@ -12,7 +12,7 @@ nav.json structure::
       "base_to_locations": {"png": "base_to_locations_123.png"},
       "locations_map": {"png": "locations_map_123.png"},
       "locations": [
-        {"slot": 1, "name": "Лес", "png": "location_1_123.png"},
+        {"slot": 1, "name": "Локация 1", "png": "location_1_123.png"},
         {"slot": 2, "name": "...", "png": "..."}
       ],
       "farm_floor_button": {"png": "farm_floor_button_123.png"},
@@ -104,7 +104,6 @@ def _ensure_dirs() -> None:
     LIVE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
-
 def _empty_nav() -> dict[str, Any]:
     return {
         "base_screenshot": {"png": ""},
@@ -123,7 +122,6 @@ def _empty_nav() -> dict[str, Any]:
         },
         "settings": dict(DEFAULT_SETTINGS),
     }
-
 
 
 def _normalize_locations(value: Any) -> list[dict[str, Any]]:
@@ -146,14 +144,12 @@ def _normalize_locations(value: Any) -> list[dict[str, Any]]:
     return result
 
 
-
 def _sanitize_threshold(value: Any) -> float:
     try:
         number = float(value)
     except (TypeError, ValueError):
         return float(DEFAULT_SETTINGS["match_threshold"])
     return max(0.05, min(0.99, number))
-
 
 
 def _normalize_settings(value: Any) -> dict[str, Any]:
@@ -170,7 +166,6 @@ def _normalize_settings(value: Any) -> dict[str, Any]:
         if "match_threshold" in value:
             data["match_threshold"] = _sanitize_threshold(value["match_threshold"])
     return data
-
 
 
 def _load_nav() -> dict[str, Any]:
@@ -204,7 +199,6 @@ def _load_nav() -> dict[str, Any]:
     return data
 
 
-
 def _save_nav(data: dict[str, Any]) -> None:
     _ensure_dirs()
     fd, tmp_name = tempfile.mkstemp(prefix=".nav-", suffix=".tmp", dir=BASE_DIR)
@@ -220,13 +214,11 @@ def _save_nav(data: dict[str, Any]) -> None:
             os.unlink(tmp_name)
 
 
-
 def _append_live_log(text: str) -> None:
     _ensure_dirs()
     ts = time.strftime("%H:%M:%S")
     with LIVE_LOG_PATH.open("a", encoding="utf-8", newline="\n") as fh:
         fh.write(f"{ts} {text}\n")
-
 
 
 def _write_png(crop_bgr, prefix: str) -> str:
@@ -235,7 +227,6 @@ def _write_png(crop_bgr, prefix: str) -> str:
     if cv2 is None or not cv2.imwrite(str(path), crop_bgr):
         raise RuntimeError("Не удалось сохранить PNG.")
     return path.name
-
 
 
 def _make_provider() -> Any:
@@ -248,11 +239,9 @@ def _make_provider() -> Any:
     return ScreenshotProvider(adb, config, logger)
 
 
-
 def _nearest_match_level(threshold: float) -> int:
     threshold = _sanitize_threshold(threshold)
     return min(MATCH_LEVELS, key=lambda level: abs(MATCH_LEVELS[level] - threshold))
-
 
 
 def _threshold_from_user(value: str) -> float:
@@ -262,7 +251,6 @@ def _threshold_from_user(value: str) -> float:
     if not (0.05 <= number <= 0.99):
         raise ValueError("match_threshold должен быть от 0.05 до 0.99 или от 5 до 99 как проценты.")
     return round(number, 2)
-
 
 
 def capture_region(parent, prompt):
@@ -317,7 +305,6 @@ def capture_region(parent, prompt):
     if state["result"] is None and state.get("selector") is not None:
         owner.wait_window(state["selector"])
     return state["result"]
-
 
 
 def _open_crop_window(parent, prompt: str, frame, state: dict[str, Any]) -> None:
@@ -501,7 +488,7 @@ class SettingsTab(ttk.Frame):
         ttk.Button(parent, text="Сохранить уровень", command=self._save_level).grid(row=4, column=3, sticky="w", pady=(8, 2))
         ttk.Label(
             parent,
-            text="Чем выше уровень, тем строже бот сравнивает картинку: реже путает объекты, но может не узнать знакомый. На низких уровнях 1–4 бот может принимать чужие объекты за знакомые — это подходит для проверки, а не для фарма. Если бот не узнаёт нужное, снизьте уровень на 1. Если путает объекты, повысьте уровень.",
+            text="Чем выше уровень, тем строже бот сравнивает картинку: реже путает объекты, но может не узнать знакомые. На низких уровнях 1–4 бот может принимать чужие объекты за знакомые — это подходит для проверки, а не для фарма. Если бот не узнаёт нужное, снижайте уровень на 1. Если путает объекты, повышайте уровень.",
             wraplength=980,
             justify=tk.LEFT,
         ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(4, 0))
