@@ -269,7 +269,6 @@ def _threshold_from_user(value: str) -> float:
     return round(number, 2)
 
 
-
 def capture_region(parent, prompt):
     """Capture device screen in a worker thread and let user select a region.
 
@@ -1143,7 +1142,7 @@ class SettingsTab(ttk.Frame):
         if not hasattr(nav, "go_to_dungeon"):
             self._console_queue.put(("log", "В nav.py нет функции go_to_dungeon."))
             return
-        ok, reason = nav.go_to_dungeon(getattr(self.app, "project_dir", "."), args[0], log=self._threadsafe_console_log)
+        ok, reason = nav.go_to_dungeon(getattr(self.app, "project_dir", "."), args[0], log=self._threadsafe_console_log, stop_event=None)
         self._console_queue.put(("log", f"go: ok={ok}, reason={reason}"))
 
     def _cmd_memory(self, args: list[str]) -> None:
