@@ -285,7 +285,8 @@ class NavigationController:
                 if match is None:
                     self._sleep(0.4)
                     continue
-                self._tap_center(match.rect)
+                if not self._tap_center(match.rect):
+                    return False, self.last_reason or f"failed to tap {label}"
                 self._sleep(1.0 if stable else 1.4)
                 if next_png is None:
                     return True, f"{label} tapped"
@@ -309,15 +310,16 @@ class NavigationController:
 
     def _run_chain(self, location_id: str, floor_name: str, verify_only: bool) -> NavigationResult:
         data, error = _read_nav(self.project_dir)
+        floor_number = int(floor_name) if str(floor_name).isdigit() else None
         if error:
-            return NavigationResult(False, ScreenState.UNKNOWN, error, location_id=location_id, floor_number=int(floor_name) if str(floor_name).isdigit() else None)
+            return NavigationResult(False, ScreenState.UNKNOWN, error, location_id=location_id, floor_number=floor_number)
         assert data is not None
         loc = _location(data, location_id)
         if loc is None:
-            return NavigationResult(False, ScreenState.LOCATION_SELECT, f"unknown location: {location_id}", location_id=location_id)
+            return NavigationResult(False, ScreenState.LOCATION_SELECT, f"unknown location: {location_id}", location_id=location_id, floor_number=floor_number)
         floor = _floor(loc, floor_name)
         if floor is None:
-            return NavigationResult(False, ScreenState.FLOOR, f"unknown floor: {floor_name}", location_id=location_id)
+            return NavigationResult(False, ScreenState.FLOOR, f"unknown floor: {floor_name}", location_id=location_id, floor_number=floor_number)
 
         base_png = _png(self.project_dir, data.get("base_to_locations", {}).get("png") if isinstance(data.get("base_to_locations"), dict) else None)
         loc_png = _png(self.project_dir, loc.get("png"))
@@ -326,31 +328,31 @@ class NavigationController:
         required = [(base_png, "base_to_locations"), (loc_png, "location"), (floor_png, "floor"), (enter_png, "enter_dungeon")]
         for png, label in required:
             if png is None:
-                return NavigationResult(False, ScreenState.UNKNOWN, f"template missing: {label}", location_id=location_id)
+                return NavigationResult(False, ScreenState.UNKNOWN, f"template missing: {label}", location_id=location_id, floor_number=floor_number)
 
         ok, reason = self.return_to_base(data)
         if not ok:
-            return NavigationResult(False, ScreenState.UNKNOWN, reason, 1, location_id)
+            return NavigationResult(False, ScreenState.UNKNOWN, reason, 1, location_id, floor_number)
 
         ok, reason = self._tap_template_until_next(base_png, "base → locations", next_png=loc_png)
         if not ok:
-            return NavigationResult(False, ScreenState.MAIN_BASE, reason, 1, location_id)
+            return NavigationResult(False, ScreenState.MAIN_BASE, reason, 1, location_id, floor_number)
 
         ok, reason = self._tap_template_until_next(loc_png, f"location {loc.get('name')}", next_png=floor_png)
         if not ok:
-            return NavigationResult(False, ScreenState.LOCATION_SELECT, reason, 1, location_id)
+            return NavigationResult(False, ScreenState.LOCATION_SELECT, reason, 1, location_id, floor_number)
 
         ok, reason = self._tap_template_until_next(floor_png, f"floor {floor.get('name')}", next_png=enter_png)
         if not ok:
-            return NavigationResult(False, ScreenState.LOCATION, reason, 1, location_id)
+            return NavigationResult(False, ScreenState.LOCATION, reason, 1, location_id, floor_number)
 
         if verify_only:
-            return NavigationResult(True, ScreenState.HERO_MENU, "chain verified up to hero menu", 1, location_id)
+            return NavigationResult(True, ScreenState.HERO_MENU, "chain verified up to hero menu", 1, location_id, floor_number)
 
         ok, reason = self._tap_template_until_next(enter_png, "enter dungeon", next_png=None)
         if not ok:
-            return NavigationResult(False, ScreenState.HERO_MENU, reason, 1, location_id)
-        return NavigationResult(True, ScreenState.FARM, "navigation chain completed", 1, location_id)
+            return NavigationResult(False, ScreenState.HERO_MENU, reason, 1, location_id, floor_number)
+        return NavigationResult(True, ScreenState.FARM, "navigation chain completed", 1, location_id, floor_number)
 
 
 def go_to_dungeon(
@@ -360,7 +362,13 @@ def go_to_dungeon(
     log: Callable[..., Any] = print,
     stop_event: Any = None,
 ) -> tuple[bool, str]:
-    result = NavigationController(project_dir=project_dir, log=log, stop_event=stop_event).navigate_from_current_screen(location_name, int(floor_name) if str(floor_name).isdigit() else 0)
+    status = nav_status(project_dir)
+    if not status["ready"]:
+        reason = status.get("error") or "navigation profile is incomplete"
+        log(reason)
+        return False, reason
+    controller = NavigationController(project_dir=project_dir, log=log, stop_event=stop_event)
+    result = controller._run_chain(location_name, floor_name, verify_only=False)
     if not result.ok:
         log(result.message)
     return result.ok, result.message
