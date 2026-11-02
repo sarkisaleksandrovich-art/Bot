@@ -113,8 +113,8 @@ class GuiApp:
         self._closing = False
 
         self._build_ui()
-        self.reload_profiles()
         self._mount_tabs()
+        self.reload_profiles()
 
     def log(self, text: str) -> None:
         self.log_queue.put(str(text))
