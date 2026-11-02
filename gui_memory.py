@@ -164,7 +164,7 @@ def delete_one_feature(
 
 
 class MemoryTab(ttk.Frame):
-    """Editor tab for deleting exactly one selected icon from the chosen profile."""
+    """Tab for deleting exactly one selected icon from the chosen profile."""
 
     def __init__(self, parent: tk.Misc, app: Any) -> None:
         super().__init__(parent, padding=12)
@@ -221,7 +221,12 @@ class MemoryTab(ttk.Frame):
         self.profile_combo["values"] = profiles
 
         current = self.profile_var.get().strip()
-        if profiles and current not in profiles:
+        app_profile_var = getattr(self.app, "profile_var", None)
+        app_current = app_profile_var.get().strip() if hasattr(app_profile_var, "get") else ""
+        if app_current and app_current in profiles and current != app_current:
+            self.profile_var.set(app_current)
+            current = app_current
+        elif profiles and current not in profiles:
             self.profile_var.set(profiles[0])
             current = profiles[0]
 
