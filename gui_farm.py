@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -284,6 +285,28 @@ class ControlTab(ttk.Frame):
             except Exception:
                 pass
 
+    def _write_actions_data(self, actions_path: Path, data: dict[str, Any]) -> None:
+        actions_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=".actions-", suffix=".tmp", dir=str(actions_path.parent))
+        try:
+            with open(fd, "w", encoding="utf-8", newline="\n", closefd=False) as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=2)
+                fh.write("\n")
+                fh.flush()
+                try:
+                    import os
+                    os.fsync(fh.fileno())
+                except Exception:
+                    pass
+            Path(tmp_name).replace(actions_path)
+        finally:
+            tmp_path = Path(tmp_name)
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
+
     def _release_and_snapshot_async(self) -> None:
         if self._stop_snapshot_busy:
             return
@@ -494,20 +517,20 @@ class ControlTab(ttk.Frame):
                     objects[index] = {"name": record_name, "png": png_name, "action": action}
                     if cv2 is None or not cv2.imwrite(str(base_dir / png_name), crop):
                         raise RuntimeError("Не удалось сохранить шаблон объекта")
-                    actions_path.write_text(json.dumps({"objects": objects}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                    self._write_actions_data(actions_path, data)
                     return
                 if self._matched_png and item_png == self._matched_png:
                     png_name = item_png or png_name
                     objects[index] = {"name": record_name, "png": png_name, "action": action}
                     if cv2 is None or not cv2.imwrite(str(base_dir / png_name), crop):
                         raise RuntimeError("Не удалось сохранить шаблон объекта")
-                    actions_path.write_text(json.dumps({"objects": objects}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                    self._write_actions_data(actions_path, data)
                     return
 
         if cv2 is None or not cv2.imwrite(str(base_dir / png_name), crop):
             raise RuntimeError("Не удалось сохранить шаблон объекта")
         objects.append({"name": record_name, "png": png_name, "action": action})
-        actions_path.write_text(json.dumps({"objects": objects}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self._write_actions_data(actions_path, data)
 
     def on_loot(self) -> None:
         self._manual_target_action("loot")
