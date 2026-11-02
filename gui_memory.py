@@ -88,12 +88,14 @@ def delete_one_feature(profile: str, feature_id: str, data_root: Path | str = Pa
         raise RuntimeError("Bot is running; memory editing is locked")
     if not isinstance(feature_id, str) or not feature_id.strip():
         raise ValueError("A single feature id is required")
+
     path = features_path(profile, data_root)
     original = _validate_json(path)
     records = _records(original)
     matches = [record for record in records if record.get("id") == feature_id]
     if len(matches) != 1:
         raise ValueError(f"Expected exactly one feature {feature_id!r}, found {len(matches)}")
+
     filename = matches[0].get("file")
     if not isinstance(filename, str) or not filename.strip():
         raise ValueError(f"Feature {feature_id!r} has no PNG path")
@@ -104,13 +106,25 @@ def delete_one_feature(profile: str, feature_id: str, data_root: Path | str = Pa
         raise ValueError(f"Refusing to delete non-PNG file: {png}")
     if not png.is_file():
         raise FileNotFoundError(f"PNG is missing; JSON was not changed: {png}")
-    _backup(path)
-    updated = copy.deepcopy(original)
-    updated["templates"] = [record for record in records if record.get("id") != feature_id]
-    updated["updated_at"] = _utc_now()
-    _atomic_write_json(path, updated)
-    png.unlink()
-    _validate_json(path)
+
+    backup = _backup(path)
+    try:
+        # Delete the asset first. If it fails, the JSON remains unchanged.
+        png.unlink()
+        updated = copy.deepcopy(original)
+        updated["templates"] = [record for record in records if record.get("id") != feature_id]
+        updated["updated_at"] = _utc_now()
+        _atomic_write_json(path, updated)
+        _validate_json(path)
+    except Exception:
+        # Restore the original JSON if anything after the PNG deletion fails.
+        try:
+            _validate_json(backup)
+            shutil.copy2(backup, path)
+            _validate_json(path)
+        except Exception as restore_error:
+            raise RuntimeError(f"Deletion failed and JSON rollback failed: {restore_error}") from restore_error
+        raise
 
 
 class MemoryTab(ttk.Frame):
