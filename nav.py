@@ -51,7 +51,7 @@ class HoldWorkerState:
     chunk_ms: int
 
 
-_HOLD_LOCK = threading.Lock()
+_HOLD_LOCK = threading.RLock()
 _HOLD_THREAD: Optional[threading.Thread] = None
 _HOLD_STOP_EVENT: Optional[threading.Event] = None
 _HOLD_ACTIVE_SIDE: Optional[str] = None
@@ -291,13 +291,13 @@ def annotate_known(frame: Any, objects: list[tuple[str, str, int, int, int, int,
 
 
 def memory_summary(project_dir: str | Path) -> str:
-    counts = {"loot": 0, "mob": 0, "event_choice": 0, "event_skip": 0}
+    counts = {"loot": 0, "mob": 0, "event_choice": 0, "event_skip": 0, "skip": 0}
     for item in _load_actions_list(project_dir):
         action = str(item.get("action", "")).strip()
         if action in counts:
             counts[action] += 1
     events = counts["event_choice"] + counts["event_skip"]
-    return f"В памяти: лут {counts['loot']}, мобы {counts['mob']}, события {events}"
+    return f"В памяти: лут {counts['loot']}, мобы {counts['mob']}, события {events}, пропуски {counts['skip']}"
 
 
 def match_known(project_dir: str | Path, crop: Any) -> Optional[str]:
@@ -415,7 +415,6 @@ def release(project_dir: str | Path = ".", log: Callable[..., Any] = print) -> N
 def approach_target(project_dir: str | Path, template: Any, log: Callable[..., Any] = print, stop_event: Any = None) -> tuple[bool, str]:
     runtime = _build_runtime(project_dir, log=log)
     settings = _settings(project_dir, log=log)
-    threshold = settings["match_threshold"]
     click_radius_px = int(settings["click_radius_px"])
     timeout_s = float(settings["approach_timeout_s"])
     frame_interval_ms = int(settings["frame_interval_ms"])
@@ -441,13 +440,15 @@ def approach_target(project_dir: str | Path, template: Any, log: Callable[..., A
             _log(log, f"approach decision dx={dx} radius={click_radius_px} hold_side={side} hold_chunk_ms={settings['hold_chunk_ms']} score={score:.3f}")
             if current_side != side:
                 release(project_dir=project_dir, log=log)
-                hold(side, project_dir=project_dir, log=log)
+                if not hold(side, project_dir=project_dir, log=log):
+                    return False, f"hold failed: {side}"
                 current_side = side
             if last_dx is not None and ((last_dx > 0 > dx) or (last_dx < 0 < dx)):
                 release(project_dir=project_dir, log=log)
                 back_side = "left" if side == "right" else "right"
                 _log(log, f"approach overshoot prev_dx={last_dx} new_dx={dx}; corrective_hold={back_side}")
-                hold(back_side, project_dir=project_dir, log=log)
+                if not hold(back_side, project_dir=project_dir, log=log):
+                    return False, f"hold failed: {back_side}"
                 time.sleep(max(0.05, frame_interval_ms / 2000.0))
                 release(project_dir=project_dir, log=log)
                 current_side = None
@@ -490,7 +491,8 @@ def click_loot(project_dir: str | Path, template: Any, log: Callable[..., Any] =
     if not ok:
         return False, reason
     frame = runtime.screenshot.capture()
-    return (_click_center(runtime, find_template(project_dir, template, frame=frame), log), "loot clicked")
+    clicked = _click_center(runtime, find_template(project_dir, template, frame=frame), log)
+    return clicked, ("loot clicked" if clicked else "loot target missing after approach")
 
 
 def attack_mob(project_dir: str | Path, template: Any, log: Callable[..., Any] = print, stop_event: Any = None) -> tuple[bool, str]:
@@ -499,7 +501,8 @@ def attack_mob(project_dir: str | Path, template: Any, log: Callable[..., Any] =
     if not ok:
         return False, reason
     frame = runtime.screenshot.capture()
-    return (_click_center(runtime, find_template(project_dir, template, frame=frame), log), "mob attacked")
+    clicked = _click_center(runtime, find_template(project_dir, template, frame=frame), log)
+    return clicked, ("mob attacked" if clicked else "mob target missing after approach")
 
 
 def handle_event(project_dir: str | Path, template: Any, log: Callable[..., Any] = print, stop_event: Any = None) -> tuple[bool, str]:
@@ -508,7 +511,8 @@ def handle_event(project_dir: str | Path, template: Any, log: Callable[..., Any]
     if not ok:
         return False, reason
     frame = runtime.screenshot.capture()
-    return (_click_center(runtime, find_template(project_dir, template, frame=frame), log), "event opened")
+    clicked = _click_center(runtime, find_template(project_dir, template, frame=frame), log)
+    return clicked, ("event opened" if clicked else "event target missing after approach")
 
 
 def start_battle(project_dir: str | Path, log: Callable[..., Any] = print, stop_event: Any = None) -> tuple[bool, str]:
@@ -516,6 +520,8 @@ def start_battle(project_dir: str | Path, log: Callable[..., Any] = print, stop_
     nav, _ = _read_nav(project_dir)
     autobattle_png = _resolve_path(project_dir, nav.get("autobattle_on", {}).get("png") if isinstance(nav.get("autobattle_on"), dict) else nav.get("autobattle_on"))
     enter_png = _resolve_path(project_dir, nav.get("enter_dungeon", {}).get("png") if isinstance(nav.get("enter_dungeon"), dict) else nav.get("enter_dungeon"))
+    if stop_event is not None and stop_event.is_set():
+        return False, "stopped"
     if enter_png is None:
         return False, "enter_dungeon template missing"
     frame, _ = _stable_wait(runtime, 4.0, log)
@@ -523,12 +529,16 @@ def start_battle(project_dir: str | Path, log: Callable[..., Any] = print, stop_
     if not started:
         return False, "failed to start battle"
     time.sleep(1.0)
+    if stop_event is not None and stop_event.is_set():
+        return False, "stopped"
     if autobattle_png is not None:
         battle_frame = runtime.screenshot.capture()
         found, x, y, dx, score = find_template(project_dir, str(autobattle_png), frame=battle_frame)
         _log(log, f"autobattle state found={found} score={score:.3f}")
         if not found:
-            _log(log, "autobattle not detected as ON; tapping autobattle control is not implemented separately")
+            _log(log, "autobattle is OFF; enabling autobattle")
+            runtime.adb.tap(int(x), int(y))
+            time.sleep(0.5)
     return True, "battle started"
 
 
@@ -605,6 +615,8 @@ def _go_path(project_dir: str | Path, location_name: str, log: Callable[..., Any
         icon_tpl = chain["location_icon"]
         floor_tpl = chain["farm_floor_button"]
         enter_tpl = chain["enter_dungeon"]
+        if stop_event is not None and stop_event.is_set():
+            return False, "stopped"
         frame, _ = _stable_wait(runtime, 4.0, log)
         if base_tpl:
             found, x, y, dx, score = find_template(project_dir, base_tpl, frame=frame)
@@ -612,10 +624,14 @@ def _go_path(project_dir: str | Path, location_name: str, log: Callable[..., Any
             if found:
                 runtime.adb.tap(x, y)
                 time.sleep(1.0)
+        if stop_event is not None and stop_event.is_set():
+            return False, "stopped"
         frame, _ = _stable_wait(runtime, 4.0, log)
         if map_tpl:
             found, x, y, dx, score = find_template(project_dir, map_tpl, frame=frame)
             _log(log, f"locations_map score={score:.3f} found={found}")
+        if stop_event is not None and stop_event.is_set():
+            return False, "stopped"
         frame, _ = _stable_wait(runtime, 4.0, log)
         found, x, y, dx, score = find_template(project_dir, icon_tpl, frame=frame)
         _log(log, f"location_icon score={score:.3f} found={found}")
@@ -623,6 +639,8 @@ def _go_path(project_dir: str | Path, location_name: str, log: Callable[..., Any
             return False, "location icon not found"
         runtime.adb.tap(x, y)
         time.sleep(1.0)
+        if stop_event is not None and stop_event.is_set():
+            return False, "stopped"
         frame, _ = _stable_wait(runtime, 4.0, log)
         found, x, y, dx, score = find_template(project_dir, floor_tpl, frame=frame)
         _log(log, f"farm_floor_button score={score:.3f} found={found}")
@@ -630,6 +648,8 @@ def _go_path(project_dir: str | Path, location_name: str, log: Callable[..., Any
             return False, "farm floor button not found"
         runtime.adb.tap(x, y)
         time.sleep(1.0)
+        if stop_event is not None and stop_event.is_set():
+            return False, "stopped"
         frame, _ = _stable_wait(runtime, 4.0, log)
         found, x, y, dx, score = find_template(project_dir, enter_tpl, frame=frame)
         _log(log, f"enter_dungeon score={score:.3f} found={found}")
