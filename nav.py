@@ -410,8 +410,10 @@ def release(project_dir: str | Path = ".", log: Callable[..., Any] = print) -> N
         if _HOLD_STOP_EVENT is not None:
             _HOLD_STOP_EVENT.set()
         if _probe_motionevent(runtime):
+            points = _joystick(project_dir)
+            up_x, up_y = points.get(active or "", (1, 1))
             try:
-                runtime.adb.shell("input motionevent UP 1 1")
+                runtime.adb.shell(f"input motionevent UP {up_x} {up_y}")
             except Exception:
                 pass
         if _HOLD_THREAD is not None and _HOLD_THREAD.is_alive():
