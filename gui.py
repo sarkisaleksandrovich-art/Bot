@@ -125,6 +125,7 @@ class GuiApp:
         self.current_thread: threading.Thread | None = None
         self.stop_requested = False
         self.exit_code = 0
+        self._closing = False
 
         self.profile_combo: ttk.Combobox | None = None
         self.stop_button: ttk.Button | None = None
@@ -317,11 +318,14 @@ class GuiApp:
                     self.current_thread = None
                     self._set_running_state(False)
                     self.status_var.set("Процесс остановлен" if self.stop_requested else "Готово")
+                    if self._closing:
+                        self.root.after(0, self.root.destroy)
                     continue
                 self._append_log(item)
         except queue.Empty:
             pass
-        self.root.after(100, self._poll_log_queue)
+        if not self._closing or self.current_process is not None:
+            self.root.after(100, self._poll_log_queue)
 
     def stop_process(self) -> None:
         process = self.current_process
@@ -355,8 +359,11 @@ class GuiApp:
                 "Есть активный процесс. Остановить его и выйти?",
             ):
                 return
+            self._closing = True
             self.stop_process()
-        self.root.after(200, self.root.destroy)
+            return
+        self._closing = True
+        self.root.destroy()
 
     def run(self) -> int:
         self.root.mainloop()
