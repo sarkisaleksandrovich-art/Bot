@@ -329,8 +329,7 @@ def launch_gui(profile: str | None = None) -> int:
 
 
 def main() -> int:
-    profile = sys.argv[1] if len(sys.argv) > 1 else None
-    return launch_gui(profile=profile)
+    return launch_gui()
 
 
 if __name__ == "__main__":
