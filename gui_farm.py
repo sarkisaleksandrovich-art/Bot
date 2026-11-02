@@ -31,6 +31,7 @@ ACTION_LABELS = {
     "event_skip": "Событие: пропустить",
     "skip": "Пропустить объект",
 }
+VALID_ACTIONS = {"loot", "mob", "event_choice", "event_skip", "skip"}
 
 
 class ControlTab(ttk.Frame):
@@ -49,6 +50,8 @@ class ControlTab(ttk.Frame):
         self._manual_dialog_open = False
         self._matched_action: str | None = None
         self._matched_score: float | None = None
+        self._matched_name: str | None = None
+        self._matched_png: str | None = None
 
         self.location_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Готово")
@@ -124,7 +127,7 @@ class ControlTab(ttk.Frame):
             return
         self.listener_started = True
         if pynput_keyboard is None:
-            self.log("pynput не установлена: глобальные Num-клавиши работают только при фокусе окна бота. Подсказка: pip install pynput")
+            self.log("pynput не установлен: глобальные Num-клавиши работают только при фокусе окна бота. Подсказка: pip install pynput")
             return
 
         def worker() -> None:
@@ -331,6 +334,8 @@ class ControlTab(ttk.Frame):
         self._manual_dialog_open = True
         self._matched_action = None
         self._matched_score = None
+        self._matched_name = None
+        self._matched_png = None
         try:
             result = capture_region(self, "Выделите рамкой объект. Объекты без рамки на предыдущем скриншоте считаются новыми.")
             if not result:
@@ -345,6 +350,8 @@ class ControlTab(ttk.Frame):
             replace_known = False
             matched_action: str | None = None
             matched_score: float | None = None
+            matched_name: str | None = None
+            matched_png: str | None = None
             if isinstance(matched, tuple) and len(matched) >= 1:
                 matched_action = str(matched[0]).strip() or None
                 if len(matched) >= 2:
@@ -352,11 +359,17 @@ class ControlTab(ttk.Frame):
                         matched_score = float(matched[1])
                     except Exception:
                         matched_score = None
+                if len(matched) >= 3:
+                    matched_name = str(matched[2]).strip() or None
+                if len(matched) >= 4:
+                    matched_png = str(matched[3]).strip() or None
             elif isinstance(matched, str):
                 matched_action = matched.strip() or None
             if matched_action:
                 self._matched_action = matched_action
                 self._matched_score = matched_score
+                self._matched_name = matched_name
+                self._matched_png = matched_png
                 decision = self._ask_known_match(ACTION_LABELS.get(matched_action, matched_action), matched_score)
                 if decision == "cancel":
                     return
@@ -399,7 +412,7 @@ class ControlTab(ttk.Frame):
         if choice == "continue":
             self.do_start()
             return
-        if choice in {"loot", "mob", "event_choice", "event_skip", "skip"}:
+        if choice in VALID_ACTIONS:
             try:
                 self._save_action_memory(crop, choice, replace=replace_known)
             except Exception as exc:
@@ -457,32 +470,50 @@ class ControlTab(ttk.Frame):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _save_action_memory(self, crop: Any, action: str, replace: bool = False) -> None:
-        base_dir = self.project_dir / "data" / "base"
-        base_dir.mkdir(parents=True, exist_ok=True)
-        actions_path = base_dir / "actions.json"
-        png_name = f"manual_{int(time.time() * 1000)}.png"
-        if cv2 is None or not cv2.imwrite(str(base_dir / png_name), crop):
-            raise RuntimeError("Не удалось сохранить шаблон объекта")
+    def _load_actions_data(self) -> dict[str, Any]:
+        actions_path = self.project_dir / "data" / "base" / "actions.json"
         try:
             data = json.loads(actions_path.read_text(encoding="utf-8")) if actions_path.exists() else {}
         except Exception:
             data = {}
         if not isinstance(data, dict):
             data = {}
-        objects = data.get("objects")
+        objects = data.get("objects", data.get("actions", data.get("templates", [])))
         if not isinstance(objects, list):
             objects = []
-            data["objects"] = objects
+        data["objects"] = [item for item in objects if isinstance(item, dict)]
+        return data
+
+    def _save_action_memory(self, crop: Any, action: str, replace: bool = False) -> None:
+        if action not in VALID_ACTIONS:
+            raise ValueError(f"Недопустимое действие: {action}")
+        base_dir = self.project_dir / "data" / "base"
+        base_dir.mkdir(parents=True, exist_ok=True)
+        actions_path = base_dir / "actions.json"
+        png_name = f"manual_{int(time.time() * 1000)}.png"
+        if cv2 is None or not cv2.imwrite(str(base_dir / png_name), crop):
+            raise RuntimeError("Не удалось сохранить шаблон объекта")
+        data = self._load_actions_data()
+        objects = data["objects"]
+        record_name = self._matched_name or f"manual_{action}_{int(time.time())}"
         record = {
-            "name": f"manual_{action}_{int(time.time())}",
+            "name": record_name,
             "png": png_name,
             "action": action,
         }
         if replace and self._matched_action:
             replaced = False
             for index, item in enumerate(objects):
-                if isinstance(item, dict) and str(item.get("action", "")).strip() == self._matched_action:
+                item_action = str(item.get("action", "")).strip()
+                item_name = str(item.get("name", "")).strip()
+                item_png = str(item.get("png") or item.get("template") or item.get("file") or "").strip()
+                if item_action != self._matched_action:
+                    continue
+                if self._matched_name and item_name == self._matched_name:
+                    objects[index] = record
+                    replaced = True
+                    break
+                if self._matched_png and item_png == self._matched_png:
                     objects[index] = record
                     replaced = True
                     break
@@ -490,7 +521,7 @@ class ControlTab(ttk.Frame):
                 objects.append(record)
         else:
             objects.append(record)
-        actions_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        actions_path.write_text(json.dumps({"objects": objects}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     def on_loot(self) -> None:
         self._manual_target_action("loot")
