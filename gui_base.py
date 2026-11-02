@@ -608,17 +608,16 @@ class SettingsTab(ttk.Frame):
             return
         self._capture_busy = True
         self.busy_var.set("Идёт захват скриншота...")
+        self.after(0, lambda: self._capture_single_template_ui(key, prompt))
 
-        def worker() -> None:
-            try:
-                result = capture_region(self, prompt)
-                error = None
-            except Exception as exc:
-                result = None
-                error = exc
-            self.after(0, lambda: self._after_template_capture(key, result, error))
-
-        threading.Thread(target=worker, daemon=True).start()
+    def _capture_single_template_ui(self, key: str, prompt: str) -> None:
+        try:
+            result = capture_region(self, prompt)
+            error = None
+        except Exception as exc:
+            result = None
+            error = exc
+        self._after_template_capture(key, result, error)
 
     def _after_template_capture(self, key: str, result, error: Exception | None) -> None:
         self._capture_busy = False
@@ -642,17 +641,16 @@ class SettingsTab(ttk.Frame):
             return
         self._capture_busy = True
         self.busy_var.set("Идёт захват скриншота...")
+        self.after(0, lambda: self._bind_location_ui(index, prompt))
 
-        def worker() -> None:
-            try:
-                result = capture_region(self, prompt)
-                error = None
-            except Exception as exc:
-                result = None
-                error = exc
-            self.after(0, lambda: self._after_location_capture(index, result, error))
-
-        threading.Thread(target=worker, daemon=True).start()
+    def _bind_location_ui(self, index: int, prompt: str) -> None:
+        try:
+            result = capture_region(self, prompt)
+            error = None
+        except Exception as exc:
+            result = None
+            error = exc
+        self._after_location_capture(index, result, error)
 
     def _after_location_capture(self, index: int, result, error: Exception | None) -> None:
         self._capture_busy = False
