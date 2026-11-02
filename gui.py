@@ -8,7 +8,7 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
-from typing import Any, Callable
+from typing import Any
 
 BOT_ACTIONS: tuple[tuple[str, str, bool], ...] = (
     ("Проверка", "--check", False),
@@ -69,7 +69,7 @@ class BotTab(ttk.Frame):
 
         ttk.Button(
             profile_row,
-            text="Обновить список",
+            text="Обновить",
             command=self.app.reload_profiles,
         ).pack(side=tk.LEFT, padx=(10, 0))
 
@@ -235,7 +235,7 @@ class GuiApp:
         self.log(f"[GUI] Выбран профиль: {self.profile_var.get().strip()}")
 
     def log(self, text: str) -> None:
-        self._append_log(text)
+        self.log_queue.put(text)
 
     def _append_log(self, text: str) -> None:
         if self.log_text is None:
@@ -363,17 +363,17 @@ class GuiApp:
         return self.exit_code
 
 
-def start_farm_navigation(location_id: str, floor_number: int) -> Any:
+def start_farm_navigation(location_id: str, floor_number: int, stop_event: threading.Event | None = None) -> Any:
     """Delegate farm navigation to nav.go_to_dungeon using the real nav.py API."""
     import nav
 
-    stop_event = threading.Event()
+    actual_stop_event = stop_event if stop_event is not None else threading.Event()
     ok, reason = nav.go_to_dungeon(
         Path(__file__).resolve().parent,
         location_id,
         str(floor_number),
         log=print,
-        stop_event=stop_event,
+        stop_event=actual_stop_event,
     )
     return ok, reason
 
