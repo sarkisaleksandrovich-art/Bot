@@ -1,15 +1,7 @@
-"""Template-driven dungeon navigation.
-
-The module deliberately keeps the public legacy API, while the real device path
-is used when an ADB controller/screenshot/vision triple is supplied by the host.
-The screen classifier is conservative: it reports UNKNOWN when no template can
-be proven, rather than guessing. Device execution is not verified in CI.
-"""
 from __future__ import annotations
 
 import argparse
 import json
-import logging
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -82,7 +74,6 @@ def _location(data: dict[str, Any], name: str) -> Optional[dict[str, Any]]:
 
 
 def nav_status(project_dir: str | Path) -> dict[str, Any]:
-    """Return readiness of every configured link in the navigation chain."""
     data, error = _read_nav(project_dir)
     if error:
         return {"ready": False, "error": error, "steps": {"profile": False}}
@@ -91,26 +82,26 @@ def nav_status(project_dir: str | Path) -> dict[str, Any]:
     enter = data.get("enter_dungeon", {})
     steps: dict[str, Any] = {
         "profile": True,
-        "base_to_locations": _png(project_dir, base.get("png") if isinstance(base, dict) else None) is not None,
-        "enter_dungeon": _png(project_dir, enter.get("png") if isinstance(enter, dict) else None) is not None,
+        "base_to_locations": _png(project_dir, base.get("png")) if isinstance(base, dict) else None,
+        "enter_dungeon": _png(project_dir, enter.get("png")) if isinstance(enter, dict) else None,
         "locations": [],
     }
     for item in _locations(data):
         if not isinstance(item, dict):
             continue
-        floors = []
-        for floor in item.get("floors", []) if isinstance(item.get("floors", []), list) else []:
+        floors = item.get("floors", [])
+        floor_status = []
+        for floor in floors if isinstance(floors, list) else []:
             if isinstance(floor, dict):
-                floors.append({"name": floor.get("name"), "ready": _png(project_dir, floor.get("png")) is not None})
+                floor_status.append({"name": floor.get("name"), "ready": _png(project_dir, floor.get("png")) is not None})
         icon_ok = _png(project_dir, item.get("png")) is not None
-        steps["locations"].append({"slot": item.get("slot"), "name": item.get("name"), "ready": icon_ok and bool(floors) and all(f["ready"] for f in floors), "icon": icon_ok, "floors": floors})
+        steps["locations"].append({"slot": item.get("slot"), "name": item.get("name"), "ready": icon_ok and bool(floor_status) and all(x["ready"] for x in floor_status), "icon": icon_ok, "floors": floor_status})
     steps["locations_ready"] = bool(steps["locations"]) and all(x["ready"] for x in steps["locations"])
     steps["ready"] = bool(steps["base_to_locations"] and steps["enter_dungeon"] and steps["locations_ready"])
     return {"ready": steps["ready"], "error": None, "steps": steps}
 
 
 class NavigationController:
-    """Small retrying FSM. Dependencies are optional for offline validation."""
     def __init__(self, project_dir: str | Path, log: Callable[..., Any] = print, stop_event: Any = None, *, adb: Any = None, screenshot: Any = None, vision: Any = None, **_: Any):
         self.project_dir = Path(project_dir).resolve()
         self.log, self.stop_event = log, stop_event
@@ -164,7 +155,6 @@ class NavigationController:
 
 
 def go_to_dungeon(project_dir: str | Path, location_name: str, floor_name: str, log: Callable[..., Any] = print, stop_event: Any = None) -> tuple[bool, str]:
-    """Navigate and return ``(success, reason)``. Device wiring is host-specific."""
     try:
         floor = int(floor_name)
     except (TypeError, ValueError):
@@ -176,12 +166,11 @@ def go_to_dungeon(project_dir: str | Path, location_name: str, floor_name: str, 
 
 
 def verify_chain(project_dir: str | Path, location_name: str, floor_name: str, log: Callable[..., Any] = print) -> bool:
-    """Validate profile/templates and exercise the same path without farm logic."""
     status = nav_status(project_dir)
     if not status["ready"]:
         log(status.get("error") or "navigation profile is incomplete")
         return False
-    ok, reason = go_to_dungeon(project_dir, location_name, floor_name, log=log)
+    ok, _ = go_to_dungeon(project_dir, location_name, floor_name, log=log)
     return ok
 
 
