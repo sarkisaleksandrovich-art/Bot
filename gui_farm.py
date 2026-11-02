@@ -1,302 +1,247 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+from gui_base import capture_region
 
-class FarmTab(ttk.Frame):
-    """Farm panel: choose taught location/floor/profile and run nav -> main."""
+try:
+    import cv2  # type: ignore
+except Exception:  # pragma: no cover
+    cv2 = None
 
+try:
+    from pynput import keyboard as pynput_keyboard  # type: ignore
+except Exception:  # pragma: no cover
+    pynput_keyboard = None
+
+
+ACTION_LABELS = {
+    "loot": "Лут",
+    "mob": "Моб",
+    "event_choice": "Событие",
+    "event_skip": "Событие: пропустить",
+    "skip": "Пропустить объект",
+}
+
+
+class ControlTab(ttk.Frame):
     def __init__(self, parent, app):
-        super().__init__(parent, padding=12)
+        super().__init__(parent, padding=10)
         self.app = app
-        self.project_dir = Path(getattr(app, "project_dir", Path(__file__).resolve().parent)).resolve()
-        self.running = False
+        self.project_dir = Path(getattr(app, "project_dir", ".")).resolve()
         self.stop_event = threading.Event()
-        self.worker: threading.Thread | None = None
-        self.process: subprocess.Popen[str] | None = None
+        self.nav_thread: threading.Thread | None = None
+        self.main_thread: threading.Thread | None = None
+        self.main_process: subprocess.Popen[str] | None = None
+        self.listener_thread: threading.Thread | None = None
+        self.hotkey_listener = None
+        self.listener_started = False
+        self.running = False
+        self.paused_by_stop = False
+        self._stop_snapshot_busy = False
 
-        self.location_var = tk.StringVar()
-        self.floor_var = tk.StringVar()
-        self.profile_var = tk.StringVar(value=getattr(app, "profile_var", tk.StringVar(value="")).get())
-        self.status_var = tk.StringVar(value="Готовность: ✗")
+        self.location_var = tk.StringVar(value="")
+        self.status_var = tk.StringVar(value="Готово")
+        self.location_names: list[str] = []
 
-        self.chain_vars = {
-            "base_to_locations": tk.StringVar(value="✗ Вход в локации"),
-            "location_icon": tk.StringVar(value="✗ Иконка локации"),
-            "floor": tk.StringVar(value="✗ Этаж"),
-            "enter_dungeon": tk.StringVar(value="✗ В данж"),
-        }
+        self._build_ui()
+        self._bind_focus_hotkeys()
+        self._start_hotkey_listener_once()
+        self.reload_locations()
+        self.refresh_ready_state()
 
-        self._build()
-        self._reload_profiles()
-        self._reload_locations()
-        self._refresh_ready_state()
-
-    def _build(self) -> None:
-        ttk.Label(self, text="Фарм", font=("TkDefaultFont", 15, "bold")).pack(anchor="w")
+    def _build_ui(self) -> None:
+        ttk.Label(self, text="Управление", font=("TkDefaultFont", 14, "bold")).pack(anchor="w")
         ttk.Label(
             self,
-            text=(
-                "Локации и этажи берутся из data/base/nav.json. "
-                "Если чего-то нет, сначала обучите это на вкладке «Навигация»."
-            ),
-            wraplength=950,
+            text="Без ручного ввода этажей. Локации берутся из data/base/nav.json, кнопка Старт доступна только когда цепочка настроена.",
+            wraplength=1000,
             justify=tk.LEFT,
-        ).pack(anchor="w", pady=(4, 10))
+        ).pack(anchor="w", pady=(4, 8))
 
-        controls = ttk.Frame(self)
-        controls.pack(fill="x", pady=(0, 10))
+        top = ttk.Frame(self)
+        top.pack(fill="x", pady=(0, 8))
 
-        ttk.Label(controls, text="Локация").grid(row=0, column=0, sticky="w")
-        self.location_combo = ttk.Combobox(
-            controls,
-            textvariable=self.location_var,
-            state="readonly",
-            width=30,
-        )
-        self.location_combo.grid(row=0, column=1, sticky="w", padx=(6, 16))
-        self.location_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_location_changed())
+        ttk.Label(top, text="Локация").grid(row=0, column=0, sticky="w")
+        self.location_combo = ttk.Combobox(top, textvariable=self.location_var, state="readonly", width=36)
+        self.location_combo.grid(row=0, column=1, sticky="w", padx=(8, 10))
+        self.location_combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh_ready_state())
+        ttk.Button(top, text="Обновить", command=self._on_reload).grid(row=0, column=2, sticky="w")
 
-        ttk.Label(controls, text="Этаж").grid(row=0, column=2, sticky="w")
-        self.floor_combo = ttk.Combobox(
-            controls,
-            textvariable=self.floor_var,
-            state="readonly",
-            width=26,
-        )
-        self.floor_combo.grid(row=0, column=3, sticky="w", padx=(6, 16))
-        self.floor_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_ready_state())
-
-        ttk.Label(controls, text="Профиль").grid(row=0, column=4, sticky="w")
-        self.profile_combo = ttk.Combobox(
-            controls,
-            textvariable=self.profile_var,
-            state="readonly",
-            width=24,
-        )
-        self.profile_combo.grid(row=0, column=5, sticky="w", padx=(6, 0))
-
-        status_box = ttk.LabelFrame(self, text="Готовность цепочки", padding=8)
-        status_box.pack(fill="x", pady=(0, 10))
-        for key in ("base_to_locations", "location_icon", "floor", "enter_dungeon"):
-            ttk.Label(status_box, textvariable=self.chain_vars[key]).pack(anchor="w", pady=1)
-
-        ttk.Label(self, textvariable=self.status_var).pack(anchor="w", pady=(0, 10))
-
-        floors_box = ttk.LabelFrame(self, text="Сохранённые этажи выбранной локации", padding=8)
-        floors_box.pack(fill="both", expand=True, pady=(0, 10))
-        self.floor_list = tk.Listbox(floors_box, height=8, exportselection=False)
-        self.floor_list.pack(fill="both", expand=True)
-        self.floor_list.bind("<<ListboxSelect>>", self._select_floor_from_list)
-
-        buttons = ttk.Frame(self)
-        buttons.pack(fill="x")
-        self.start_button = ttk.Button(buttons, text="Старт", command=self._start, state="disabled")
+        actions = ttk.Frame(self)
+        actions.pack(fill="x", pady=(0, 8))
+        self.start_button = ttk.Button(actions, text="Старт (Num1)", command=self.on_start, state=tk.DISABLED)
         self.start_button.pack(side="left")
-        self.stop_button = ttk.Button(buttons, text="Стоп", command=self._stop, state="disabled")
+        self.stop_button = ttk.Button(actions, text="Стоп (Num2)", command=self.on_stop, state=tk.DISABLED)
         self.stop_button.pack(side="left", padx=(8, 0))
-        ttk.Button(buttons, text="Обновить", command=self._full_reload).pack(side="left", padx=(8, 0))
+        self.event_button = ttk.Button(actions, text="Событие (Num3)", command=self.on_event)
+        self.event_button.pack(side="left", padx=(16, 0))
+        self.loot_button = ttk.Button(actions, text="Лут", command=self.on_loot)
+        self.loot_button.pack(side="left", padx=(8, 0))
+        self.mob_button = ttk.Button(actions, text="Моб", command=self.on_mob)
+        self.mob_button.pack(side="left", padx=(8, 0))
 
-    def _nav_data(self) -> dict[str, Any]:
+        ttk.Label(self, textvariable=self.status_var).pack(anchor="w", pady=(0, 8))
+
+        if not getattr(self.app, "full_stop_button", None):
+            container = getattr(self.app, "root", self.winfo_toplevel())
+            bottom = ttk.Frame(container)
+            bottom.pack(side="bottom", fill="x", padx=10, pady=(0, 10))
+            button = tk.Button(
+                bottom,
+                text="Полная остановка (Num0)",
+                command=self.on_full_stop,
+                bg="#b71c1c",
+                fg="white",
+                activebackground="#d32f2f",
+                activeforeground="white",
+                relief="raised",
+                padx=10,
+                pady=6,
+            )
+            button.pack(fill="x")
+            self.app.full_stop_button = button
+
+    def _bind_focus_hotkeys(self) -> None:
+        root = getattr(self.app, "root", self.winfo_toplevel())
+        root.bind("<KP_1>", lambda _e: self.on_start())
+        root.bind("<KP_2>", lambda _e: self.on_stop())
+        root.bind("<KP_3>", lambda _e: self.on_event())
+        root.bind("<KP_0>", lambda _e: self.on_full_stop())
+
+    def _start_hotkey_listener_once(self) -> None:
+        if self.listener_started:
+            return
+        self.listener_started = True
+        if pynput_keyboard is None:
+            self.log("pynput не установлен: глобальные Num-клавиши работают только при фокусе окна. Подсказка: pip install pynput")
+            return
+
+        def worker() -> None:
+            def on_press(key) -> None:
+                vk = getattr(key, "vk", None)
+                if vk == 97:
+                    self.after(0, self.on_start)
+                elif vk == 98:
+                    self.after(0, self.on_stop)
+                elif vk == 99:
+                    self.after(0, self.on_event)
+                elif vk == 96:
+                    self.after(0, self.on_full_stop)
+
+            self.hotkey_listener = pynput_keyboard.Listener(on_press=on_press)
+            self.hotkey_listener.daemon = True
+            self.hotkey_listener.start()
+            self.hotkey_listener.join()
+
+        self.listener_thread = threading.Thread(target=worker, daemon=True)
+        self.listener_thread.start()
+
+    def _read_nav_json(self) -> dict[str, Any]:
+        path = self.project_dir / "data" / "base" / "nav.json"
         try:
-            import json
-
-            path = self.project_dir / "data" / "base" / "nav.json"
-            value = json.loads(path.read_text(encoding="utf-8"))
-            return value if isinstance(value, dict) else {}
+            data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return {}
+        return data if isinstance(data, dict) else {}
 
-    def _locations(self) -> list[dict[str, Any]]:
-        data = self._nav_data()
-        value = data.get("locations", [])
-        return [item for item in value if isinstance(item, dict) and str(item.get("name", "")).strip()]
+    def reload_locations(self) -> None:
+        data = self._read_nav_json()
+        raw_locations = data.get("locations", []) if isinstance(data.get("locations"), list) else []
+        names = []
+        for item in raw_locations:
+            if isinstance(item, dict):
+                name = str(item.get("name", "")).strip()
+                if name:
+                    names.append(name)
+        self.location_names = names[:7]
+        self.location_combo["values"] = self.location_names
+        if self.location_var.get().strip() not in self.location_names:
+            self.location_var.set(self.location_names[0] if self.location_names else "")
 
-    def _selected_location(self) -> dict[str, Any] | None:
-        name = self.location_var.get().strip()
-        for item in self._locations():
-            if str(item.get("name", "")).strip() == name:
-                return item
-        return None
+    def _on_reload(self) -> None:
+        self.reload_locations()
+        self.refresh_ready_state()
 
-    def _reload_profiles(self) -> None:
-        profiles_root = self.project_dir / "data" / "profiles"
-        profiles = sorted(
-            item.name
-            for item in profiles_root.iterdir()
-            if item.is_dir() and item.name != "base"
-        ) if profiles_root.exists() else []
-        if not profiles:
-            profiles = ["loc1"]
-        self.profile_combo["values"] = profiles
-        if self.profile_var.get().strip() not in profiles:
-            self.profile_var.set(profiles[0])
-
-    def _reload_locations(self) -> None:
-        names = [str(item.get("name", "")).strip() for item in self._locations()]
-        self.location_combo["values"] = names
-        if self.location_var.get().strip() not in names:
-            self.location_var.set(names[0] if names else "")
-        self._reload_floors()
-
-    def _reload_floors(self) -> None:
-        location = self._selected_location()
-        floors = location.get("floors", []) if isinstance(location, dict) else []
-        names = [str(item.get("name", "")).strip() for item in floors if isinstance(item, dict) and str(item.get("name", "")).strip()]
-        self.floor_combo["values"] = names
-        if self.floor_var.get().strip() not in names:
-            self.floor_var.set(names[0] if names else "")
-
-        self.floor_list.delete(0, tk.END)
-        for name in names:
-            self.floor_list.insert(tk.END, name)
-        if self.floor_var.get().strip() in names:
-            idx = names.index(self.floor_var.get().strip())
-            self.floor_list.selection_clear(0, tk.END)
-            self.floor_list.selection_set(idx)
-        self._refresh_ready_state()
-
-    def _on_location_changed(self) -> None:
-        self._reload_floors()
-
-    def _select_floor_from_list(self, _event=None) -> None:
-        selection = self.floor_list.curselection()
-        if selection:
-            self.floor_var.set(self.floor_list.get(selection[0]))
-            self._refresh_ready_state()
-
-    def _refresh_ready_state(self) -> None:
-        data = self._nav_data()
-        location = self._selected_location()
-        floor = None
-        if isinstance(location, dict):
-            for item in location.get("floors", []):
-                if isinstance(item, dict) and str(item.get("name", "")).strip() == self.floor_var.get().strip():
-                    floor = item
-                    break
-
-        base = data.get("base_to_locations") if isinstance(data.get("base_to_locations"), dict) else {}
-        enter = data.get("enter_dungeon") if isinstance(data.get("enter_dungeon"), dict) else {}
-
-        checks = {
-            "base_to_locations": bool(str(base.get("png", "")).strip()),
-            "location_icon": bool(location and str(location.get("png", "")).strip()),
-            "floor": bool(floor and str(floor.get("png", "")).strip()),
-            "enter_dungeon": bool(str(enter.get("png", "")).strip()),
-        }
-        titles = {
-            "base_to_locations": "Вход в локации",
-            "location_icon": "Иконка локации",
-            "floor": "Этаж",
-            "enter_dungeon": "В данж",
-        }
-        for key, ok in checks.items():
-            self.chain_vars[key].set(f"{'✓' if ok else '✗'} {titles[key]}")
-
-        ready = all(checks.values()) and bool(self.location_var.get().strip()) and bool(self.floor_var.get().strip())
-        self.status_var.set(
-            "Готовность: ✓ цепочка настроена"
-            if ready
-            else "Готовность: ✗ сначала обучите цепочку на вкладке «Навигация»"
-        )
-
-        self.start_button.configure(state="normal" if ready and not self.running else "disabled")
-        self.stop_button.configure(state="normal" if self.running else "disabled")
-        self.location_combo.configure(state="disabled" if self.running else "readonly")
-        self.floor_combo.configure(state="disabled" if self.running else "readonly")
-        self.profile_combo.configure(state="disabled" if self.running else "readonly")
-
-    def _full_reload(self) -> None:
-        self._reload_profiles()
-        self._reload_locations()
-        self._refresh_ready_state()
-
-    def _start(self) -> None:
-        self._refresh_ready_state()
-        if self.start_button.cget("state") == "disabled":
-            messagebox.showwarning(
-                "Фарм",
-                "Старт недоступен, пока не настроена вся цепочка: вход в локации → иконка локации → этаж → «В данж».",
-                parent=self,
-            )
-            return
+    def refresh_ready_state(self) -> None:
         try:
             import nav
+            status = nav.nav_status(self.project_dir)
         except Exception as exc:
-            messagebox.showerror("Фарм", f"Не удалось импортировать nav.py: {exc}", parent=self)
+            self.start_button.configure(state=tk.DISABLED)
+            self.status_var.set(f"Ошибка nav.py: {exc}")
             return
-        if not hasattr(nav, "go_to_dungeon"):
-            messagebox.showinfo(
-                "Фарм",
-                "В nav.py отсутствует функция go_to_dungeon(project_dir, location_name, floor_name, log, stop_event).",
-                parent=self,
-            )
+        ready = bool(status.get("ready")) and bool(self.location_var.get().strip())
+        self.start_button.configure(state=(tk.NORMAL if ready and not self.running else tk.DISABLED))
+        self.stop_button.configure(state=(tk.NORMAL if self.running else tk.DISABLED))
+        if not ready:
+            self.status_var.set("Старт заблокирован: заполните цепочку в Настройках (nav.nav_status).")
+        elif not self.running:
+            self.status_var.set("Готово")
+
+    def log(self, text: str) -> None:
+        if hasattr(self.app, "log"):
+            self.app.log(str(text))
+        else:
+            print(text)
+
+    def on_start(self) -> None:
+        self.refresh_ready_state()
+        if self.running:
             return
-
-        self.running = True
-        self.stop_event.clear()
-        self.status_var.set("Фарм: переход база → локация → этаж → «В данж»...")
-        self._refresh_ready_state()
-        self.worker = threading.Thread(target=self._run_worker, daemon=True)
-        self.worker.start()
-
-    def _run_worker(self) -> None:
-        message = "Остановлено"
+        if self.start_button.cget("state") == tk.DISABLED:
+            return
         location_name = self.location_var.get().strip()
-        floor_name = self.floor_var.get().strip()
-        profile_name = self.profile_var.get().strip()
-        try:
-            import nav
+        if not location_name:
+            return
+        self.stop_event.clear()
+        self.running = True
+        self.paused_by_stop = False
+        self.start_button.configure(state=tk.DISABLED)
+        self.stop_button.configure(state=tk.NORMAL)
+        self.status_var.set("Иду в локацию...")
 
-            ok, reason = nav.go_to_dungeon(
-                self.project_dir,
-                location_name,
-                floor_name,
-                log=self._log,
-                stop_event=self.stop_event,
-            )
-            if not ok:
-                message = f"Фарм не запущен: {reason}"
-            elif self.stop_event.is_set():
-                message = "Остановлено"
-            else:
-                code, out = self._run_main_process(profile_name)
+        def worker() -> None:
+            message = "Остановлено"
+            try:
+                import nav
+                ok, reason = nav.go_to_dungeon(self.project_dir, location_name, log=self.log, stop_event=self.stop_event)
                 if self.stop_event.is_set():
                     message = "Остановлено"
+                elif not ok:
+                    message = f"Навигация не выполнена: {reason}"
                 else:
-                    message = "Фарм завершён" if code == 0 else f"main.py завершился с кодом {code}: {out}"
-        except Exception as exc:
-            message = f"Ошибка: {exc}"
-        self.after(0, lambda: self._finish(message))
+                    battle_ok, battle_reason = nav.start_battle(self.project_dir, log=self.log, stop_event=self.stop_event)
+                    if self.stop_event.is_set():
+                        message = "Остановлено"
+                    elif not battle_ok:
+                        message = f"Не удалось запустить бой: {battle_reason}"
+                    else:
+                        code, last = self._run_main_process()
+                        if self.stop_event.is_set():
+                            message = "Остановлено"
+                        else:
+                            message = "Фарм завершён" if code == 0 else f"main.py завершился с кодом {code}: {last}"
+            except Exception as exc:
+                message = f"Ошибка: {exc}"
+            self.after(0, lambda: self._finish_run(message))
 
-    def _run_main_process(self, profile_name: str) -> tuple[int, str]:
-        command = [
-            sys.executable,
-            "main.py",
-            "--profile",
-            profile_name,
-            "--floor-from",
-            "1",
-            "--floor-to",
-            "1",
-        ]
-        self._log(f"[FARM] cmd={' '.join(command)}")
-        env = None
-        try:
-            import os
+        self.nav_thread = threading.Thread(target=worker, daemon=True)
+        self.nav_thread.start()
 
-            env = os.environ.copy()
-            env["PYTHONIOENCODING"] = "utf-8"
-        except Exception:
-            env = None
-        self.process = subprocess.Popen(
+    def _run_main_process(self) -> tuple[int, str]:
+        command = [sys.executable, "main.py", "--profile", self._selected_profile(), "--teach"]
+        self.log(f"[FARM] {' '.join(command)}")
+        self.main_process = subprocess.Popen(
             command,
             cwd=str(self.project_dir),
             stdout=subprocess.PIPE,
@@ -305,50 +250,249 @@ class FarmTab(ttk.Frame):
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=env,
         )
         last_line = ""
-        assert self.process.stdout is not None
-        for line in self.process.stdout:
+        assert self.main_process.stdout is not None
+        for line in self.main_process.stdout:
             last_line = line.rstrip("\n")
-            self._log(last_line)
-            if self.stop_event.is_set() and self.process.poll() is None:
-                self.process.terminate()
-        code = self.process.wait()
-        self.process = None
+            self.log(last_line)
+            if self.stop_event.is_set() and self.main_process.poll() is None:
+                try:
+                    self.main_process.terminate()
+                except Exception:
+                    pass
+        code = self.main_process.wait()
+        self.main_process = None
         return code, last_line
 
-    def _stop(self) -> None:
-        self.stop_event.set()
-        if self.process is not None and self.process.poll() is None:
-            try:
-                self.process.terminate()
-            except Exception:
-                pass
-        self.status_var.set("Фарм остановлен")
+    def _selected_profile(self) -> str:
+        value = getattr(getattr(self.app, "profile_var", None), "get", lambda: "")()
+        value = str(value).strip()
+        return value or "loc1"
 
-    def _finish(self, message: str) -> None:
+    def _finish_run(self, message: str) -> None:
         self.running = False
-        self.process = None
+        self.main_process = None
         self.status_var.set(message)
-        self._refresh_ready_state()
+        self.refresh_ready_state()
 
-    def _log(self, *parts: Any) -> None:
-        text = " ".join(str(part) for part in parts)
-        if hasattr(self.app, "log"):
+    def on_stop(self) -> None:
+        self.stop_event.set()
+        self.paused_by_stop = True
+        self.status_var.set("Остановка...")
+        self._terminate_main_process()
+        self._release_and_snapshot_async()
+
+    def _terminate_main_process(self) -> None:
+        if self.main_process is not None and self.main_process.poll() is None:
             try:
-                self.app.log(text)
-                return
+                self.main_process.terminate()
             except Exception:
                 pass
-        print(text)
+
+    def _release_and_snapshot_async(self) -> None:
+        if self._stop_snapshot_busy:
+            return
+        self._stop_snapshot_busy = True
+
+        def worker() -> None:
+            try:
+                import nav
+                nav.release(self.project_dir, log=self.log)
+                shot_path, frame = nav.take_screenshot(self.project_dir)
+                found = nav.find_known_objects(self.project_dir, frame)
+                annotated = nav.annotate_known(frame, found)
+                annotated_path = str(Path(shot_path).with_name(Path(shot_path).stem + "_known.png"))
+                if cv2 is not None and annotated is not None:
+                    try:
+                        cv2.imwrite(annotated_path, annotated)
+                    except Exception:
+                        annotated_path = shot_path
+                summary = nav.memory_summary(self.project_dir)
+                self.after(0, lambda: self._after_stop_snapshot(summary, shot_path, annotated_path))
+            except Exception as exc:
+                self.after(0, lambda: self._after_stop_snapshot(f"Ошибка стоп-сценария: {exc}", "", ""))
+            finally:
+                self._stop_snapshot_busy = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _after_stop_snapshot(self, summary: str, shot_path: str, annotated_path: str) -> None:
+        self.log(summary)
+        if shot_path:
+            self.log(f"Скриншот: {shot_path}")
+        if annotated_path:
+            self.log(f"Известные объекты с рамками: {annotated_path}")
+        self.status_var.set("Пауза после Стоп")
+        self.running = False
+        self.refresh_ready_state()
+        self._open_manual_stop_dialog()
+
+    def _open_manual_stop_dialog(self) -> None:
+        result = capture_region(self, "Выделите рамкой объект. Объекты без рамки на предыдущем скриншоте считаются новыми.")
+        if not result:
+            return
+        crop, _bbox = result
+        try:
+            import nav
+            known_action = nav.match_known(self.project_dir, crop)
+        except Exception as exc:
+            self.log(f"match_known ошибка: {exc}")
+            known_action = None
+        if known_action:
+            decision = self._ask_known_match(known_action)
+            if decision == "cancel":
+                return
+        self._ask_action_dialog(crop, known_action)
+
+    def _ask_known_match(self, known_action: str) -> str:
+        win = tk.Toplevel(self)
+        win.title("Совпадение с памятью")
+        win.transient(self.winfo_toplevel())
+        win.grab_set()
+        result = {"value": "cancel"}
+        ttk.Label(win, text=f"Это уже в памяти как {ACTION_LABELS.get(known_action, known_action)}", padding=12).pack(anchor="w")
+        row = ttk.Frame(win)
+        row.pack(fill="x", padx=12, pady=(0, 12))
+        ttk.Button(row, text="Оставить", command=lambda: self._close_modal(win, result, "keep")).pack(side="left")
+        ttk.Button(row, text="Заменить", command=lambda: self._close_modal(win, result, "replace")).pack(side="left", padx=(8, 0))
+        ttk.Button(row, text="Отмена", command=lambda: self._close_modal(win, result, "cancel")).pack(side="right")
+        self.wait_window(win)
+        return result["value"]
+
+    def _ask_action_dialog(self, crop: Any, remembered_action: str | None) -> None:
+        choice = self._show_action_choice_dialog(remembered_action)
+        if choice in {None, "cancel"}:
+            return
+        if choice == "full_stop":
+            self.on_full_stop()
+            return
+        if choice == "continue":
+            self.on_start()
+            return
+        if choice in {"loot", "mob", "event_choice", "event_skip", "skip"}:
+            try:
+                self._save_action_memory(crop, choice)
+            except Exception as exc:
+                self.log(f"Не удалось сохранить действие: {exc}")
+            if choice != "skip":
+                self._manual_execute_action(choice, crop)
+
+    def _show_action_choice_dialog(self, remembered_action: str | None) -> str | None:
+        win = tk.Toplevel(self)
+        win.title("Что делать с этим?")
+        win.transient(self.winfo_toplevel())
+        win.grab_set()
+        result = {"value": None}
+        ttk.Label(win, text="Что делать с этим?", padding=(12, 12, 12, 6), font=("TkDefaultFont", 11, "bold")).pack(anchor="w")
+        body = ttk.Frame(win)
+        body.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        items = [
+            (remembered_action, f"Сохранённое действие: {ACTION_LABELS.get(remembered_action, remembered_action)}") if remembered_action else None,
+            ("loot", "Лут"),
+            ("mob", "Моб"),
+            ("event_choice", "Событие: выбрать кнопку"),
+            ("event_skip", "Событие: пропустить"),
+            ("skip", "Пропустить объект"),
+            ("continue", "Продолжить фарм"),
+            ("full_stop", "Полная остановка"),
+        ]
+        for item in items:
+            if not item:
+                continue
+            value, text = item
+            style = "Accent.TButton" if remembered_action and value == remembered_action else "TButton"
+            ttk.Button(body, text=text, style=style, command=lambda v=value: self._close_modal(win, result, v)).pack(fill="x", pady=2)
+        ttk.Button(body, text="Отмена", command=lambda: self._close_modal(win, result, "cancel")).pack(fill="x", pady=(8, 0))
+        self.wait_window(win)
+        return result["value"]
+
+    def _manual_execute_action(self, action: str, crop: Any) -> None:
+        self.log("Подхожу к цели")
+
+        def worker() -> None:
+            try:
+                import nav
+                if action == "loot":
+                    ok, reason = nav.click_loot(self.project_dir, crop, log=self.log, stop_event=self.stop_event)
+                elif action == "mob":
+                    ok, reason = nav.attack_mob(self.project_dir, crop, log=self.log, stop_event=self.stop_event)
+                else:
+                    ok, reason = nav.handle_event(self.project_dir, crop, log=self.log, stop_event=self.stop_event)
+                self.log(f"Ручное действие: ok={ok}, reason={reason}")
+            except Exception as exc:
+                self.log(f"Ошибка ручного действия: {exc}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _save_action_memory(self, crop: Any, action: str) -> None:
+        base_dir = self.project_dir / "data" / "base"
+        base_dir.mkdir(parents=True, exist_ok=True)
+        actions_path = base_dir / "actions.json"
+        png_name = f"manual_{int(time.time() * 1000)}.png"
+        png_rel = png_name
+        if cv2 is None or not cv2.imwrite(str(base_dir / png_name), crop):
+            raise RuntimeError("Не удалось сохранить шаблон объекта")
+        try:
+            data = json.loads(actions_path.read_text(encoding="utf-8")) if actions_path.exists() else {}
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        objects = data.get("objects")
+        if not isinstance(objects, list):
+            objects = []
+            data["objects"] = objects
+        objects.append({
+            "name": f"manual_{action}_{int(time.time())}",
+            "png": png_rel,
+            "action": action,
+        })
+        actions_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def on_loot(self) -> None:
+        self._manual_target_action("loot")
+
+    def on_mob(self) -> None:
+        self._manual_target_action("mob")
+
+    def on_event(self) -> None:
+        self._manual_target_action("event_choice")
+
+    def _manual_target_action(self, action: str) -> None:
+        result = capture_region(self, "Выделите цель на экране")
+        if not result:
+            return
+        crop, _bbox = result
+        self._manual_execute_action(action, crop)
+
+    def on_full_stop(self) -> None:
+        self.stop_event.set()
+        self.running = False
+        self.paused_by_stop = False
+        self._terminate_main_process()
+        try:
+            import nav
+            nav.release(self.project_dir, log=self.log)
+        except Exception as exc:
+            self.log(f"release ошибка: {exc}")
+        root = getattr(self.app, "root", self.winfo_toplevel())
+        for child in list(root.winfo_children()):
+            if isinstance(child, tk.Toplevel):
+                try:
+                    child.destroy()
+                except Exception:
+                    pass
+        self.status_var.set("Полная остановка")
+        self.refresh_ready_state()
+
+    @staticmethod
+    def _close_modal(win: tk.Toplevel, state: dict[str, Any], value: str) -> None:
+        state["value"] = value
+        win.destroy()
 
 
-FarmPanel = FarmTab
+FarmTab = ControlTab
 
-
-def render_hero_menu(parent, app):
-    return FarmTab(parent, app)
-
-
-__all__ = ["FarmTab", "FarmPanel", "render_hero_menu"]
+__all__ = ["ControlTab", "FarmTab"]
