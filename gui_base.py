@@ -13,7 +13,12 @@ nav.json structure::
       "locations_map": {"png": "locations_map_123.png"},
       "locations": [
         {"slot": 1, "name": "Локация 1", "png": "location_1_123.png"},
-        {"slot": 2, "name": "...", "png": "..."}
+        {"slot": 2, "name": "Локация 2", "png": "location_2_123.png"},
+        {"slot": 3, "name": "Локация 3", "png": "location_3_123.png"},
+        {"slot": 4, "name": "Локация 4", "png": "location_4_123.png"},
+        {"slot": 5, "name": "Локация 5", "png": "location_5_123.png"},
+        {"slot": 6, "name": "Локация 6", "png": "location_6_123.png"},
+        {"slot": 7, "name": "Локация 7", "png": "location_7_123.png"}
       ],
       "farm_floor_button": {"png": "farm_floor_button_123.png"},
       "enter_dungeon": {"png": "enter_dungeon_123.png"},
@@ -104,6 +109,7 @@ def _ensure_dirs() -> None:
     LIVE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
+
 def _empty_nav() -> dict[str, Any]:
     return {
         "base_screenshot": {"png": ""},
@@ -122,6 +128,7 @@ def _empty_nav() -> dict[str, Any]:
         },
         "settings": dict(DEFAULT_SETTINGS),
     }
+
 
 
 def _normalize_locations(value: Any) -> list[dict[str, Any]]:
@@ -144,12 +151,14 @@ def _normalize_locations(value: Any) -> list[dict[str, Any]]:
     return result
 
 
+
 def _sanitize_threshold(value: Any) -> float:
     try:
         number = float(value)
     except (TypeError, ValueError):
         return float(DEFAULT_SETTINGS["match_threshold"])
     return max(0.05, min(0.99, number))
+
 
 
 def _normalize_settings(value: Any) -> dict[str, Any]:
@@ -166,6 +175,7 @@ def _normalize_settings(value: Any) -> dict[str, Any]:
         if "match_threshold" in value:
             data["match_threshold"] = _sanitize_threshold(value["match_threshold"])
     return data
+
 
 
 def _load_nav() -> dict[str, Any]:
@@ -199,6 +209,7 @@ def _load_nav() -> dict[str, Any]:
     return data
 
 
+
 def _save_nav(data: dict[str, Any]) -> None:
     _ensure_dirs()
     fd, tmp_name = tempfile.mkstemp(prefix=".nav-", suffix=".tmp", dir=BASE_DIR)
@@ -214,11 +225,13 @@ def _save_nav(data: dict[str, Any]) -> None:
             os.unlink(tmp_name)
 
 
+
 def _append_live_log(text: str) -> None:
     _ensure_dirs()
     ts = time.strftime("%H:%M:%S")
     with LIVE_LOG_PATH.open("a", encoding="utf-8", newline="\n") as fh:
         fh.write(f"{ts} {text}\n")
+
 
 
 def _write_png(crop_bgr, prefix: str) -> str:
@@ -227,6 +240,7 @@ def _write_png(crop_bgr, prefix: str) -> str:
     if cv2 is None or not cv2.imwrite(str(path), crop_bgr):
         raise RuntimeError("Не удалось сохранить PNG.")
     return path.name
+
 
 
 def _make_provider() -> Any:
@@ -239,9 +253,11 @@ def _make_provider() -> Any:
     return ScreenshotProvider(adb, config, logger)
 
 
+
 def _nearest_match_level(threshold: float) -> int:
     threshold = _sanitize_threshold(threshold)
     return min(MATCH_LEVELS, key=lambda level: abs(MATCH_LEVELS[level] - threshold))
+
 
 
 def _threshold_from_user(value: str) -> float:
@@ -251,6 +267,7 @@ def _threshold_from_user(value: str) -> float:
     if not (0.05 <= number <= 0.99):
         raise ValueError("match_threshold должен быть от 0.05 до 0.99 или от 5 до 99 как проценты.")
     return round(number, 2)
+
 
 
 def capture_region(parent, prompt):
@@ -305,6 +322,7 @@ def capture_region(parent, prompt):
     if state["result"] is None and state.get("selector") is not None:
         owner.wait_window(state["selector"])
     return state["result"]
+
 
 
 def _open_crop_window(parent, prompt: str, frame, state: dict[str, Any]) -> None:
@@ -377,8 +395,6 @@ class SettingsTab(ttk.Frame):
         self._console_history_index = 0
         self._tail_buffer: deque[str] = deque(maxlen=MAX_CONSOLE_LINES)
         self._console_queue: "queue.Queue[tuple[str, Any]]" = queue.Queue()
-        self._joystick_preview_bbox: tuple[int, int, int, int] | None = None
-        self._joystick_preview_frame = None
         self._build_vars()
         self._build_ui()
         self._build_command_registry()
@@ -451,7 +467,7 @@ class SettingsTab(ttk.Frame):
         joy_row = base_row + 3
         joy_frame = ttk.LabelFrame(parent, text="Края джойстика", padding=8)
         joy_frame.grid(row=joy_row, column=0, columnspan=5, sticky="we", pady=(8, 0))
-        ttk.Label(joy_frame, text="Нужно указать две точки: левый и правый край джойстика. Это не прямоугольник, а просто координаты точек на экране.", wraplength=950, justify=tk.LEFT).grid(row=0, column=0, columnspan=8, sticky="w", pady=(0, 6))
+        ttk.Label(joy_frame, text="Нужно указать две точки: левый и правый край джойстика. Это не прямоугольник, а просто координаты точек на экране.", wraplength=950, justify=tk.LEFT).grid(row=0, column=0, columnspan=10, sticky="w", pady=(0, 6))
         ttk.Button(joy_frame, text="Выбрать точки на скриншоте", command=self._capture_joystick_points).grid(row=1, column=0, sticky="w", padx=(0, 8))
         ttk.Label(joy_frame, text="Левый x").grid(row=1, column=1, sticky="e")
         ttk.Entry(joy_frame, textvariable=self.left_x_var, width=8).grid(row=1, column=2, sticky="w", padx=(4, 8))
@@ -885,7 +901,7 @@ class SettingsTab(ttk.Frame):
 
     def _cmd_help(self, args: list[str]) -> None:
         del args
-        self._console_queue.put(("log", "Команды: help; status; settings; set имя значение; tail N; screenshot; find имя_шаблона; hold left|right миллисекунды; release; stop; loot; mob; event; go название_локации; memory"))
+        self._console_queue.put(("log", "Команды: help; status; settings; set имя значение; tail N; screenshot; find имя_шаблона; hold left|right миллисекунды; release; stop; loot имя_шаблона; mob имя_шаблона; event имя_шаблона; go название_локации; memory"))
 
     def _cmd_status(self, args: list[str]) -> None:
         del args
@@ -979,8 +995,8 @@ class SettingsTab(ttk.Frame):
         if func is None:
             self._console_queue.put(("log", "В nav.py нет функции find_template."))
             return
-        result = func(getattr(self.app, "project_dir", "."), template)
-        self._console_queue.put(("log", f"find_template({key}): {result}"))
+        found, x, y, dx, score = func(getattr(self.app, "project_dir", "."), template)
+        self._console_queue.put(("log", f"find_template({key}): found={found}, x={x}, y={y}, dx={dx}, score={score}"))
 
     def _cmd_hold(self, args: list[str]) -> None:
         if len(args) != 2:
