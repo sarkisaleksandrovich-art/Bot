@@ -35,6 +35,7 @@ It never starts farming.
 import json
 import os
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -234,7 +235,7 @@ def _write_png(crop_bgr, prefix: str) -> str:
     path = BASE_DIR / f"{prefix}_{time.time_ns()}.png"
     if cv2 is None or not cv2.imwrite(str(path), crop_bgr):
         raise RuntimeError("Не удалось сохранить PNG")
-    return path.relative_to(BASE_DIR).as_posix()
+    return path.name
 
 
 class NavigationTab(ttk.Frame):
@@ -253,6 +254,8 @@ class NavigationTab(ttk.Frame):
             for item in self.data["locations"]
         ]
         self.floor_location_var = tk.StringVar(value="1")
+        self.busy_var = tk.StringVar(value="")
+        self._capture_busy = False
         self._build()
 
     def _build(self) -> None:
@@ -263,6 +266,8 @@ class NavigationTab(ttk.Frame):
             wraplength=950,
             justify=tk.LEFT,
         ).pack(anchor="w", pady=(4, 10))
+
+        ttk.Label(self, textvariable=self.busy_var, foreground="blue").pack(anchor="w", pady=(0, 6))
 
         ttk.Button(
             self,
@@ -306,7 +311,7 @@ class NavigationTab(ttk.Frame):
 
         ttk.Button(
             self,
-            text="Назначить кнопку В данж",
+            text="В данж",
             command=self._capture_enter_dungeon,
         ).pack(anchor="w", pady=(0, 6))
 
@@ -316,59 +321,83 @@ class NavigationTab(ttk.Frame):
             command=self._verify_chain,
         ).pack(anchor="w")
 
-    def _capture_and_store(self, prompt: str, prefix: str) -> str | None:
-        selected = capture_region(self, prompt)
+    def _run_capture_job(self, prompt: str, prefix: str, on_success) -> None:
+        if self._capture_busy:
+            messagebox.showinfo("Скриншот", "Дождитесь завершения текущего захвата.", parent=self)
+            return
+
+        self._capture_busy = True
+        self.busy_var.set("Идёт захват скриншота, подождите...")
+
+        def worker() -> None:
+            try:
+                selected = capture_region(self, prompt)
+                error = None
+            except Exception as exc:
+                selected = None
+                error = exc
+            self.after(0, lambda: self._finish_capture_job(selected, prefix, on_success, error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_capture_job(self, selected, prefix: str, on_success, error: Exception | None) -> None:
+        self._capture_busy = False
+        self.busy_var.set("")
+        if error is not None:
+            messagebox.showerror("Сохранение", str(error), parent=self)
+            return
         if not selected:
-            return None
-        crop_bgr, _bbox = selected
-        return _write_png(crop_bgr, prefix)
+            return
+        try:
+            crop_bgr, _bbox = selected
+            png = _write_png(crop_bgr, prefix)
+            on_success(png)
+        except Exception as exc:
+            messagebox.showerror("Сохранение", str(exc), parent=self)
 
     def _capture_base_to_locations(self) -> None:
-        try:
-            png = self._capture_and_store(
-                "Откройте главную базу в эмуляторе. На скриншоте выделите кнопку перехода к локациям.",
-                "base_to_locations",
-            )
-            if png:
-                self.data["base_to_locations"] = {"png": png}
-                _save_nav(self.data)
-        except Exception as exc:
-            messagebox.showerror("Сохранение", str(exc), parent=self)
+        self._run_capture_job(
+            "Откройте главную базу в эмуляторе. На скриншоте выделите кнопку перехода к локациям.",
+            "base_to_locations",
+            self._on_base_to_locations_captured,
+        )
+
+    def _on_base_to_locations_captured(self, png: str) -> None:
+        self.data["base_to_locations"] = {"png": png}
+        _save_nav(self.data)
 
     def _bind_location(self, index: int) -> None:
-        try:
-            png = self._capture_and_store(
-                f"Откройте экран выбора локаций. Выделите иконку для слота {index + 1}.",
-                f"location_{index + 1}",
-            )
-            if png:
-                item = self.data["locations"][index]
-                item["slot"] = index + 1
-                item["name"] = self.location_vars[index].get().strip()
-                item["png"] = png
-                _save_nav(self.data)
-                self.status_vars[index].set("✓")
-        except Exception as exc:
-            messagebox.showerror("Сохранение", str(exc), parent=self)
+        self._run_capture_job(
+            f"Откройте экран выбора локаций. Выделите иконку для слота {index + 1}.",
+            f"location_{index + 1}",
+            lambda png, idx=index: self._on_location_captured(idx, png),
+        )
+
+    def _on_location_captured(self, index: int, png: str) -> None:
+        item = self.data["locations"][index]
+        item["slot"] = index + 1
+        item["name"] = self.location_vars[index].get().strip()
+        item["png"] = png
+        _save_nav(self.data)
+        self.status_vars[index].set("✓")
 
     def _add_floor(self) -> None:
         index = int(self.floor_location_var.get()) - 1
         floor_name = simpledialog.askstring("Этаж", "Введите имя этажа:", parent=self)
         if not floor_name or not floor_name.strip():
             return
-        try:
-            png = self._capture_and_store(
-                "Откройте экран с нужным этажом. Выделите кнопку или строку выбора этого этажа.",
-                f"location_{index + 1}_floor",
-            )
-            if png:
-                self.data["locations"][index].setdefault("floors", []).append(
-                    {"name": floor_name.strip(), "png": png}
-                )
-                _save_nav(self.data)
-                self._refresh_floors()
-        except Exception as exc:
-            messagebox.showerror("Сохранение", str(exc), parent=self)
+        self._run_capture_job(
+            "Откройте экран с нужным этажом. Выделите кнопку или строку выбора этого этажа.",
+            f"location_{index + 1}_floor",
+            lambda png, idx=index, name=floor_name.strip(): self._on_floor_captured(idx, name, png),
+        )
+
+    def _on_floor_captured(self, index: int, floor_name: str, png: str) -> None:
+        self.data["locations"][index].setdefault("floors", []).append(
+            {"name": floor_name, "png": png}
+        )
+        _save_nav(self.data)
+        self._refresh_floors()
 
     def _refresh_floors(self) -> None:
         if not hasattr(self, "floor_list"):
@@ -380,16 +409,15 @@ class NavigationTab(ttk.Frame):
             self.floor_list.insert(tk.END, f"{floor.get('name', '')}: {floor.get('png', '')}")
 
     def _capture_enter_dungeon(self) -> None:
-        try:
-            png = self._capture_and_store(
-                "Откройте экран выбранной локации. Выделите кнопку «В данж».",
-                "enter_dungeon",
-            )
-            if png:
-                self.data["enter_dungeon"] = {"png": png}
-                _save_nav(self.data)
-        except Exception as exc:
-            messagebox.showerror("Сохранение", str(exc), parent=self)
+        self._run_capture_job(
+            "Откройте экран выбранной локации. Выделите кнопку «В данж».",
+            "enter_dungeon",
+            self._on_enter_dungeon_captured,
+        )
+
+    def _on_enter_dungeon_captured(self, png: str) -> None:
+        self.data["enter_dungeon"] = {"png": png}
+        _save_nav(self.data)
 
     def _verify_chain(self) -> None:
         try:
