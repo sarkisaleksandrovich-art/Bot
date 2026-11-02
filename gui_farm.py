@@ -48,6 +48,7 @@ class ControlTab(ttk.Frame):
         self._stop_snapshot_busy = False
         self._manual_dialog_open = False
         self._matched_action: str | None = None
+        self._matched_score: float | None = None
 
         self.location_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Готово")
@@ -302,16 +303,18 @@ class ControlTab(ttk.Frame):
                     except Exception:
                         annotated_path = shot_path
                 summary = nav.memory_summary(self.project_dir)
-                self.after(0, lambda: self._after_stop_snapshot(summary, shot_path, annotated_path))
+                found_count = len(found)
+                self.after(0, lambda: self._after_stop_snapshot(summary, found_count, shot_path, annotated_path))
             except Exception as exc:
-                self.after(0, lambda: self._after_stop_snapshot(f"Ошибка стоп-сценария: {exc}", "", ""))
+                self.after(0, lambda: self._after_stop_snapshot(f"Ошибка стоп-сценария: {exc}", 0, "", ""))
             finally:
                 self._stop_snapshot_busy = False
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _after_stop_snapshot(self, summary: str, shot_path: str, annotated_path: str) -> None:
+    def _after_stop_snapshot(self, summary: str, found_count: int, shot_path: str, annotated_path: str) -> None:
         self.log(summary)
+        self.log(f"Найдено известных объектов: {found_count}")
         self.log("Объекты без рамки считаются новыми.")
         if shot_path:
             self.log(f"Скриншот: {shot_path}")
@@ -327,6 +330,7 @@ class ControlTab(ttk.Frame):
             return
         self._manual_dialog_open = True
         self._matched_action = None
+        self._matched_score = None
         try:
             result = capture_region(self, "Выделите рамкой объект. Объекты без рамки на предыдущем скриншоте считаются новыми.")
             if not result:
@@ -334,31 +338,49 @@ class ControlTab(ttk.Frame):
             crop, _bbox = result
             try:
                 import nav
-                matched_action = nav.match_known(self.project_dir, crop)
+                matched = nav.match_known(self.project_dir, crop)
             except Exception as exc:
                 self.log(f"match_known ошибка: {exc}")
-                matched_action = None
+                matched = None
             replace_known = False
+            matched_action: str | None = None
+            matched_score: float | None = None
+            if isinstance(matched, tuple) and len(matched) >= 1:
+                matched_action = str(matched[0]).strip() or None
+                if len(matched) >= 2:
+                    try:
+                        matched_score = float(matched[1])
+                    except Exception:
+                        matched_score = None
+            elif isinstance(matched, str):
+                matched_action = matched.strip() or None
             if matched_action:
                 self._matched_action = matched_action
-                decision = self._ask_known_match(ACTION_LABELS.get(matched_action, matched_action))
+                self._matched_score = matched_score
+                decision = self._ask_known_match(ACTION_LABELS.get(matched_action, matched_action), matched_score)
                 if decision == "cancel":
                     return
                 if decision == "keep":
-                    self.log(f"Это уже в памяти как {ACTION_LABELS.get(matched_action, matched_action)}")
+                    if matched_score is None:
+                        self.log(f"Это уже в памяти как {ACTION_LABELS.get(matched_action, matched_action)}")
+                    else:
+                        self.log(f"Это уже в памяти как {ACTION_LABELS.get(matched_action, matched_action)} (score={matched_score:.3f})")
                     return
                 replace_known = decision == "replace"
             self._ask_action_dialog(crop, matched_action, replace_known)
         finally:
             self._manual_dialog_open = False
 
-    def _ask_known_match(self, known_name: str) -> str:
+    def _ask_known_match(self, known_name: str, score: float | None) -> str:
         win = tk.Toplevel(self)
         win.title("Совпадение с памятью")
         win.transient(self.winfo_toplevel())
         win.grab_set()
         result = {"value": "cancel"}
-        ttk.Label(win, text=f"Это уже в памяти как {known_name}", padding=12).pack(anchor="w")
+        text = f"Это уже в памяти как {known_name}"
+        if score is not None:
+            text += f"\nscore={score:.3f}"
+        ttk.Label(win, text=text, padding=12, justify=tk.LEFT).pack(anchor="w")
         row = ttk.Frame(win)
         row.pack(fill="x", padx=12, pady=(0, 12))
         ttk.Button(row, text="Оставить", command=lambda: self._close_modal(win, result, "keep")).pack(side="left")
