@@ -345,21 +345,13 @@ class ControlTab(ttk.Frame):
             known_score = 0.0
             try:
                 import nav
-                threshold = float(nav.nav_status(self.project_dir).get("match_threshold", 0.0))
-                for item in getattr(nav, "find_known_objects", lambda *_args, **_kwargs: [])(self.project_dir, crop):
-                    if len(item) >= 7:
-                        action = str(item[0]).strip()
-                        score = float(item[6])
-                        if score >= threshold and score > known_score:
-                            known_action = action
-                            known_score = score
-                if known_action is None:
-                    match_result = nav.match_known(self.project_dir, crop)
-                    if isinstance(match_result, tuple) and len(match_result) >= 2:
-                        known_action = str(match_result[0]).strip() or None
-                        known_score = float(match_result[1])
-                    elif isinstance(match_result, str):
-                        known_action = match_result.strip() or None
+                match_result = nav.match_known(self.project_dir, crop)
+                if isinstance(match_result, tuple) and len(match_result) >= 2:
+                    known_action = str(match_result[0]).strip() or None
+                    known_score = float(match_result[1])
+                elif isinstance(match_result, str):
+                    known_action = match_result.strip() or None
+                    known_score = 0.0
             except Exception as exc:
                 self.log(f"match_known ошибка: {exc}")
                 known_action = None
@@ -439,7 +431,7 @@ class ControlTab(ttk.Frame):
             value, text = item
             style = "Accent.TButton" if remembered_action and value == remembered_action else "TButton"
             ttk.Button(body, text=text, style=style, command=lambda v=value: self._close_modal(win, result, v)).pack(fill="x", pady=2)
-        ttk.Button(body, text="Отмена", command=lambda: self._close_modal(win, result, "cancel")).pack(fill="x", pady=(8, 0))
+        tk.Button(body, text="Отмена", command=lambda: self._close_modal(win, result, "cancel")).pack(fill="x", pady=(8, 0))
         self.wait_window(win)
         return result["value"]
 
@@ -478,18 +470,15 @@ class ControlTab(ttk.Frame):
         if not isinstance(objects, list):
             objects = []
             data["objects"] = objects
+        record = {
+            "name": f"manual_{action}_{int(time.time())}",
+            "png": png_name,
+            "action": action,
+        }
         if replace and objects:
-            objects[-1] = {
-                "name": f"manual_{action}_{int(time.time())}",
-                "png": png_name,
-                "action": action,
-            }
+            objects[-1] = record
         else:
-            objects.append({
-                "name": f"manual_{action}_{int(time.time())}",
-                "png": png_name,
-                "action": action,
-            })
+            objects.append(record)
         actions_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     def on_loot(self) -> None:
