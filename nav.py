@@ -27,7 +27,6 @@ DEFAULT_APPROACH_TIMEOUT_S = 12.0
 DEFAULT_HOLD_CHUNK_MS = 250
 DEFAULT_FRAME_INTERVAL_MS = 250
 DEFAULT_STABLE_TIMEOUT_S = 3.0
-DEFAULT_BACKSTEP_FACTOR = 0.5
 DEFAULT_FLOOR_NUMBER = 1
 
 ACTION_KIND_LABELS = {
@@ -378,13 +377,18 @@ def hold(side: str, project_dir: str | Path = ".", log: Callable[..., Any] = pri
     x, y = points[side]
     chunk_ms = int(settings["hold_chunk_ms"])
     with _HOLD_LOCK:
-        if _HOLD_ACTIVE_SIDE == side and _HOLD_THREAD is not None and _HOLD_THREAD.is_alive():
+        if _HOLD_ACTIVE_SIDE == side and (
+            (_HOLD_THREAD is not None and _HOLD_THREAD.is_alive()) or
+            (_HOLD_THREAD is None and _probe_motionevent(runtime))
+        ):
             _log(log, f"hold side={side} already active")
             return True
         release(project_dir=project_dir, log=log)
         if _probe_motionevent(runtime):
             try:
                 runtime.adb.shell(f"input motionevent DOWN {x} {y}")
+                _HOLD_THREAD = None
+                _HOLD_STOP_EVENT = None
                 _HOLD_ACTIVE_SIDE = side
                 _log(log, f"hold side={side} mode=motionevent x={x} y={y} chunk_ms={chunk_ms}")
                 return True
@@ -429,6 +433,7 @@ def approach_target(project_dir: str | Path, template: Any, log: Callable[..., A
     frame_interval_ms = int(settings["frame_interval_ms"])
     started = time.monotonic()
     last_dx: Optional[int] = None
+    last_abs_dx: Optional[int] = None
     last_frame: Any = None
     current_side: Optional[str] = None
     try:
@@ -441,17 +446,13 @@ def approach_target(project_dir: str | Path, template: Any, log: Callable[..., A
             _log(log, f"approach scan found={found} score={score:.3f} stable={stable} dx={dx} radius={click_radius_px}")
             if not found:
                 return False, "target not found"
-            if abs(dx) <= click_radius_px:
+            abs_dx = abs(dx)
+            if abs_dx <= click_radius_px:
                 release(project_dir=project_dir, log=log)
                 _log(log, f"approach success dx={dx} radius={click_radius_px} score={score:.3f}")
                 return True, "aligned"
             side = "right" if dx > 0 else "left"
             _log(log, f"approach decision dx={dx} radius={click_radius_px} hold_side={side} hold_chunk_ms={settings['hold_chunk_ms']} score={score:.3f}")
-            if current_side != side:
-                release(project_dir=project_dir, log=log)
-                if not hold(side, project_dir=project_dir, log=log):
-                    return False, f"hold failed: {side}"
-                current_side = side
             if last_dx is not None and ((last_dx > 0 > dx) or (last_dx < 0 < dx)):
                 release(project_dir=project_dir, log=log)
                 back_side = "left" if side == "right" else "right"
@@ -461,6 +462,19 @@ def approach_target(project_dir: str | Path, template: Any, log: Callable[..., A
                 time.sleep(max(0.05, frame_interval_ms / 2000.0))
                 release(project_dir=project_dir, log=log)
                 current_side = None
+                last_dx = dx
+                last_abs_dx = abs_dx
+                last_frame = frame
+                continue
+            if current_side != side:
+                release(project_dir=project_dir, log=log)
+                if not hold(side, project_dir=project_dir, log=log):
+                    return False, f"hold failed: {side}"
+                current_side = side
+            if last_abs_dx is not None and abs_dx > last_abs_dx:
+                release(project_dir=project_dir, log=log)
+                _log(log, f"approach stop reason=edge_or_passaway prev_abs_dx={last_abs_dx} new_abs_dx={abs_dx}")
+                return False, "target moves away or hero stuck at edge"
             if last_frame is not None and current_side is not None and np is not None:
                 try:
                     moved = runtime.vision.is_animating(last_frame, frame, 0.002)
@@ -471,6 +485,7 @@ def approach_target(project_dir: str | Path, template: Any, log: Callable[..., A
                     _log(log, "approach stop reason=no movement while holding")
                     return False, "frame did not move while holding"
             last_dx = dx
+            last_abs_dx = abs_dx
             last_frame = frame
             time.sleep(max(0.05, frame_interval_ms / 1000.0))
         release(project_dir=project_dir, log=log)
@@ -487,7 +502,7 @@ def approach_target(project_dir: str | Path, template: Any, log: Callable[..., A
 def _click_center(runtime: NavigationRuntime, match_result: tuple[bool, int, int, int, float], log: Callable[..., Any]) -> bool:
     found, x, y, dx, score = match_result
     if not found:
-        _log(log, "click_center target missing")
+        _log(log, f"click_center target missing score={score:.3f}")
         return False
     _log(log, f"click_center x={x} y={y} dx={dx} score={score:.3f}")
     runtime.adb.tap(int(x), int(y))
@@ -620,7 +635,6 @@ def nav_status(project_dir: str | Path) -> dict[str, Any]:
     actions, action_notes = _read_actions(project_dir)
     settings = _settings(project_dir)
     locations = nav.get("locations", []) if isinstance(nav.get("locations"), list) else []
-    frame = None
     screen = None
     screen_score = 0.0
     shot_path = None
@@ -767,8 +781,6 @@ def _go_path(project_dir: str | Path, location_name: str, log: Callable[..., Any
         ok, reason = _run_known_objects(project_dir, frame, log, stop_event)
         if not ok:
             return False, reason
-        runtime.adb.tap(x, y)
-        time.sleep(1.0)
         ok, reason = start_battle(project_dir, log=log, stop_event=stop_event)
         if not ok:
             return False, reason
