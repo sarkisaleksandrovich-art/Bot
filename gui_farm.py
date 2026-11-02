@@ -6,10 +6,10 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import ttk
 
 from gui_base import capture_region
 
@@ -27,8 +27,8 @@ except Exception:  # pragma: no cover
 ACTION_LABELS = {
     "loot": "Лут",
     "mob": "Моб",
-    "event_choice": "Событие",
-    "event_skip": "Событие: пропустить",
+    "event_choice": "Событие-выбор",
+    "event_skip": "Событие-пропустить",
     "skip": "Пропустить объект",
 }
 
@@ -40,7 +40,6 @@ class ControlTab(ttk.Frame):
         self.project_dir = Path(getattr(app, "project_dir", ".")).resolve()
         self.stop_event = threading.Event()
         self.nav_thread: threading.Thread | None = None
-        self.main_thread: threading.Thread | None = None
         self.main_process: subprocess.Popen[str] | None = None
         self.listener_thread: threading.Thread | None = None
         self.hotkey_listener = None
@@ -48,6 +47,7 @@ class ControlTab(ttk.Frame):
         self.running = False
         self.paused_by_stop = False
         self._stop_snapshot_busy = False
+        self._manual_dialog_open = False
 
         self.location_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Готово")
@@ -79,11 +79,11 @@ class ControlTab(ttk.Frame):
 
         actions = ttk.Frame(self)
         actions.pack(fill="x", pady=(0, 8))
-        self.start_button = ttk.Button(actions, text="Старт (Num1)", command=self.on_start, state=tk.DISABLED)
+        self.start_button = ttk.Button(actions, text="Старт (Num1)", command=self.do_start, state=tk.DISABLED)
         self.start_button.pack(side="left")
-        self.stop_button = ttk.Button(actions, text="Стоп (Num2)", command=self.on_stop, state=tk.DISABLED)
+        self.stop_button = ttk.Button(actions, text="Стоп (Num2)", command=self.do_stop, state=tk.DISABLED)
         self.stop_button.pack(side="left", padx=(8, 0))
-        self.event_button = ttk.Button(actions, text="Событие (Num3)", command=self.on_event)
+        self.event_button = ttk.Button(actions, text="Событие (Num3)", command=self.do_event)
         self.event_button.pack(side="left", padx=(16, 0))
         self.loot_button = ttk.Button(actions, text="Лут", command=self.on_loot)
         self.loot_button.pack(side="left", padx=(8, 0))
@@ -99,7 +99,7 @@ class ControlTab(ttk.Frame):
             button = tk.Button(
                 bottom,
                 text="Полная остановка (Num0)",
-                command=self.on_full_stop,
+                command=self.do_full_stop,
                 bg="#b71c1c",
                 fg="white",
                 activebackground="#d32f2f",
@@ -113,10 +113,10 @@ class ControlTab(ttk.Frame):
 
     def _bind_focus_hotkeys(self) -> None:
         root = getattr(self.app, "root", self.winfo_toplevel())
-        root.bind("<KP_1>", lambda _e: self.on_start())
-        root.bind("<KP_2>", lambda _e: self.on_stop())
-        root.bind("<KP_3>", lambda _e: self.on_event())
-        root.bind("<KP_0>", lambda _e: self.on_full_stop())
+        root.bind("<KP_1>", lambda _e: self.do_start())
+        root.bind("<KP_2>", lambda _e: self.do_stop())
+        root.bind("<KP_3>", lambda _e: self.do_event())
+        root.bind("<KP_0>", lambda _e: self.do_full_stop())
 
     def _start_hotkey_listener_once(self) -> None:
         if self.listener_started:
@@ -130,13 +130,13 @@ class ControlTab(ttk.Frame):
             def on_press(key) -> None:
                 vk = getattr(key, "vk", None)
                 if vk == 97:
-                    self.after(0, self.on_start)
+                    self.after(0, self.do_start)
                 elif vk == 98:
-                    self.after(0, self.on_stop)
+                    self.after(0, self.do_stop)
                 elif vk == 99:
-                    self.after(0, self.on_event)
+                    self.after(0, self.do_event)
                 elif vk == 96:
-                    self.after(0, self.on_full_stop)
+                    self.after(0, self.do_full_stop)
 
             self.hotkey_listener = pynput_keyboard.Listener(on_press=on_press)
             self.hotkey_listener.daemon = True
@@ -194,7 +194,7 @@ class ControlTab(ttk.Frame):
         else:
             print(text)
 
-    def on_start(self) -> None:
+    def do_start(self) -> None:
         self.refresh_ready_state()
         if self.running:
             return
@@ -276,7 +276,7 @@ class ControlTab(ttk.Frame):
         self.status_var.set(message)
         self.refresh_ready_state()
 
-    def on_stop(self) -> None:
+    def do_stop(self) -> None:
         self.stop_event.set()
         self.paused_by_stop = True
         self.status_var.set("Остановка...")
@@ -298,6 +298,8 @@ class ControlTab(ttk.Frame):
         def worker() -> None:
             try:
                 import nav
+                if self.nav_thread is not None and self.nav_thread.is_alive():
+                    self.nav_thread.join(timeout=5.0)
                 nav.release(self.project_dir, log=self.log)
                 shot_path, frame = nav.take_screenshot(self.project_dir)
                 found = nav.find_known_objects(self.project_dir, frame)
@@ -309,16 +311,18 @@ class ControlTab(ttk.Frame):
                     except Exception:
                         annotated_path = shot_path
                 summary = nav.memory_summary(self.project_dir)
-                self.after(0, lambda: self._after_stop_snapshot(summary, shot_path, annotated_path))
+                found_count = len(found)
+                self.after(0, lambda: self._after_stop_snapshot(summary, found_count, shot_path, annotated_path))
             except Exception as exc:
-                self.after(0, lambda: self._after_stop_snapshot(f"Ошибка стоп-сценария: {exc}", "", ""))
+                self.after(0, lambda: self._after_stop_snapshot(f"Ошибка стоп-сценария: {exc}", 0, "", ""))
             finally:
                 self._stop_snapshot_busy = False
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _after_stop_snapshot(self, summary: str, shot_path: str, annotated_path: str) -> None:
+    def _after_stop_snapshot(self, summary: str, found_count: int, shot_path: str, annotated_path: str) -> None:
         self.log(summary)
+        self.log(f"Найдено известных объектов: {found_count}")
         if shot_path:
             self.log(f"Скриншот: {shot_path}")
         if annotated_path:
@@ -329,29 +333,60 @@ class ControlTab(ttk.Frame):
         self._open_manual_stop_dialog()
 
     def _open_manual_stop_dialog(self) -> None:
-        result = capture_region(self, "Выделите рамкой объект. Объекты без рамки на предыдущем скриншоте считаются новыми.")
-        if not result:
+        if self._manual_dialog_open:
             return
-        crop, _bbox = result
+        self._manual_dialog_open = True
         try:
-            import nav
-            known_action = nav.match_known(self.project_dir, crop)
-        except Exception as exc:
-            self.log(f"match_known ошибка: {exc}")
-            known_action = None
-        if known_action:
-            decision = self._ask_known_match(known_action)
-            if decision == "cancel":
+            result = capture_region(self, "Выделите рамкой объект. Объекты без рамки на предыдущем скриншоте считаются новыми.")
+            if not result:
                 return
-        self._ask_action_dialog(crop, known_action)
+            crop, _bbox = result
+            known_action = None
+            known_score = 0.0
+            try:
+                import nav
+                threshold = float(nav.nav_status(self.project_dir).get("match_threshold", 0.0))
+                for item in getattr(nav, "find_known_objects", lambda *_args, **_kwargs: [])(self.project_dir, crop):
+                    if len(item) >= 7:
+                        action = str(item[0]).strip()
+                        score = float(item[6])
+                        if score >= threshold and score > known_score:
+                            known_action = action
+                            known_score = score
+                if known_action is None:
+                    match_result = nav.match_known(self.project_dir, crop)
+                    if isinstance(match_result, tuple) and len(match_result) >= 2:
+                        known_action = str(match_result[0]).strip() or None
+                        known_score = float(match_result[1])
+                    elif isinstance(match_result, str):
+                        known_action = match_result.strip() or None
+            except Exception as exc:
+                self.log(f"match_known ошибка: {exc}")
+                known_action = None
+                known_score = 0.0
+            replace_known = False
+            if known_action:
+                decision = self._ask_known_match(known_action, known_score)
+                if decision == "cancel":
+                    return
+                if decision == "keep":
+                    return
+                replace_known = decision == "replace"
+            self._ask_action_dialog(crop, known_action, replace_known)
+        finally:
+            self._manual_dialog_open = False
 
-    def _ask_known_match(self, known_action: str) -> str:
+    def _ask_known_match(self, known_action: str, known_score: float) -> str:
         win = tk.Toplevel(self)
         win.title("Совпадение с памятью")
         win.transient(self.winfo_toplevel())
         win.grab_set()
         result = {"value": "cancel"}
-        ttk.Label(win, text=f"Это уже в памяти как {ACTION_LABELS.get(known_action, known_action)}", padding=12).pack(anchor="w")
+        ttk.Label(
+            win,
+            text=f"Это уже в памяти как {ACTION_LABELS.get(known_action, known_action)} (score {known_score:.3f})",
+            padding=12,
+        ).pack(anchor="w")
         row = ttk.Frame(win)
         row.pack(fill="x", padx=12, pady=(0, 12))
         ttk.Button(row, text="Оставить", command=lambda: self._close_modal(win, result, "keep")).pack(side="left")
@@ -360,19 +395,19 @@ class ControlTab(ttk.Frame):
         self.wait_window(win)
         return result["value"]
 
-    def _ask_action_dialog(self, crop: Any, remembered_action: str | None) -> None:
+    def _ask_action_dialog(self, crop: Any, remembered_action: str | None, replace_known: bool) -> None:
         choice = self._show_action_choice_dialog(remembered_action)
         if choice in {None, "cancel"}:
             return
         if choice == "full_stop":
-            self.on_full_stop()
+            self.do_full_stop()
             return
         if choice == "continue":
-            self.on_start()
+            self.do_start()
             return
         if choice in {"loot", "mob", "event_choice", "event_skip", "skip"}:
             try:
-                self._save_action_memory(crop, choice)
+                self._save_action_memory(crop, choice, replace=replace_known)
             except Exception as exc:
                 self.log(f"Не удалось сохранить действие: {exc}")
             if choice != "skip":
@@ -392,8 +427,8 @@ class ControlTab(ttk.Frame):
             (remembered_action, f"Сохранённое действие: {ACTION_LABELS.get(remembered_action, remembered_action)}") if remembered_action else None,
             ("loot", "Лут"),
             ("mob", "Моб"),
-            ("event_choice", "Событие: выбрать кнопку"),
-            ("event_skip", "Событие: пропустить"),
+            ("event_choice", "Событие-выбор"),
+            ("event_skip", "Событие-пропустить"),
             ("skip", "Пропустить объект"),
             ("continue", "Продолжить фарм"),
             ("full_stop", "Полная остановка"),
@@ -426,12 +461,11 @@ class ControlTab(ttk.Frame):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _save_action_memory(self, crop: Any, action: str) -> None:
+    def _save_action_memory(self, crop: Any, action: str, replace: bool = False) -> None:
         base_dir = self.project_dir / "data" / "base"
         base_dir.mkdir(parents=True, exist_ok=True)
         actions_path = base_dir / "actions.json"
         png_name = f"manual_{int(time.time() * 1000)}.png"
-        png_rel = png_name
         if cv2 is None or not cv2.imwrite(str(base_dir / png_name), crop):
             raise RuntimeError("Не удалось сохранить шаблон объекта")
         try:
@@ -444,11 +478,18 @@ class ControlTab(ttk.Frame):
         if not isinstance(objects, list):
             objects = []
             data["objects"] = objects
-        objects.append({
-            "name": f"manual_{action}_{int(time.time())}",
-            "png": png_rel,
-            "action": action,
-        })
+        if replace and objects:
+            objects[-1] = {
+                "name": f"manual_{action}_{int(time.time())}",
+                "png": png_name,
+                "action": action,
+            }
+        else:
+            objects.append({
+                "name": f"manual_{action}_{int(time.time())}",
+                "png": png_name,
+                "action": action,
+            })
         actions_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     def on_loot(self) -> None:
@@ -457,21 +498,25 @@ class ControlTab(ttk.Frame):
     def on_mob(self) -> None:
         self._manual_target_action("mob")
 
-    def on_event(self) -> None:
+    def do_event(self) -> None:
         self._manual_target_action("event_choice")
 
     def _manual_target_action(self, action: str) -> None:
+        if self._manual_dialog_open:
+            return
         result = capture_region(self, "Выделите цель на экране")
         if not result:
             return
         crop, _bbox = result
         self._manual_execute_action(action, crop)
 
-    def on_full_stop(self) -> None:
+    def do_full_stop(self) -> None:
         self.stop_event.set()
         self.running = False
         self.paused_by_stop = False
         self._terminate_main_process()
+        if self.nav_thread is not None and self.nav_thread.is_alive():
+            self.nav_thread.join(timeout=5.0)
         try:
             import nav
             nav.release(self.project_dir, log=self.log)
@@ -486,6 +531,11 @@ class ControlTab(ttk.Frame):
                     pass
         self.status_var.set("Полная остановка")
         self.refresh_ready_state()
+
+    on_start = do_start
+    on_stop = do_stop
+    on_event = do_event
+    on_full_stop = do_full_stop
 
     @staticmethod
     def _close_modal(win: tk.Toplevel, state: dict[str, Any], value: str) -> None:
