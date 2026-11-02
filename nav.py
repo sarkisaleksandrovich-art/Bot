@@ -26,6 +26,9 @@ DEFAULT_CLICK_RADIUS_PX = 40
 DEFAULT_APPROACH_TIMEOUT_S = 12.0
 DEFAULT_HOLD_CHUNK_MS = 250
 DEFAULT_FRAME_INTERVAL_MS = 250
+DEFAULT_STABLE_TIMEOUT_S = 3.0
+DEFAULT_BACKSTEP_FACTOR = 0.5
+DEFAULT_FLOOR_NUMBER = 1
 
 ACTION_KIND_LABELS = {
     "loot": "Лут",
@@ -169,6 +172,12 @@ def _frame_shape(frame: Any) -> tuple[int, int]:
     return int(width), int(height)
 
 
+def _extract_png(config_value: Any) -> Any:
+    if isinstance(config_value, dict):
+        return config_value.get("png")
+    return config_value
+
+
 def _stable_wait(runtime: NavigationRuntime, timeout_s: float, log: Callable[..., Any]) -> tuple[Any, bool]:
     try:
         stable = runtime.vision.wait_until_stable(runtime.screenshot.capture, stable_timeout_s=timeout_s)
@@ -297,7 +306,7 @@ def memory_summary(project_dir: str | Path) -> str:
         if action in counts:
             counts[action] += 1
     events = counts["event_choice"] + counts["event_skip"]
-    return f"В памяти: лут {counts['loot']}, мобы {counts['mob']}, события {events}, пропуски {counts['skip']}"
+    return f"В памяти: лут {counts['loot']}, мобы {counts['mob']}, события {events}"
 
 
 def match_known(project_dir: str | Path, crop: Any) -> Optional[str]:
@@ -427,7 +436,7 @@ def approach_target(project_dir: str | Path, template: Any, log: Callable[..., A
             if stop_event is not None and stop_event.is_set():
                 _log(log, "approach stop_event set")
                 return False, "stopped"
-            frame, stable = _stable_wait(runtime, timeout_s=3.0, log=log)
+            frame, stable = _stable_wait(runtime, timeout_s=DEFAULT_STABLE_TIMEOUT_S, log=log)
             found, x, y, dx, score = find_template(project_dir, template, frame=frame)
             _log(log, f"approach scan found={found} score={score:.3f} stable={stable} dx={dx} radius={click_radius_px}")
             if not found:
@@ -518,8 +527,8 @@ def handle_event(project_dir: str | Path, template: Any, log: Callable[..., Any]
 def start_battle(project_dir: str | Path, log: Callable[..., Any] = print, stop_event: Any = None) -> tuple[bool, str]:
     runtime = _build_runtime(project_dir, log=log)
     nav, _ = _read_nav(project_dir)
-    autobattle_png = _resolve_path(project_dir, nav.get("autobattle_on", {}).get("png") if isinstance(nav.get("autobattle_on"), dict) else nav.get("autobattle_on"))
-    enter_png = _resolve_path(project_dir, nav.get("enter_dungeon", {}).get("png") if isinstance(nav.get("enter_dungeon"), dict) else nav.get("enter_dungeon"))
+    autobattle_png = _resolve_path(project_dir, _extract_png(nav.get("autobattle_on")))
+    enter_png = _resolve_path(project_dir, _extract_png(nav.get("enter_dungeon")))
     if stop_event is not None and stop_event.is_set():
         return False, "stopped"
     if enter_png is None:
@@ -536,8 +545,10 @@ def start_battle(project_dir: str | Path, log: Callable[..., Any] = print, stop_
         found, x, y, dx, score = find_template(project_dir, str(autobattle_png), frame=battle_frame)
         _log(log, f"autobattle state found={found} score={score:.3f}")
         if not found:
-            _log(log, "autobattle is OFF; enabling autobattle")
-            runtime.adb.tap(int(x), int(y))
+            width, height = _frame_shape(battle_frame)
+            tx, ty = width // 2, height // 2
+            _log(log, f"autobattle is OFF; enabling autobattle via fallback tap x={tx} y={ty}")
+            runtime.adb.tap(int(tx), int(ty))
             time.sleep(0.5)
     return True, "battle started"
 
@@ -550,7 +561,7 @@ def run_event(project_dir: str | Path, template: Any, action: str = "event_choic
     return True, f"event handled: {action}"
 
 
-def _nav_chain_templates(project_dir: str | Path, location_name: str) -> dict[str, Optional[str]]:
+def _nav_chain_templates(project_dir: str | Path, location_name: str, floor_number: int | None = None) -> dict[str, Optional[str]]:
     nav, _ = _read_nav(project_dir)
     location_item = None
     for item in nav.get("locations", []) if isinstance(nav.get("locations"), list) else []:
@@ -559,14 +570,49 @@ def _nav_chain_templates(project_dir: str | Path, location_name: str) -> dict[st
         if str(item.get("name", "")).strip().lower() == str(location_name).strip().lower():
             location_item = item
             break
+    farm_floor = nav.get("farm_floor_button")
+    if isinstance(farm_floor, dict) and floor_number is not None:
+        floor_specific = None
+        for key in (str(floor_number), f"floor_{floor_number}", f"{floor_number}"):
+            if key in farm_floor:
+                floor_specific = farm_floor.get(key)
+                break
+        farm_floor = floor_specific if floor_specific is not None else _extract_png(farm_floor)
     return {
         "base": str(_resolve_path(project_dir, nav.get("base_screenshot")) or "") or None,
-        "base_to_locations": str(_resolve_path(project_dir, nav.get("base_to_locations", {}).get("png") if isinstance(nav.get("base_to_locations"), dict) else nav.get("base_to_locations")) or "") or None,
+        "base_to_locations": str(_resolve_path(project_dir, _extract_png(nav.get("base_to_locations"))) or "") or None,
         "locations_map": str(_resolve_path(project_dir, nav.get("locations_map")) or "") or None,
         "location_icon": str(_resolve_path(project_dir, (location_item or {}).get("png")) or "") or None,
-        "farm_floor_button": str(_resolve_path(project_dir, nav.get("farm_floor_button")) or "") or None,
-        "enter_dungeon": str(_resolve_path(project_dir, nav.get("enter_dungeon", {}).get("png") if isinstance(nav.get("enter_dungeon"), dict) else nav.get("enter_dungeon")) or "") or None,
+        "farm_floor_button": str(_resolve_path(project_dir, farm_floor) or "") or None,
+        "enter_dungeon": str(_resolve_path(project_dir, _extract_png(nav.get("enter_dungeon"))) or "") or None,
     }
+
+
+def _go_home(project_dir: str | Path, log: Callable[..., Any], stop_event: Any) -> tuple[bool, str]:
+    runtime = _build_runtime(project_dir, log=log)
+    chain = _nav_chain_templates(project_dir, "", floor_number=None)
+    base_tpl = chain.get("base")
+    if not base_tpl:
+        _log(log, "go_home skipped: base_screenshot missing")
+        return True, "base template missing; home recovery skipped"
+    deadline = time.monotonic() + 15.0
+    last_score = 0.0
+    try:
+        while time.monotonic() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                return False, "stopped"
+            frame, _ = _stable_wait(runtime, 2.0, log)
+            found, x, y, dx, score = find_template(project_dir, base_tpl, frame=frame)
+            last_score = score
+            _log(log, f"go_home base score={score:.3f} found={found}")
+            if found:
+                return True, "already at base"
+            runtime.adb.back()
+            _log(log, "go_home action=back")
+            time.sleep(1.0)
+        return False, f"failed to return to base; last_score={last_score:.3f}"
+    finally:
+        release(project_dir=project_dir, log=log)
 
 
 def nav_status(project_dir: str | Path) -> dict[str, Any]:
@@ -574,14 +620,37 @@ def nav_status(project_dir: str | Path) -> dict[str, Any]:
     actions, action_notes = _read_actions(project_dir)
     settings = _settings(project_dir)
     locations = nav.get("locations", []) if isinstance(nav.get("locations"), list) else []
+    frame = None
+    screen = None
+    screen_score = 0.0
+    shot_path = None
+    try:
+        shot_path, frame = take_screenshot(project_dir)
+        candidates = {
+            "base": nav.get("base_screenshot"),
+            "locations_map": nav.get("locations_map"),
+            "base_to_locations": _extract_png(nav.get("base_to_locations")),
+            "enter_dungeon": _extract_png(nav.get("enter_dungeon")),
+        }
+        best = (None, 0.0)
+        for name, template in candidates.items():
+            found, x, y, dx, score = find_template(project_dir, template, frame=frame)
+            if found and score >= best[1]:
+                best = (name, score)
+        screen, screen_score = best
+    except Exception as exc:
+        nav_notes.append(f"nav_status runtime note: {exc}")
     return {
         "ready": bool(nav),
+        "screen": screen,
+        "screen_score": screen_score,
         "notes": nav_notes + action_notes,
         "match_threshold": settings["match_threshold"],
         "nav_json_present": _nav_path(project_dir).exists(),
         "actions_json_present": _actions_path(project_dir).exists(),
         "locations_count": len([x for x in locations if isinstance(x, dict)]),
         "known_actions_count": len(_load_actions_list(project_dir)),
+        "last_screenshot": shot_path,
         "nav_format": {
             "base_screenshot": nav.get("base_screenshot"),
             "base_to_locations": nav.get("base_to_locations"),
@@ -603,13 +672,50 @@ def nav_status(project_dir: str | Path) -> dict[str, Any]:
     }
 
 
+def _run_known_objects(project_dir: str | Path, frame: Any, log: Callable[..., Any], stop_event: Any) -> tuple[bool, str]:
+    objects = find_known_objects(project_dir, frame)
+    if not objects:
+        return True, "no known objects"
+    for kind, name, x, y, w, h, score in objects:
+        if stop_event is not None and stop_event.is_set():
+            return False, "stopped"
+        _log(log, f"known_object kind={kind} name={name} x={x} y={y} w={w} h={h} score={score:.3f}")
+        action_template = None
+        for item in _load_actions_list(project_dir):
+            if str(item.get("name", "")).strip() == name and str(item.get("action", "")).strip() == kind:
+                action_template = item.get("png") or item.get("template") or item.get("file")
+                break
+        if kind == "loot" and action_template:
+            ok, reason = click_loot(project_dir, action_template, log=log, stop_event=stop_event)
+            if not ok:
+                return False, reason
+        elif kind == "mob" and action_template:
+            ok, reason = attack_mob(project_dir, action_template, log=log, stop_event=stop_event)
+            if not ok:
+                return False, reason
+        elif kind in {"event_choice", "event_skip"} and action_template:
+            ok, reason = run_event(project_dir, action_template, action=kind, log=log, stop_event=stop_event)
+            if not ok:
+                return False, reason
+        elif kind == "skip":
+            _log(log, f"known skip object ignored name={name} score={score:.3f}")
+        else:
+            _log(log, f"Пропущен неизвестный объект на x={x}")
+    return True, "known objects handled"
+
+
 def _go_path(project_dir: str | Path, location_name: str, log: Callable[..., Any], stop_event: Any, launch: bool) -> tuple[bool, str]:
     runtime = _build_runtime(project_dir, log=log)
-    chain = _nav_chain_templates(project_dir, location_name)
+    nav, _ = _read_nav(project_dir)
+    floor_number = int(nav.get("selected_floor", DEFAULT_FLOOR_NUMBER) or DEFAULT_FLOOR_NUMBER)
+    chain = _nav_chain_templates(project_dir, location_name, floor_number=floor_number)
     for key, value in chain.items():
         if value is None and key not in {"base", "locations_map"}:
             return False, f"template missing: {key}"
     try:
+        ok, reason = _go_home(project_dir, log, stop_event)
+        if not ok:
+            return False, reason
         base_tpl = chain["base_to_locations"]
         map_tpl = chain["locations_map"]
         icon_tpl = chain["location_icon"]
@@ -657,9 +763,16 @@ def _go_path(project_dir: str | Path, location_name: str, log: Callable[..., Any
             return False, "hero/start menu not found"
         if not launch:
             return True, "chain verified"
+        frame = runtime.screenshot.capture()
+        ok, reason = _run_known_objects(project_dir, frame, log, stop_event)
+        if not ok:
+            return False, reason
         runtime.adb.tap(x, y)
         time.sleep(1.0)
-        return True, "navigation completed"
+        ok, reason = start_battle(project_dir, log=log, stop_event=stop_event)
+        if not ok:
+            return False, reason
+        return True, "navigation complete"
     finally:
         release(project_dir=project_dir, log=log)
 
