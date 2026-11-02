@@ -26,8 +26,8 @@ except Exception:  # pragma: no cover
 ACTION_LABELS = {
     "loot": "Лут",
     "mob": "Моб",
-    "event_choice": "Событие",
-    "event_skip": "Событие: пропустить",
+    "event_choice": "Событие-выбор",
+    "event_skip": "Событие-пропустить",
     "skip": "Пропустить объект",
 }
 VALID_ACTIONS = {"loot", "mob", "event_choice", "event_skip", "skip"}
@@ -369,14 +369,14 @@ class ControlTab(ttk.Frame):
                 self._matched_score = matched_score
                 self._matched_name = matched_name
                 self._matched_png = matched_png
-                decision = self._ask_known_match(ACTION_LABELS.get(matched_action, matched_action), matched_score)
+                decision = self._ask_known_match(matched_name or ACTION_LABELS.get(matched_action, matched_action), matched_score)
                 if decision == "cancel":
                     return
                 if decision == "keep":
                     if matched_score is None:
-                        self.log(f"Это уже в памяти как {ACTION_LABELS.get(matched_action, matched_action)}")
+                        self.log(f"Это уже в памяти как {matched_name or ACTION_LABELS.get(matched_action, matched_action)}")
                     else:
-                        self.log(f"Это уже в памяти как {ACTION_LABELS.get(matched_action, matched_action)} (score={matched_score:.3f})")
+                        self.log(f"Это уже в памяти как {matched_name or ACTION_LABELS.get(matched_action, matched_action)} (score={matched_score:.3f})")
                     return
                 replace_known = decision == "replace"
             self._ask_action_dialog(crop, matched_action, replace_known)
@@ -435,8 +435,8 @@ class ControlTab(ttk.Frame):
         for value, text in [
             ("loot", "Лут"),
             ("mob", "Моб"),
-            ("event_choice", "Событие"),
-            ("event_skip", "Событие: пропустить"),
+            ("event_choice", "Событие-выбор"),
+            ("event_skip", "Событие-пропустить"),
             ("skip", "Пропустить объект"),
             ("continue", "Продолжить фарм"),
             ("full_stop", "Полная остановка"),
@@ -489,19 +489,12 @@ class ControlTab(ttk.Frame):
         base_dir = self.project_dir / "data" / "base"
         base_dir.mkdir(parents=True, exist_ok=True)
         actions_path = base_dir / "actions.json"
-        png_name = f"manual_{int(time.time() * 1000)}.png"
-        if cv2 is None or not cv2.imwrite(str(base_dir / png_name), crop):
-            raise RuntimeError("Не удалось сохранить шаблон объекта")
         data = self._load_actions_data()
         objects = data["objects"]
+        png_name = f"manual_{int(time.time() * 1000)}.png"
         record_name = self._matched_name or f"manual_{action}_{int(time.time())}"
-        record = {
-            "name": record_name,
-            "png": png_name,
-            "action": action,
-        }
+
         if replace and self._matched_action:
-            replaced = False
             for index, item in enumerate(objects):
                 item_action = str(item.get("action", "")).strip()
                 item_name = str(item.get("name", "")).strip()
@@ -509,17 +502,23 @@ class ControlTab(ttk.Frame):
                 if item_action != self._matched_action:
                     continue
                 if self._matched_name and item_name == self._matched_name:
-                    objects[index] = record
-                    replaced = True
-                    break
+                    png_name = item_png or png_name
+                    objects[index] = {"name": record_name, "png": png_name, "action": action}
+                    if cv2 is None or not cv2.imwrite(str(base_dir / png_name), crop):
+                        raise RuntimeError("Не удалось сохранить шаблон объекта")
+                    actions_path.write_text(json.dumps({"objects": objects}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                    return
                 if self._matched_png and item_png == self._matched_png:
-                    objects[index] = record
-                    replaced = True
-                    break
-            if not replaced:
-                objects.append(record)
-        else:
-            objects.append(record)
+                    png_name = item_png or png_name
+                    objects[index] = {"name": record_name, "png": png_name, "action": action}
+                    if cv2 is None or not cv2.imwrite(str(base_dir / png_name), crop):
+                        raise RuntimeError("Не удалось сохранить шаблон объекта")
+                    actions_path.write_text(json.dumps({"objects": objects}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                    return
+
+        if cv2 is None or not cv2.imwrite(str(base_dir / png_name), crop):
+            raise RuntimeError("Не удалось сохранить шаблон объекта")
+        objects.append({"name": record_name, "png": png_name, "action": action})
         actions_path.write_text(json.dumps({"objects": objects}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     def on_loot(self) -> None:
