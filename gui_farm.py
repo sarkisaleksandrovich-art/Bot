@@ -33,7 +33,6 @@ ACTION_LABELS = {
 }
 
 MAIN_FLAG_CANDIDATES = [
-    ["--teach"],
     [],
 ]
 
@@ -54,6 +53,8 @@ class ControlTab(ttk.Frame):
         self._stop_snapshot_busy = False
         self._manual_dialog_open = False
         self._known_match_name: str | None = None
+        self._known_match_action: str | None = None
+        self._known_match_score = 0.0
 
         self.location_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Готово")
@@ -239,8 +240,6 @@ class ControlTab(ttk.Frame):
 
     def _run_main_process(self) -> tuple[int, str]:
         command = [sys.executable, "main.py"]
-        for extra in MAIN_FLAG_CANDIDATES[0]:
-            command.append(extra)
         profile = self._selected_profile()
         if profile:
             command.extend(["--profile", profile])
@@ -340,6 +339,9 @@ class ControlTab(ttk.Frame):
         if self._manual_dialog_open:
             return
         self._manual_dialog_open = True
+        self._known_match_name = None
+        self._known_match_action = None
+        self._known_match_score = 0.0
         try:
             result = capture_region(self, "Выделите рамкой объект. Объекты без рамки на предыдущем скриншоте считаются новыми.")
             if not result:
@@ -358,6 +360,9 @@ class ControlTab(ttk.Frame):
                 self.log(f"match_known ошибка: {exc}")
             replace_known = False
             if known_action:
+                self._known_match_action = known_action
+                self._known_match_name = known_action
+                self._known_match_score = known_score
                 decision = self._ask_known_match(known_name or known_action, known_score)
                 if decision == "cancel":
                     return
@@ -480,7 +485,7 @@ class ControlTab(ttk.Frame):
         if replace and self._known_match_name:
             replaced = False
             for index, item in enumerate(objects):
-                if isinstance(item, dict) and str(item.get("name", "")).strip() == self._known_match_name:
+                if isinstance(item, dict) and str(item.get("action", "")).strip() == self._known_match_name:
                     objects[index] = record
                     replaced = True
                     break
