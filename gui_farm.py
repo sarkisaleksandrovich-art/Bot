@@ -340,48 +340,36 @@ class ControlTab(ttk.Frame):
             if not result:
                 return
             crop, _bbox = result
-            try:
-                import nav
-                matched = nav.match_known(self.project_dir, crop)
-            except Exception as exc:
-                self.log(f"match_known ошибка: {exc}")
-                matched = None
-            replace_known = False
-            matched_action: str | None = None
-            matched_score: float | None = None
-            matched_name: str | None = None
-            matched_png: str | None = None
-            if isinstance(matched, tuple) and len(matched) >= 1:
-                matched_action = str(matched[0]).strip() or None
-                if len(matched) >= 2:
-                    try:
-                        matched_score = float(matched[1])
-                    except Exception:
-                        matched_score = None
-                if len(matched) >= 3:
-                    matched_name = str(matched[2]).strip() or None
-                if len(matched) >= 4:
-                    matched_png = str(matched[3]).strip() or None
-            elif isinstance(matched, str):
-                matched_action = matched.strip() or None
-            if matched_action:
-                self._matched_action = matched_action
-                self._matched_score = matched_score
-                self._matched_name = matched_name
-                self._matched_png = matched_png
-                decision = self._ask_known_match(matched_name or ACTION_LABELS.get(matched_action, matched_action), matched_score)
-                if decision == "cancel":
-                    return
-                if decision == "keep":
-                    if matched_score is None:
-                        self.log(f"Это уже в памяти как {matched_name or ACTION_LABELS.get(matched_action, matched_action)}")
-                    else:
-                        self.log(f"Это уже в памяти как {matched_name or ACTION_LABELS.get(matched_action, matched_action)} (score={matched_score:.3f})")
-                    return
-                replace_known = decision == "replace"
-            self._ask_action_dialog(crop, matched_action, replace_known)
+            remembered_action = self._match_known_action(crop)
+            self._ask_action_dialog(crop, remembered_action, replace_known=False)
         finally:
             self._manual_dialog_open = False
+
+    def _match_known_action(self, crop: Any) -> str | None:
+        try:
+            import nav
+            matched = nav.match_known(self.project_dir, crop)
+        except Exception as exc:
+            self.log(f"match_known ошибка: {exc}")
+            matched = None
+        if isinstance(matched, str):
+            matched_action = matched.strip() or None
+        else:
+            matched_action = None
+        self._matched_action = matched_action
+        self._matched_score = None
+        self._matched_name = None
+        self._matched_png = None
+        if matched_action:
+            decision = self._ask_known_match(ACTION_LABELS.get(matched_action, matched_action), None)
+            if decision == "cancel":
+                return None
+            if decision == "keep":
+                self.log(f"Это уже в памяти как {ACTION_LABELS.get(matched_action, matched_action)}")
+                return None
+            if decision == "replace":
+                return matched_action
+        return matched_action
 
     def _ask_known_match(self, known_name: str, score: float | None) -> str:
         win = tk.Toplevel(self)
@@ -537,7 +525,11 @@ class ControlTab(ttk.Frame):
         if not result:
             return
         crop, _bbox = result
-        self._manual_execute_action(action, crop)
+        remembered_action = self._match_known_action(crop)
+        if remembered_action is None and self._matched_action:
+            return
+        replace_known = bool(self._matched_action and remembered_action == self._matched_action)
+        self._ask_action_dialog(crop, remembered_action or action, replace_known=replace_known)
 
     def do_full_stop(self) -> None:
         self.stop_event.set()
@@ -551,12 +543,27 @@ class ControlTab(ttk.Frame):
         except Exception as exc:
             self.log(f"release ошибка: {exc}")
         root = getattr(self.app, "root", self.winfo_toplevel())
-        for child in list(root.winfo_children()):
-            if isinstance(child, tk.Toplevel):
+        try:
+            for widget in list(root.winfo_children()):
                 try:
-                    child.destroy()
+                    if isinstance(widget, tk.Toplevel):
+                        widget.destroy()
                 except Exception:
                     pass
+            for widget_name in root.tk.call("wm", "stackorder", "."):
+                if widget_name == ".":
+                    continue
+                try:
+                    widget = root.nametowidget(widget_name)
+                except Exception:
+                    continue
+                if isinstance(widget, tk.Toplevel):
+                    try:
+                        widget.destroy()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         self.status_var.set("Полная остановка")
         self.refresh_ready_state()
 
