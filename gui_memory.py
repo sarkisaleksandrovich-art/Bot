@@ -14,6 +14,7 @@ from tkinter import messagebox, ttk
 
 
 DEFAULT_DATA_ROOT = Path("data/profiles")
+DEFAULT_FEATURES_FILE = "features.json"
 
 
 def _utc_now() -> str:
@@ -68,12 +69,36 @@ def _profile_dir(profile: str, data_root: Path | str = DEFAULT_DATA_ROOT) -> Pat
     return _profiles_root(data_root) / profile_name
 
 
-def features_path(profile: str, data_root: Path | str = DEFAULT_DATA_ROOT) -> Path:
-    return _profile_dir(profile, data_root) / "features.json"
+def _features_filename(app: Any | None = None) -> str:
+    config = getattr(app, "config", None)
+    if isinstance(config, dict):
+        app_config = config.get("app")
+        if isinstance(app_config, dict):
+            value = app_config.get("features_file")
+            if isinstance(value, str) and value.strip():
+                return Path(value).name
+    return DEFAULT_FEATURES_FILE
 
 
-def load_features(profile: str, data_root: Path | str = DEFAULT_DATA_ROOT) -> dict[str, Any]:
-    return _validate_json(features_path(profile, data_root))
+def features_path(
+    profile: str,
+    data_root: Path | str = DEFAULT_DATA_ROOT,
+    *,
+    features_file: str = DEFAULT_FEATURES_FILE,
+) -> Path:
+    filename = Path(features_file).name
+    if not filename:
+        raise ValueError("features_file is required")
+    return _profile_dir(profile, data_root) / filename
+
+
+def load_features(
+    profile: str,
+    data_root: Path | str = DEFAULT_DATA_ROOT,
+    *,
+    features_file: str = DEFAULT_FEATURES_FILE,
+) -> dict[str, Any]:
+    return _validate_json(features_path(profile, data_root, features_file=features_file))
 
 
 def _records(data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -95,8 +120,13 @@ def list_profiles(data_root: Path | str = DEFAULT_DATA_ROOT) -> list[str]:
     return sorted(item.name for item in root.iterdir() if item.is_dir() and item.name != "base")
 
 
-def list_feature_ids(profile: str, data_root: Path | str = DEFAULT_DATA_ROOT) -> list[str]:
-    return [str(record["id"]) for record in _records(load_features(profile, data_root))]
+def list_feature_ids(
+    profile: str,
+    data_root: Path | str = DEFAULT_DATA_ROOT,
+    *,
+    features_file: str = DEFAULT_FEATURES_FILE,
+) -> list[str]:
+    return [str(record["id"]) for record in _records(load_features(profile, data_root, features_file=features_file))]
 
 
 def delete_one_feature(
@@ -105,6 +135,7 @@ def delete_one_feature(
     data_root: Path | str = DEFAULT_DATA_ROOT,
     *,
     bot_running: Callable[[], bool] | bool = False,
+    features_file: str = DEFAULT_FEATURES_FILE,
 ) -> None:
     running = bot_running() if callable(bot_running) else bool(bot_running)
     if running:
@@ -112,7 +143,7 @@ def delete_one_feature(
     if not isinstance(feature_id, str) or not feature_id.strip():
         raise ValueError("A single feature id is required")
 
-    path = features_path(profile, data_root)
+    path = features_path(profile, data_root, features_file=features_file)
     original = _validate_json(path)
     records = _records(original)
     matches = [record for record in records if record.get("id") == feature_id]
@@ -137,29 +168,16 @@ def delete_one_feature(
 
     backup = _backup(path)
     try:
+        png.unlink()
         _atomic_write_json(path, updated)
         _validate_json(path)
-        try:
-            png.unlink()
-        except Exception:
-            try:
-                _validate_json(backup)
-                shutil.copy2(backup, path)
-                _validate_json(path)
-            except Exception as restore_error:
-                raise RuntimeError(f"PNG deletion failed and JSON rollback failed: {restore_error}") from restore_error
-            raise
     except Exception:
-        if path.exists():
-            try:
-                _validate_json(path)
-            except Exception:
-                try:
-                    _validate_json(backup)
-                    shutil.copy2(backup, path)
-                    _validate_json(path)
-                except Exception as restore_error:
-                    raise RuntimeError(f"Deletion failed and JSON rollback failed: {restore_error}") from restore_error
+        try:
+            _validate_json(backup)
+            shutil.copy2(backup, path)
+            _validate_json(path)
+        except Exception as restore_error:
+            raise RuntimeError(f"Deletion failed and JSON rollback failed: {restore_error}") from restore_error
         raise
 
 
@@ -192,6 +210,9 @@ class MemoryTab(ttk.Frame):
         if project_dir:
             return Path(project_dir) / DEFAULT_DATA_ROOT
         return DEFAULT_DATA_ROOT
+
+    def _features_file(self) -> str:
+        return _features_filename(self.app)
 
     def _bot_running(self) -> bool:
         for name in ("is_bot_running", "bot_running"):
@@ -236,7 +257,7 @@ class MemoryTab(ttk.Frame):
             return
 
         try:
-            records = _records(load_features(current, self._data_root()))
+            records = _records(load_features(current, self._data_root(), features_file=self._features_file()))
             for record in records:
                 self.listbox.insert(tk.END, str(record["id"]))
             self.status_var.set(f"Иконок: {len(records)}")
@@ -260,7 +281,7 @@ class MemoryTab(ttk.Frame):
 
         if not messagebox.askyesno(
             "Подтверждение",
-            f"Удалить иконку {feature_id} и её PNG?\nБудет создан features.json.bak.",
+            f"Удалить иконку {feature_id} и её PNG?\nБудет создан {self._features_file()}.bak.",
             parent=self.winfo_toplevel(),
         ):
             return
@@ -271,6 +292,7 @@ class MemoryTab(ttk.Frame):
                 feature_id,
                 self._data_root(),
                 bot_running=self._bot_running,
+                features_file=self._features_file(),
             )
         except Exception as exc:
             messagebox.showerror("Удаление", str(exc), parent=self.winfo_toplevel())
