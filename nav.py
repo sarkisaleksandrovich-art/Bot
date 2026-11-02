@@ -377,10 +377,7 @@ def hold(side: str, project_dir: str | Path = ".", log: Callable[..., Any] = pri
     x, y = points[side]
     chunk_ms = int(settings["hold_chunk_ms"])
     with _HOLD_LOCK:
-        if _HOLD_ACTIVE_SIDE == side and (
-            (_HOLD_THREAD is not None and _HOLD_THREAD.is_alive()) or
-            (_HOLD_THREAD is None and _probe_motionevent(runtime))
-        ):
+        if _HOLD_ACTIVE_SIDE == side and (((_HOLD_THREAD is not None and _HOLD_THREAD.is_alive())) or (_HOLD_THREAD is None and _probe_motionevent(runtime))):
             _log(log, f"hold side={side} already active")
             return True
         release(project_dir=project_dir, log=log)
