@@ -249,13 +249,16 @@ class FarmTab(ttk.Frame):
 
     def _run_worker(self) -> None:
         message = "Остановлено"
+        location_name = self.location_var.get().strip()
+        floor_name = self.floor_var.get().strip()
+        profile_name = self.profile_var.get().strip()
         try:
             import nav
 
             ok, reason = nav.go_to_dungeon(
                 self.project_dir,
-                self.location_var.get().strip(),
-                self.floor_var.get().strip(),
+                location_name,
+                floor_name,
                 log=self._log,
                 stop_event=self.stop_event,
             )
@@ -264,24 +267,35 @@ class FarmTab(ttk.Frame):
             elif self.stop_event.is_set():
                 message = "Остановлено"
             else:
-                code, out = self._run_main_process()
-                message = "Фарм завершён" if code == 0 else f"main.py завершился с кодом {code}: {out}"
+                code, out = self._run_main_process(profile_name)
+                if self.stop_event.is_set():
+                    message = "Остановлено"
+                else:
+                    message = "Фарм завершён" if code == 0 else f"main.py завершился с кодом {code}: {out}"
         except Exception as exc:
             message = f"Ошибка: {exc}"
         self.after(0, lambda: self._finish(message))
 
-    def _run_main_process(self) -> tuple[int, str]:
+    def _run_main_process(self, profile_name: str) -> tuple[int, str]:
         command = [
             sys.executable,
             "main.py",
             "--profile",
-            self.profile_var.get().strip(),
+            profile_name,
             "--floor-from",
             "1",
             "--floor-to",
             "1",
         ]
         self._log(f"[FARM] cmd={' '.join(command)}")
+        env = None
+        try:
+            import os
+
+            env = os.environ.copy()
+            env["PYTHONIOENCODING"] = "utf-8"
+        except Exception:
+            env = None
         self.process = subprocess.Popen(
             command,
             cwd=str(self.project_dir),
@@ -291,6 +305,7 @@ class FarmTab(ttk.Frame):
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=env,
         )
         last_line = ""
         assert self.process.stdout is not None
@@ -310,9 +325,7 @@ class FarmTab(ttk.Frame):
                 self.process.terminate()
             except Exception:
                 pass
-        self.running = False
         self.status_var.set("Фарм остановлен")
-        self._refresh_ready_state()
 
     def _finish(self, message: str) -> None:
         self.running = False
