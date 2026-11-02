@@ -15,7 +15,6 @@ BOT_ACTIONS: tuple[tuple[str, str, bool], ...] = (
     ("Скриншот", "--capture", False),
     ("Обучение", "--teach", True),
     ("Обучение без кликов", "--teach-only", True),
-    ("Список профилей", "--list-profiles", False),
 )
 
 
@@ -365,31 +364,18 @@ class GuiApp:
 
 
 def start_farm_navigation(location_id: str, floor_number: int) -> Any:
-    """Delegate farm navigation to NavigationController without duplicating ADB/template logic."""
-    try:
-        from bot.config import load_config
-        from bot.logging_setup import setup_logging
-        from bot.adb_controller import ADBController
-        from bot.screenshot import ScreenshotProvider
-        from bot.vision import VisionEngine
-        from nav import NavigationController
-    except Exception as exc:
-        raise RuntimeError(f"Не удалось подготовить навигацию: {exc}") from exc
+    """Delegate farm navigation to nav.go_to_dungeon using the real nav.py API."""
+    import nav
 
-    config = load_config("config.yaml")
-    logger = setup_logging(config)
-    adb = ADBController(config, logger)
-    screenshot = ScreenshotProvider(adb, config, logger)
-    vision = VisionEngine(config, logger)
-    adb.connect()
-    controller = NavigationController(
-        adb=adb,
-        screenshot=screenshot,
-        vision=vision,
-        base_dir=config.base_dir,
-        logger=logger,
+    stop_event = threading.Event()
+    ok, reason = nav.go_to_dungeon(
+        Path(__file__).resolve().parent,
+        location_id,
+        str(floor_number),
+        log=print,
+        stop_event=stop_event,
     )
-    return controller.navigate_from_current_screen(location_id=location_id, floor_number=floor_number)
+    return ok, reason
 
 
 def launch_gui(profile: str | None = None) -> int:
