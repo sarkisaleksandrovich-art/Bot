@@ -28,6 +28,7 @@ DEFAULT_HOLD_CHUNK_MS = 250
 DEFAULT_FRAME_INTERVAL_MS = 250
 DEFAULT_STABLE_TIMEOUT_S = 3.0
 DEFAULT_FLOOR_NUMBER = 1
+DEFAULT_ANIMATION_DIFF_THRESHOLD = 0.002
 
 ACTION_KIND_LABELS = {
     "loot": "Лут",
@@ -476,7 +477,7 @@ def approach_target(project_dir: str | Path, template: Any, log: Callable[..., A
                 return False, "target moves away or hero stuck at edge"
             if last_frame is not None and current_side is not None and np is not None:
                 try:
-                    moved = runtime.vision.is_animating(last_frame, frame, 0.002)
+                    moved = runtime.vision.is_animating(last_frame, frame, DEFAULT_ANIMATION_DIFF_THRESHOLD)
                 except Exception:
                     moved = True
                 if not moved:
