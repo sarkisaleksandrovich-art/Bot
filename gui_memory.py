@@ -12,7 +12,8 @@ from typing import Any, Callable
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-PROFILE_IDS = tuple(f"block{i}" for i in range(1, 8))
+
+DEFAULT_DATA_ROOT = Path("data/profiles")
 
 
 def _utc_now() -> str:
@@ -56,17 +57,22 @@ def _backup(path: Path) -> Path:
     return backup
 
 
-def _profile_dir(profile: str, data_root: Path | str = Path("data/profiles")) -> Path:
-    if profile not in PROFILE_IDS:
-        raise ValueError(f"Unknown profile: {profile}")
-    return Path(data_root) / profile
+def _profiles_root(data_root: Path | str = DEFAULT_DATA_ROOT) -> Path:
+    return Path(data_root)
 
 
-def features_path(profile: str, data_root: Path | str = Path("data/profiles")) -> Path:
+def _profile_dir(profile: str, data_root: Path | str = DEFAULT_DATA_ROOT) -> Path:
+    profile_name = str(profile).strip()
+    if not profile_name:
+        raise ValueError("Profile name is required")
+    return _profiles_root(data_root) / profile_name
+
+
+def features_path(profile: str, data_root: Path | str = DEFAULT_DATA_ROOT) -> Path:
     return _profile_dir(profile, data_root) / "features.json"
 
 
-def load_features(profile: str, data_root: Path | str = Path("data/profiles")) -> dict[str, Any]:
+def load_features(profile: str, data_root: Path | str = DEFAULT_DATA_ROOT) -> dict[str, Any]:
     return _validate_json(features_path(profile, data_root))
 
 
@@ -82,7 +88,24 @@ def _records(data: dict[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
-def delete_one_feature(profile: str, feature_id: str, data_root: Path | str = Path("data/profiles"), *, bot_running: Callable[[], bool] | bool = False) -> None:
+def list_profiles(data_root: Path | str = DEFAULT_DATA_ROOT) -> list[str]:
+    root = _profiles_root(data_root)
+    if not root.exists():
+        return []
+    return sorted(item.name for item in root.iterdir() if item.is_dir() and item.name != "base")
+
+
+def list_feature_ids(profile: str, data_root: Path | str = DEFAULT_DATA_ROOT) -> list[str]:
+    return [str(record["id"]) for record in _records(load_features(profile, data_root))]
+
+
+def delete_one_feature(
+    profile: str,
+    feature_id: str,
+    data_root: Path | str = DEFAULT_DATA_ROOT,
+    *,
+    bot_running: Callable[[], bool] | bool = False,
+) -> None:
     running = bot_running() if callable(bot_running) else bool(bot_running)
     if running:
         raise RuntimeError("Bot is running; memory editing is locked")
@@ -99,6 +122,7 @@ def delete_one_feature(profile: str, feature_id: str, data_root: Path | str = Pa
     filename = matches[0].get("file")
     if not isinstance(filename, str) or not filename.strip():
         raise ValueError(f"Feature {feature_id!r} has no PNG path")
+
     png = Path(filename)
     if not png.is_absolute():
         png = path.parent / png
@@ -109,7 +133,6 @@ def delete_one_feature(profile: str, feature_id: str, data_root: Path | str = Pa
 
     backup = _backup(path)
     try:
-        # Delete the asset first. If it fails, the JSON remains unchanged.
         png.unlink()
         updated = copy.deepcopy(original)
         updated["templates"] = [record for record in records if record.get("id") != feature_id]
@@ -117,7 +140,6 @@ def delete_one_feature(profile: str, feature_id: str, data_root: Path | str = Pa
         _atomic_write_json(path, updated)
         _validate_json(path)
     except Exception:
-        # Restore the original JSON if anything after the PNG deletion fails.
         try:
             _validate_json(backup)
             shutil.copy2(backup, path)
@@ -128,7 +150,7 @@ def delete_one_feature(profile: str, feature_id: str, data_root: Path | str = Pa
 
 
 class MemoryTab(ttk.Frame):
-    """In-place editor allowing deletion of exactly one selected icon."""
+    """Editor tab for deleting exactly one selected icon from the chosen profile."""
 
     def __init__(self, parent: tk.Misc, app: Any) -> None:
         super().__init__(parent, padding=12)
@@ -142,11 +164,20 @@ class MemoryTab(ttk.Frame):
     def _initial_profile(self) -> str:
         value = getattr(self.app, "profile_var", None)
         selected = value.get() if hasattr(value, "get") else value
-        return selected if selected in PROFILE_IDS else PROFILE_IDS[0]
+        selected_text = str(selected).strip() if selected is not None else ""
+        if selected_text:
+            return selected_text
+        profiles = list_profiles(self._data_root())
+        return profiles[0] if profiles else ""
 
     def _data_root(self) -> Path:
         root = getattr(self.app, "data_root", None)
-        return Path(root) if root else Path("data/profiles")
+        if root:
+            return Path(root)
+        project_dir = getattr(self.app, "project_dir", None)
+        if project_dir:
+            return Path(project_dir) / DEFAULT_DATA_ROOT
+        return DEFAULT_DATA_ROOT
 
     def _bot_running(self) -> bool:
         for name in ("is_bot_running", "bot_running"):
@@ -160,17 +191,33 @@ class MemoryTab(ttk.Frame):
 
     def _build(self) -> None:
         ttk.Label(self, text="Профиль:").pack(anchor=tk.W)
-        combo = ttk.Combobox(self, textvariable=self.profile_var, values=PROFILE_IDS, state="readonly")
+        combo = ttk.Combobox(self, textvariable=self.profile_var, state="readonly")
         combo.pack(fill=tk.X, pady=(0, 8))
         combo.bind("<<ComboboxSelected>>", lambda _event: self.reload())
-        self.listbox.pack(fill=tk.BOTH, expand=True)
-        ttk.Button(self, text="Удалить выбранную", command=self.delete_selected).pack(anchor=tk.E, pady=(8, 0))
+        self.profile_combo = combo
+
+        ttk.Label(self, text="Иконки профиля:").pack(anchor=tk.W)
+        self.listbox.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        ttk.Button(self, text="Удалить выбранную", command=self.delete_selected).pack(anchor=tk.E)
         ttk.Label(self, textvariable=self.status_var).pack(anchor=tk.W, pady=(8, 0))
 
     def reload(self) -> None:
+        profiles = list_profiles(self._data_root())
+        self.profile_combo["values"] = profiles
+
+        current = self.profile_var.get().strip()
+        if profiles and current not in profiles:
+            self.profile_var.set(profiles[0])
+            current = profiles[0]
+
         self.listbox.delete(0, tk.END)
+        if not current:
+            self.status_var.set("Нет профилей")
+            return
+
         try:
-            records = _records(load_features(self.profile_var.get(), self._data_root()))
+            records = _records(load_features(current, self._data_root()))
             for record in records:
                 self.listbox.insert(tk.END, str(record["id"]))
             self.status_var.set(f"Иконок: {len(records)}")
@@ -182,17 +229,34 @@ class MemoryTab(ttk.Frame):
         if len(selection) != 1:
             messagebox.showwarning("Удаление", "Выберите ровно одну иконку.", parent=self.winfo_toplevel())
             return
+
         feature_id = self.listbox.get(selection[0])
         if self._bot_running():
-            messagebox.showwarning("Удаление заблокировано", "Нельзя изменять память при работающем боте.", parent=self.winfo_toplevel())
+            messagebox.showwarning(
+                "Удаление заблокировано",
+                "Нельзя изменять память при работающем боте.",
+                parent=self.winfo_toplevel(),
+            )
             return
-        if not messagebox.askyesno("Подтверждение", f"Удалить иконку {feature_id} и её PNG?\nБудет создан features.json.bak.", parent=self.winfo_toplevel()):
+
+        if not messagebox.askyesno(
+            "Подтверждение",
+            f"Удалить иконку {feature_id} и её PNG?\nБудет создан features.json.bak.",
+            parent=self.winfo_toplevel(),
+        ):
             return
+
         try:
-            delete_one_feature(self.profile_var.get(), feature_id, self._data_root(), bot_running=self._bot_running)
+            delete_one_feature(
+                self.profile_var.get(),
+                feature_id,
+                self._data_root(),
+                bot_running=self._bot_running,
+            )
         except Exception as exc:
             messagebox.showerror("Удаление", str(exc), parent=self.winfo_toplevel())
             return
+
         self.reload()
         self.status_var.set(f"Удалено: {feature_id}; JSON проверен, создан .bak")
 
@@ -203,4 +267,12 @@ def open_memory_editor(parent: tk.Misc, app: Any) -> MemoryTab:
     return tab
 
 
-__all__ = ["MemoryTab", "delete_one_feature", "features_path", "load_features", "open_memory_editor"]
+__all__ = [
+    "MemoryTab",
+    "delete_one_feature",
+    "features_path",
+    "list_feature_ids",
+    "list_profiles",
+    "load_features",
+    "open_memory_editor",
+]
