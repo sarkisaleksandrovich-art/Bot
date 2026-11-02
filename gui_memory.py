@@ -131,21 +131,35 @@ def delete_one_feature(
     if not png.is_file():
         raise FileNotFoundError(f"PNG is missing; JSON was not changed: {png}")
 
+    updated = copy.deepcopy(original)
+    updated["templates"] = [record for record in records if record.get("id") != feature_id]
+    updated["updated_at"] = _utc_now()
+
     backup = _backup(path)
     try:
-        png.unlink()
-        updated = copy.deepcopy(original)
-        updated["templates"] = [record for record in records if record.get("id") != feature_id]
-        updated["updated_at"] = _utc_now()
         _atomic_write_json(path, updated)
         _validate_json(path)
-    except Exception:
         try:
-            _validate_json(backup)
-            shutil.copy2(backup, path)
-            _validate_json(path)
-        except Exception as restore_error:
-            raise RuntimeError(f"Deletion failed and JSON rollback failed: {restore_error}") from restore_error
+            png.unlink()
+        except Exception:
+            try:
+                _validate_json(backup)
+                shutil.copy2(backup, path)
+                _validate_json(path)
+            except Exception as restore_error:
+                raise RuntimeError(f"PNG deletion failed and JSON rollback failed: {restore_error}") from restore_error
+            raise
+    except Exception:
+        if path.exists():
+            try:
+                _validate_json(path)
+            except Exception:
+                try:
+                    _validate_json(backup)
+                    shutil.copy2(backup, path)
+                    _validate_json(path)
+                except Exception as restore_error:
+                    raise RuntimeError(f"Deletion failed and JSON rollback failed: {restore_error}") from restore_error
         raise
 
 
