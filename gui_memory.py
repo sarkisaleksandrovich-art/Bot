@@ -12,7 +12,6 @@ from typing import Any, Callable
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-
 DEFAULT_DATA_ROOT = Path("data/profiles")
 DEFAULT_FEATURES_FILE = "features.json"
 
@@ -113,6 +112,14 @@ def _records(data: dict[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
+def _record_label(record: dict[str, Any]) -> str:
+    feature_id = str(record.get("id", "")).strip()
+    file_name = str(record.get("file", "")).strip()
+    if file_name:
+        return f"{feature_id} — {Path(file_name).name}"
+    return feature_id
+
+
 def list_profiles(data_root: Path | str = DEFAULT_DATA_ROOT) -> list[str]:
     root = _profiles_root(data_root)
     if not root.exists():
@@ -190,6 +197,7 @@ class MemoryTab(ttk.Frame):
         self.profile_var = tk.StringVar(value=self._initial_profile())
         self.status_var = tk.StringVar()
         self.listbox = tk.Listbox(self, selectmode=tk.SINGLE, exportselection=False)
+        self._display_to_feature_id: dict[str, str] = {}
         self._build()
         self.reload()
 
@@ -251,6 +259,7 @@ class MemoryTab(ttk.Frame):
             self.profile_var.set(profiles[0])
             current = profiles[0]
 
+        self._display_to_feature_id.clear()
         self.listbox.delete(0, tk.END)
         if not current:
             self.status_var.set("Нет профилей")
@@ -259,7 +268,9 @@ class MemoryTab(ttk.Frame):
         try:
             records = _records(load_features(current, self._data_root(), features_file=self._features_file()))
             for record in records:
-                self.listbox.insert(tk.END, str(record["id"]))
+                label = _record_label(record)
+                self._display_to_feature_id[label] = str(record["id"])
+                self.listbox.insert(tk.END, label)
             self.status_var.set(f"Иконок: {len(records)}")
         except Exception as exc:
             self.status_var.set(f"JSON: {exc}")
@@ -270,7 +281,12 @@ class MemoryTab(ttk.Frame):
             messagebox.showwarning("Удаление", "Выберите ровно одну иконку.", parent=self.winfo_toplevel())
             return
 
-        feature_id = self.listbox.get(selection[0])
+        selected_label = self.listbox.get(selection[0])
+        feature_id = self._display_to_feature_id.get(selected_label, "")
+        if not feature_id:
+            messagebox.showerror("Удаление", "Не удалось определить выбранную иконку.", parent=self.winfo_toplevel())
+            return
+
         if self._bot_running():
             messagebox.showwarning(
                 "Удаление заблокировано",
