@@ -1,50 +1,49 @@
-# Verified findings
-
 | source ID | verdict | file:line | reason |
 |---|---|---|---|
-| NAV-001 | CONFIRMED | bot/floor.py:286-291 | `_wait_battle_end()` returns when `room_name in {"room_screen", "event_screen", "passage_screen"} and not auto_matches`. |
-| NAV-002 | CONFIRMED | nav.py:100-107, 127-134, 250-273, 305-322 | `_settings()` calls `_read_nav()`, `_load_actions_list()` calls `_read_actions()`, and loops call `_load_image(...)`. |
-| NAV-003 | NOT CONFIRMED | bot/explorer.py:343-360 | The cited explorer source was not fetched in this verification pass; the claim is unsupported by source read here. |
-| NAV-004 | CONFIRMED | nav.py:120-125 | `frame = runtime.screenshot.capture()` is immediately passed to `runtime.screenshot.save(frame, str(path))` with no validation. |
-| NAV-005 | NOT CONFIRMED | bot/vision.py:381-401 | The cited vision source was not fetched in this verification pass; the claim is unsupported by source read here. |
-| NAV-006 | CONFIRMED | bot/floor.py:388-391 | `_handle_pause_on_step()` directly executes `frame = self.screenshot.capture()`. |
-| GUI-001 | CONFIRMED | gui_farm.py:118-128 | The listener callback directly executes `self.after(0, self.do_start)` and related Tk calls. |
-| GUI-002 | CONFIRMED | gui_farm.py:216-219, 329-332 | Worker code calls `self.after(0, ...)` after subprocess/navigation work. |
-| GUI-003 | PARTIAL | gui.py:105-114; gui_base.py:728-731 | `GuiApp.log()` only queues, while `SettingsTab` is the reader; this proves coupling, not absence of every possible log panel. |
-| GUI-004 | CONFIRMED | gui.py:142-152 | `run_main()` logs `Запуск ... не реализован в этом окне` instead of launching the command. |
-| GUI-005 | PARTIAL | gui_base.py:76-78, 170-179, 903-906 | Relative globals exist, but the cited project-relative mismatch could not be fully checked because gui_base.py was unavailable. |
-| GUI-006 | NOT CONFIRMED | gui_base.py:345-372 | gui_base.py was not fetched successfully; no quote from main verifies the scrollbar claim. |
-| ADB-001 | CONFIRMED | bot/adb_controller.py:113-123; bot/screenshot.py:24-30 | `screencap_png()` calls `_run_adb(["exec-out", "screencap", "-p"], ...)` and capture calls it every time. |
-| ADB-002 | CONFIRMED | nav.py:333-337 | `_hold_swipe_worker()` repeatedly calls `runtime.adb.swipe(...)` until stopped. |
-| ADB-003 | CONFIRMED | bot/adb_controller.py:240-271 | Source assigns `ADBController._run_adb = _run_adb_checked` and `ADBController.__init__ = _init_compat`. |
-| ADB-004 | CONFIRMED | nav.py:43-47, 357-358 | Hold state is module-global and release suppresses `motionevent UP` exceptions with `except Exception: pass`. |
-| ADB-005 | CONFIRMED | nav.py:481-486 | Fallback computes `tx, ty = width // 2, height // 2` and calls `runtime.adb.tap(...)`. |
-| SAF-001 | CONFIRMED | nav.py:458-470 | After `time.sleep(1.0)`, code can reach `return True, "battle started"` without positive battle-state verification. |
-| SAF-002 | CONFIRMED | nav.py:463-467 | Missing autobattle leads to a center tap with no template verification. |
-| SAF-003 | CONFIRMED | nav.py:444-460; bot/safety.py:100-116 | nav performs taps, while `SafetyManager.ensure_action_allowed` exists; no call is present in the cited path. |
-| SAF-004 | CONFIRMED | bot/safety.py:87-98 | `is_action_allowed()` returns true only for the listed policy names and otherwise returns `False`. |
-| SAF-005 | CONFIRMED | nav.py:445, 463-468 | Code loads `autobattle_on` and center-taps when it is not found; no enable key is used. |
-| SAF-006 | CONFIRMED | nav.py:568-594 | Navigation taps are followed by fixed `time.sleep(1.0)` calls and no explicit next-state assertion before advancing. |
-| CON-001 | CONFIRMED | gui_farm.py:239-245 | `_terminate_main_process()` only calls `terminate()` and has no `wait()` or `kill()`. |
-| CON-002 | CONFIRMED | gui_farm.py:204-214, 234-238 | Code iterates `for line in self.main_process.stdout:` while stop only calls terminate. |
-| CON-003 | CONFIRMED | gui_farm.py:118-135 | A listener thread runs `worker`, whose callback invokes Tk `self.after(...)`. |
-| CON-004 | CONFIRMED | gui_farm.py:248-274, 457-485 | Async worker and `do_full_stop()` both call release and mutate shutdown-related state without synchronization. |
-| CON-005 | CONFIRMED | nav.py:156-176 | `_build_runtime()` returns `_RUNTIME_CACHE[key]` and stores live runtime objects without invalidation in the cited code. |
-| CON-006 | CONFIRMED | nav.py:43-47, 386-440 | Hold/release use module globals `_HOLD_THREAD`, `_HOLD_STOP_EVENT`, and `_HOLD_ACTIVE_SIDE`. |
-| CON-007 | NOT CONFIRMED | bot/knowledge.py:275-306, 349-380 | The cited knowledge source was not fetched in this verification pass; the claim is unsupported by source read here. |
-| ERR-001 | CONFIRMED | bot/adb_controller.py:21-22, 242-251 | Canonical `__init__` has `(adb_path, serial, exec_timeout_s)`, then is monkey-patched to accept config-style args. |
-| ERR-002 | CONFIRMED | nav.py:217-220 | `except Exception: return False, 0, 0, 0, 0.0` suppresses all vision errors. |
-| ERR-003 | CONFIRMED | nav.py:243-249 | Per-template code uses `except Exception: continue`. |
-| ERR-004 | CONFIRMED | nav.py:322-324, 333-341 | Hold worker catches `Exception` and release catches exceptions around UP without reporting failure. |
-| ERR-005 | CONFIRMED | nav.py:407-410 | `approach_target()` catches `Exception as exc` and returns `(False, str(exc))`. |
-| ERR-014 | CONFIRMED | bot/floor.py:287-290 | After labeling, `_stable_capture_or_teach()` executes `return last_frame`. |
-| ERR-017 | NOT CONFIRMED | gui_base.py:183-188 | gui_base.py was not fetched successfully; no quote from main verifies this claim. |
-| ERR-018 | CONFIRMED | gui_base.py:257-260; bot/adb_controller.py:21-22 | The cited construction is `ADBController(config, logger)` versus the declared canonical signature. |
-| ERR-021 | CONFIRMED | gui_farm.py:147-151 | `_read_nav_json()` catches `Exception` and returns `{}`. |
-
-## Counts
-- CONFIRMED: 31
-- PARTIAL: 2
-- NOT CONFIRMED: 5
-
-Not confirmed or partial: NAV-003, NAV-005, GUI-003, GUI-005, GUI-006, ADB-? (none), CON-007, ERR-017.
+| NAV-001 | CONFIRMED | `bot/floor.py:151-153` | `if room_name in {"room_screen", "event_screen", "passage_screen"} and not auto_matches: return stable_frame` proves battle-end is inferred from missing `auto_battle` on those screens. |
+| NAV-002 | CONFIRMED | `nav.py:111-119, 223-236, 250-273, 215-216` | `_settings()` does `nav, _ = _read_nav(project_dir)`, `_load_actions_list()` does `actions, _ = _read_actions(project_dir)`, and loops call `_load_image(...)` per item / `image = _load_image(template_path)`. |
+| NAV-003 | CONFIRMED | `bot/explorer.py:349-352` | `_frame_signature()` returns `str(hash(np.ascontiguousarray(small).tobytes()))`, i.e. Python built-in salted `hash(...)`. |
+| NAV-004 | CONFIRMED | `nav.py:193-198` | `frame = runtime.screenshot.capture()` is immediately passed to `runtime.screenshot.save(frame, str(path))` with no `None`/error validation. |
+| NAV-005 | NOT CONFIRMED | `bot/vision.py` unread | Cited high finding requires `bot/vision.py`, but that file was not read in this run, so I cannot verify it from source. |
+| NAV-006 | CONFIRMED | `bot/floor.py:201-204` | Floor pause path does `if self.teacher_ui.pause_requested(): frame = self.screenshot.capture(); self._pause_and_label(frame)`, unlike explorer stable pause capture. |
+| GUI-001 | CONFIRMED | `gui_farm.py:121-128, 134-135` | `on_press()` in listener thread calls `self.after(0, self.do_start/stop/event/full_stop)` and the listener itself runs in `threading.Thread(target=worker, daemon=True)`. |
+| GUI-002 | CONFIRMED | `gui_farm.py:180-193, 253-274` | Background `worker()` ends with `self.after(0, lambda: self._finish_run(message))`, and `_release_and_snapshot_async()` worker also calls `self.after(...)` from a daemon thread. |
+| GUI-003 | CONFIRMED | `gui.py:25-26, 55-61` | `GuiApp.log()` only does `self.log_queue.put(str(text))`, and `GuiApp` itself defines no log widget/consumer here. |
+| GUI-004 | CONFIRMED | `gui.py:73-83` | `run_main()` only logs `"Запуск ... не реализован в этом окне"` and sets status, with no subprocess launch. |
+| GUI-005 | CONFIRMED | `gui_base.py:183-189, 214-218` | `_load_nav()` reads global `NAV_PATH`, `_save_nav()` writes global `NAV_PATH`, while these are module-level relative paths in this file rather than `project_dir`-based. |
+| GUI-006 | PARTIAL | `gui_base.py` unread | The claim may be true, but the cited `_build_ui()` lines were not read in this run, so only path/global findings here are verified. |
+| FLR-001 | CONFIRMED | `bot/explorer.py:223-228` | `_pause_checkpoint()` re-enters pause whenever `self.teacher_ui.pause_requested()` is true, and the teacher UI pause flag must be cleared elsewhere, so it is level-triggered. |
+| FLR-002 | CONFIRMED | `bot/floor.py:145-148` | On `passage_screen` it only marks `"passage"`, saves, and `return state`; there is no node switch in this path. |
+| ADB-001 | CONFIRMED | `bot/adb_controller.py:113-123, nav.py:147-156, 380-419` | `screencap_png()` runs `self._run_adb(["exec-out", "screencap", "-p"], text=False)` and nav hot loops call capture via `_stable_wait(...runtime.screenshot.capture...)` and direct `runtime.screenshot.capture()`. |
+| ADB-002 | CONFIRMED | `nav.py:284-289, 83-94, 61-72` | `_hold_swipe_worker()` loops `runtime.adb.swipe(...)`; `swipe()` calls `self.shell(...)`; `shell()` calls `_run_adb(...)`, so each hold chunk is a new adb command. |
+| ADB-003 | CONFIRMED | `bot/adb_controller.py:240-253, 258-271` | The module explicitly monkey-patches `ADBController._run_adb = _run_adb_checked` and `ADBController.__init__ = _init_compat` after class definition. |
+| ADB-004 | CONFIRMED | `nav.py:43-47, 346-358, 388-419` | Hold state is global (`_HOLD_THREAD`, `_HOLD_STOP_EVENT`, `_HOLD_ACTIVE_SIDE`, `_RUNTIME_CACHE`) and `release()` suppresses `motionevent UP` errors with `except Exception: pass`. |
+| ADB-005 | CONFIRMED | `nav.py:477-485` | If `autobattle_on` is not found, the code does `tx, ty = width // 2, height // 2` then `runtime.adb.tap(int(tx), int(ty))`. |
+| CFG-001 | CONFIRMED | `main.py:130-141` | `_run_check()` prints `[1/8] adb.exe...` and `[2/8] serial...` before creating objects, then prints the same numbered lines again. |
+| CFG-002 | CONFIRMED | `main.py:104-109, 259-271; bot/logging_setup.py:20-27` | `main()` calls `logger = setup_logging(config)`, `_run_navigation()` calls `logger = setup_logging(config)` again, and `setup_logging()` removes every root handler in `for handler in list(root_logger.handlers): root_logger.removeHandler(handler)`. |
+| CFG-003 | CONFIRMED | `main.py:106-117` | `_run_navigation()` builds `objects = _make_core_objects(...)`, assigns `screenshot = objects["screenshot"]` and `vision = objects["vision"]`, but only uses `adb` afterwards. |
+| CFG-004 | NOT CONFIRMED | `config.yaml:99-110, bot/config.py:282-288` | The claim says shipped config fails validation due to key mismatch, but `config.yaml` contains `block_shop`, `block_ads`, `block_pvp`, and `stop_on_danger`, exactly the keys `_require_bool(...)` validates. |
+| CFG-005 | CONFIRMED | `bot/profiles.py:345-366, bot/config.py:260-338` | Runtime enforces `if len(entries) != 7: raise ProfileError(...)`, while the shown `validate_config()` section has no `profiles.items` checks at all. |
+| CFG-006 | CONFIRMED | `bot/knowledge.py:138-145; bot/profiles.py:116-126` | `KnowledgeBase` uses `profiles_root / self.profile` for `rules.json`/`features.json`, while `ProfileManager.ensure_profile()` separately creates `knowledge/<profile>/rules.json`, `location_path.json`, and `floor_selection.json`. |
+| SAF-001 | CONFIRMED | `nav.py:471-485` | After tapping `enter_dungeon`, the code does `time.sleep(1.0)` and still ends with `return True, "battle started"` even if no battle state was verified. |
+| SAF-002 | CONFIRMED | `nav.py:479-485` | Missing `autobattle_on` directly triggers `tx, ty = width // 2, height // 2` and `runtime.adb.tap(int(tx), int(ty))` with no template verification. |
+| SAF-003 | CONFIRMED | `main.py:104-124; nav.py:429-485, 551-589; bot/safety.py:100-116` | Navigation paths call `runtime.adb.tap(...)` / `_click_center(...)`, but these nav functions do not call `SafetyManager.ensure_action_allowed(...)` or `ensure_safe_frame(...)`. |
+| SAF-004 | CONFIRMED | `bot/safety.py:87-98; nav.py:25-31` | `is_action_allowed()` only returns true for `shop`, `ads`, `pvp`, `premium_currency`, `explore`, `teach`, while nav action kinds include `loot`, `mob`, `event_choice`, `event_skip`, `skip`. |
+| SAF-005 | CONFIRMED | `nav.py:471-485` | `start_battle()` resolves only `autobattle_on`; when absent on screen it assumes OFF and falls back to center tap, with no separate enable template. |
+| SAF-006 | CONFIRMED | `nav.py:568-594` | `_go_path()` taps `base_to_locations`, `location_icon`, and `farm_floor_button` followed by fixed `time.sleep(1.0)` waits rather than verified state transitions. |
+| CON-001 | CONFIRMED | `gui_farm.py:172-220, 239-245, 457-485` | Child process is started from a daemon nav thread, and stop/full-stop only call `self.main_process.terminate()` with no mandatory `wait()`/`kill()` cleanup path. |
+| CON-002 | CONFIRMED | `gui_farm.py:204-214, 234-238, 461-463` | `_run_main_process()` blocks on `for line in self.main_process.stdout:`, while stop only `terminate()`s and full-stop joins nav thread for 5s. |
+| CON-003 | CONFIRMED | `gui_farm.py:121-128, 134-135` | Global hotkey callback touches Tk via `self.after(...)` from `pynput` listener thread. |
+| CON-004 | CONFIRMED | `gui_farm.py:234-238, 248-274, 457-485` | `do_stop()` launches async release/snapshot worker, while `do_full_stop()` can concurrently call `nav.release(...)`, join, and tear down windows with no lock. |
+| CON-005 | CONFIRMED | `nav.py:47, 167-189, 364-379` | `_RUNTIME_CACHE` stores runtime objects, `_build_runtime()` returns cached entries, and no code shown clears `_RUNTIME_CACHE` on stop/restart. |
+| CON-006 | CONFIRMED | `nav.py:43-47, 317-358` | Hold/release state is module-global and mutated by both `hold()` and `release()` for all callers. |
+| CON-007 | CONFIRMED | `bot/knowledge.py:275-306` | `add_template()` does `template_id = self._next_template_id()`, writes `cv2.imwrite(...)`, then updates features separately, so PNG and JSON updates are distinct operations. |
+| ERR-001 | CONFIRMED | `bot/adb_controller.py:21-34, 258-271; main.py:89-97` | Declared constructor is `__init__(self, adb_path: str, serial: str | None = None, ...)`, but runtime monkey-patch rewrites `ADBController.__init__ = _init_compat` and callers pass `ADBController(config, logger)`. |
+| ERR-002 | CONFIRMED | `nav.py:213-220` | `find_template()` catches `except Exception:` and returns `False, 0, 0, 0, 0.0`, collapsing all errors into “not found”. |
+| ERR-003 | CONFIRMED | `nav.py:243-249` | `find_known_objects()` wraps per-template work in `except Exception: continue`, silently skipping all errors. |
+| ERR-004 | CONFIRMED | `nav.py:286-289, 351-358` | `_hold_swipe_worker()` catches `Exception` and only sleeps; `release()` catches all `motionevent UP` exceptions and `pass`es. |
+| ERR-005 | CONFIRMED | `nav.py:406-410` | `approach_target()` has `except Exception as exc: ... return False, str(exc)`, converting any internal error into an ordinary failure tuple. |
+| ERR-014 | CONFIRMED | `bot/floor.py:193-195` | After unstable retries, it does `self._pause_and_label(last_frame)` and immediately `return last_frame`, not a fresh stable recapture. |
+| ERR-017 | CONFIRMED | `gui_base.py:183-188` | `_load_nav()` catches `(OSError, ValueError)` and simply `return data`, i.e. defaults, on malformed or unreadable `nav.json`. |
+| ERR-018 | CONFIRMED | `gui_base.py:257-260; bot/adb_controller.py:21-34, 258-271` | `_make_provider()` calls `ADBController(config, logger)` even though the class signature is `(adb_path, serial=None, exec_timeout_s=15.0)` and only works via monkey-patch. |
+| ERR-021 | CONFIRMED | `gui_farm.py:143-151` | `_read_nav_json()` catches `except Exception:` and returns `{}`, so corrupted `nav.json` is silently treated as empty config. |
