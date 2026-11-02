@@ -112,22 +112,17 @@ def _run_navigation(config: BotConfig, location_id: str, floor_number: int) -> i
         adb = objects["adb"]
         screenshot = objects["screenshot"]
         vision = objects["vision"]
-        from nav import NavigationController
+        from nav import go_to_dungeon
         adb.connect()
         stop_event = threading.Event()
-        controller = NavigationController(
-            project_dir=config.base_dir,
+        ok, reason = go_to_dungeon(
+            config.base_dir,
+            location_id,
             log=print,
             stop_event=stop_event,
-            adb=adb,
-            screenshot=screenshot,
-            vision=vision,
-            base_dir=config.base_dir,
-            logger=logger,
         )
-        result = controller.navigate_from_current_screen(location_id=location_id, floor_number=floor_number)
-        print(result.message)
-        return 0 if result.ok else 1
+        print(reason)
+        return 0 if ok else 1
     except (ADBConnectionError, ADBCommandError, ADBError, ScreenshotError, Exception) as exc:
         _print_error(str(exc))
         return 1
@@ -230,7 +225,7 @@ def _adb_executable_status(config: BotConfig | None = None) -> tuple[bool, str]:
     if config is not None:
         configured = get_path(config, "adb", "adb_path")
         if configured: candidates.append(str(configured))
-    for name in ("adb.exe", "adb"): 
+    for name in ("adb.exe", "adb"):
         found = shutil.which(name)
         if found: candidates.append(found)
     for base in (r"C:\LDPlayer\LDPlayer9", r"C:\LDPlayer\LDPlayer4.0", r"C:\Program Files\LDPlayer\LDPlayer9"): candidates.append(base + r"\adb.exe")
@@ -254,7 +249,8 @@ def _android_version(adb: ADBController) -> str:
     for command in ("getprop ro.build.version.release", "getprop ro.system.build.version.release"):
         try:
             value = adb.shell(command).strip()
-        except ADBCommandError: continue
+        except ADBCommandError:
+            continue
         if value: return value
     return "неизвестно"
 
@@ -288,6 +284,5 @@ def main(argv: list[str] | None = None) -> int:
         if args.teach_only: return _run_teach_only(config, logger, profile)
         return _run_teach(config, logger, profile, floor_from, floor_to)
     except (ADBConnectionError, ADBCommandError, ADBError, ScreenshotError, ProfileError, KnowledgeError, TeacherUIError, LabelingCancelledError, ExplorerError, Exception) as exc: _print_error(str(exc)); return 1
-
 
 if __name__ == "__main__": raise SystemExit(main())
