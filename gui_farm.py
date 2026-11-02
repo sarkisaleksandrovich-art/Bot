@@ -27,10 +27,15 @@ except Exception:  # pragma: no cover
 ACTION_LABELS = {
     "loot": "Лут",
     "mob": "Моб",
-    "event_choice": "Событие-выбор",
-    "event_skip": "Событие-пропустить",
+    "event_choice": "Событие",
+    "event_skip": "Событие: пропустить",
     "skip": "Пропустить объект",
 }
+
+MAIN_FLAG_CANDIDATES = [
+    ["--teach"],
+    [],
+]
 
 
 class ControlTab(ttk.Frame):
@@ -48,6 +53,7 @@ class ControlTab(ttk.Frame):
         self.paused_by_stop = False
         self._stop_snapshot_busy = False
         self._manual_dialog_open = False
+        self._known_match_name: str | None = None
 
         self.location_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Готово")
@@ -63,7 +69,7 @@ class ControlTab(ttk.Frame):
         ttk.Label(self, text="Управление", font=("TkDefaultFont", 14, "bold")).pack(anchor="w")
         ttk.Label(
             self,
-            text="Без ручного ввода этажей. Локации берутся из data/base/nav.json, кнопка Старт доступна только когда цепочка настроена.",
+            text="Без ручного ввода этажей. Локации берутся из data/base/nav.json, кнопка Старт доступна только когда цепочка в Настройках заполнена.",
             wraplength=1000,
             justify=tk.LEFT,
         ).pack(anchor="w", pady=(4, 8))
@@ -180,7 +186,8 @@ class ControlTab(ttk.Frame):
             self.start_button.configure(state=tk.DISABLED)
             self.status_var.set(f"Ошибка nav.py: {exc}")
             return
-        ready = bool(status.get("ready")) and bool(self.location_var.get().strip())
+        nav_ok = bool(status.get("ready")) and bool(status.get("nav_json_present")) and int(status.get("locations_count") or 0) > 0
+        ready = nav_ok and bool(self.location_var.get().strip())
         self.start_button.configure(state=(tk.NORMAL if ready and not self.running else tk.DISABLED))
         self.stop_button.configure(state=(tk.NORMAL if self.running else tk.DISABLED))
         if not ready:
@@ -196,9 +203,7 @@ class ControlTab(ttk.Frame):
 
     def do_start(self) -> None:
         self.refresh_ready_state()
-        if self.running:
-            return
-        if self.start_button.cget("state") == tk.DISABLED:
+        if self.running or self.start_button.cget("state") == tk.DISABLED:
             return
         location_name = self.location_var.get().strip()
         if not location_name:
@@ -220,17 +225,11 @@ class ControlTab(ttk.Frame):
                 elif not ok:
                     message = f"Навигация не выполнена: {reason}"
                 else:
-                    battle_ok, battle_reason = nav.start_battle(self.project_dir, log=self.log, stop_event=self.stop_event)
+                    code, last = self._run_main_process()
                     if self.stop_event.is_set():
                         message = "Остановлено"
-                    elif not battle_ok:
-                        message = f"Не удалось запустить бой: {battle_reason}"
                     else:
-                        code, last = self._run_main_process()
-                        if self.stop_event.is_set():
-                            message = "Остановлено"
-                        else:
-                            message = "Фарм завершён" if code == 0 else f"main.py завершился с кодом {code}: {last}"
+                        message = "Фарм завершён" if code == 0 else f"main.py завершился с кодом {code}: {last}"
             except Exception as exc:
                 message = f"Ошибка: {exc}"
             self.after(0, lambda: self._finish_run(message))
@@ -239,7 +238,12 @@ class ControlTab(ttk.Frame):
         self.nav_thread.start()
 
     def _run_main_process(self) -> tuple[int, str]:
-        command = [sys.executable, "main.py", "--profile", self._selected_profile(), "--teach"]
+        command = [sys.executable, "main.py"]
+        for extra in MAIN_FLAG_CANDIDATES[0]:
+            command.append(extra)
+        profile = self._selected_profile()
+        if profile:
+            command.extend(["--profile", profile])
         self.log(f"[FARM] {' '.join(command)}")
         self.main_process = subprocess.Popen(
             command,
@@ -311,8 +315,7 @@ class ControlTab(ttk.Frame):
                     except Exception:
                         annotated_path = shot_path
                 summary = nav.memory_summary(self.project_dir)
-                found_count = len(found)
-                self.after(0, lambda: self._after_stop_snapshot(summary, found_count, shot_path, annotated_path))
+                self.after(0, lambda: self._after_stop_snapshot(summary, len(found), shot_path, annotated_path))
             except Exception as exc:
                 self.after(0, lambda: self._after_stop_snapshot(f"Ошибка стоп-сценария: {exc}", 0, "", ""))
             finally:
@@ -323,6 +326,7 @@ class ControlTab(ttk.Frame):
     def _after_stop_snapshot(self, summary: str, found_count: int, shot_path: str, annotated_path: str) -> None:
         self.log(summary)
         self.log(f"Найдено известных объектов: {found_count}")
+        self.log("Объекты без рамки считаются новыми.")
         if shot_path:
             self.log(f"Скриншот: {shot_path}")
         if annotated_path:
@@ -342,23 +346,19 @@ class ControlTab(ttk.Frame):
                 return
             crop, _bbox = result
             known_action = None
+            known_name = None
             known_score = 0.0
             try:
                 import nav
-                match_result = nav.match_known(self.project_dir, crop)
-                if isinstance(match_result, tuple) and len(match_result) >= 2:
-                    known_action = str(match_result[0]).strip() or None
-                    known_score = float(match_result[1])
-                elif isinstance(match_result, str):
-                    known_action = match_result.strip() or None
-                    known_score = 0.0
+                matched_action = nav.match_known(self.project_dir, crop)
+                known_action = matched_action.strip() if isinstance(matched_action, str) and matched_action.strip() else None
+                if known_action:
+                    known_name = ACTION_LABELS.get(known_action, known_action)
             except Exception as exc:
                 self.log(f"match_known ошибка: {exc}")
-                known_action = None
-                known_score = 0.0
             replace_known = False
             if known_action:
-                decision = self._ask_known_match(known_action, known_score)
+                decision = self._ask_known_match(known_name or known_action, known_score)
                 if decision == "cancel":
                     return
                 if decision == "keep":
@@ -368,7 +368,7 @@ class ControlTab(ttk.Frame):
         finally:
             self._manual_dialog_open = False
 
-    def _ask_known_match(self, known_action: str, known_score: float) -> str:
+    def _ask_known_match(self, known_name: str, known_score: float) -> str:
         win = tk.Toplevel(self)
         win.title("Совпадение с памятью")
         win.transient(self.winfo_toplevel())
@@ -376,7 +376,7 @@ class ControlTab(ttk.Frame):
         result = {"value": "cancel"}
         ttk.Label(
             win,
-            text=f"Это уже в памяти как {ACTION_LABELS.get(known_action, known_action)} (score {known_score:.3f})",
+            text=f"Это уже в памяти как {known_name}" + (f" (score {known_score:.3f})" if known_score else ""),
             padding=12,
         ).pack(anchor="w")
         row = ttk.Frame(win)
@@ -415,20 +415,22 @@ class ControlTab(ttk.Frame):
         body = ttk.Frame(win)
         body.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
-        items = [
-            (remembered_action, f"Сохранённое действие: {ACTION_LABELS.get(remembered_action, remembered_action)}") if remembered_action else None,
+        items = []
+        if remembered_action:
+            items.append((remembered_action, f"Сохранённое действие: {ACTION_LABELS.get(remembered_action, remembered_action)}"))
+        for value, text in [
             ("loot", "Лут"),
             ("mob", "Моб"),
-            ("event_choice", "Событие-выбор"),
-            ("event_skip", "Событие-пропустить"),
+            ("event_choice", "Событие: выбрать кнопку"),
+            ("event_skip", "Событие: пропустить"),
             ("skip", "Пропустить объект"),
             ("continue", "Продолжить фарм"),
             ("full_stop", "Полная остановка"),
-        ]
-        for item in items:
-            if not item:
+        ]:
+            if value == remembered_action:
                 continue
-            value, text = item
+            items.append((value, text))
+        for value, text in items:
             style = "Accent.TButton" if remembered_action and value == remembered_action else "TButton"
             ttk.Button(body, text=text, style=style, command=lambda v=value: self._close_modal(win, result, v)).pack(fill="x", pady=2)
         tk.Button(body, text="Отмена", command=lambda: self._close_modal(win, result, "cancel")).pack(fill="x", pady=(8, 0))
@@ -475,8 +477,15 @@ class ControlTab(ttk.Frame):
             "png": png_name,
             "action": action,
         }
-        if replace and objects:
-            objects[-1] = record
+        if replace and self._known_match_name:
+            replaced = False
+            for index, item in enumerate(objects):
+                if isinstance(item, dict) and str(item.get("name", "")).strip() == self._known_match_name:
+                    objects[index] = record
+                    replaced = True
+                    break
+            if not replaced:
+                objects.append(record)
         else:
             objects.append(record)
         actions_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
