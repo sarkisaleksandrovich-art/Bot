@@ -13,11 +13,14 @@ from gui_base import SettingsTab
 from gui_farm import ControlTab
 from gui_memory import MemoryTab
 
+
 BOT_ACTIONS: tuple[tuple[str, str, bool], ...] = (
-    ("Проверка", "--check", False),
-    ("Скриншот", "--capture", False),
+    ("Проверка", "--check", True),
+    ("Скриншот", "--capture", True),
     ("Обучение", "--teach", True),
     ("Обучение без кликов", "--teach-only", True),
+    ("Список профилей", "--list-profiles", False),
+    ("Сброс памяти", "--reset-knowledge", True),
 )
 
 
@@ -92,6 +95,7 @@ class GuiApp:
         self.profile_var = tk.StringVar(value=profile or "")
 
         self.log_queue: queue.Queue[str] = queue.Queue()
+        self.app_log = self.log_queue
         self.current_process: subprocess.Popen[str] | None = None
         self.current_thread: threading.Thread | None = None
         self.stop_requested = False
