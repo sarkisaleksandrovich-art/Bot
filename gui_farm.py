@@ -23,7 +23,6 @@ try:
 except Exception:  # pragma: no cover
     pynput_keyboard = None
 
-
 ACTION_LABELS = {
     "loot": "Лут",
     "mob": "Моб",
