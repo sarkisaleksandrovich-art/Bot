@@ -8,7 +8,10 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
-from typing import Any
+
+from gui_base import SettingsTab
+from gui_farm import ControlTab
+from gui_memory import MemoryTab
 
 BOT_ACTIONS: tuple[tuple[str, str, bool], ...] = (
     ("Проверка", "--check", False),
@@ -18,32 +21,8 @@ BOT_ACTIONS: tuple[tuple[str, str, bool], ...] = (
 )
 
 
-class MissingTab(ttk.Frame):
-    """Fallback tab shown when an optional GUI module is unavailable."""
-
-    def __init__(self, parent: tk.Misc, title: str, message: str) -> None:
-        super().__init__(parent, padding=12)
-        ttk.Label(self, text=title, font=("TkDefaultFont", 11, "bold")).pack(anchor=tk.W)
-        ttk.Label(
-            self,
-            text=message,
-            foreground="red",
-            wraplength=900,
-            justify=tk.LEFT,
-        ).pack(anchor=tk.W, pady=(8, 0))
-
-
-class PlaceholderTab(ttk.Frame):
-    """Simple tab used when a module exists but does not expose the required Frame class."""
-
-    def __init__(self, parent: tk.Misc, title: str, message: str) -> None:
-        super().__init__(parent, padding=12)
-        ttk.Label(self, text=title, font=("TkDefaultFont", 11, "bold")).pack(anchor=tk.W)
-        ttk.Label(self, text=message, wraplength=900, justify=tk.LEFT).pack(anchor=tk.W, pady=(8, 0))
-
-
 class BotTab(ttk.Frame):
-    """Main bot control tab: runs main.py with only real CLI flags from main.py."""
+    """Tab for direct main.py actions using only real CLI flags from main.py."""
 
     def __init__(self, parent: tk.Misc, app: "GuiApp") -> None:
         super().__init__(parent, padding=12)
@@ -96,21 +75,13 @@ class BotTab(ttk.Frame):
         )
         self.app.stop_button.pack(side=tk.LEFT)
 
-        ttk.Label(self, textvariable=self.app.status_var).pack(anchor=tk.W, pady=(10, 6))
-
-        log_frame = ttk.LabelFrame(self, text="Живой лог", padding=8)
-        log_frame.pack(fill=tk.BOTH, expand=True)
-
-        self.app.log_text = tk.Text(log_frame, wrap=tk.WORD, state=tk.DISABLED, height=24)
-        scrollbar = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.app.log_text.yview)
-        self.app.log_text.configure(yscrollcommand=scrollbar.set)
-        self.app.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        ttk.Label(self, textvariable=self.app.status_var).pack(anchor=tk.W, pady=(10, 0))
 
 
 class GuiApp:
     def __init__(self, profile: str | None = None) -> None:
         self.project_dir = Path(__file__).resolve().parent
+        self.data_root = self.project_dir / "data" / "profiles"
         self.root = tk.Tk()
         self.root.title("LDPlayer Bot")
         self.root.geometry("1180x780")
@@ -129,13 +100,21 @@ class GuiApp:
 
         self.profile_combo: ttk.Combobox | None = None
         self.stop_button: ttk.Button | None = None
-        self.log_text: tk.Text | None = None
         self.start_buttons: list[ttk.Button] = []
+        self.control_tab: ControlTab | None = None
+        self.settings_tab: SettingsTab | None = None
+        self.memory_tab: MemoryTab | None = None
+        self.bot_tab: BotTab | None = None
+        self.full_stop_button = None
 
         self._build_ui()
         self.reload_profiles()
         self._mount_tabs()
-        self._poll_log_queue()
+
+    def app_log(self, text: str) -> None:
+        self.log_queue.put(str(text))
+
+    log = app_log
 
     def _build_ui(self) -> None:
         self._build_menu()
@@ -154,63 +133,22 @@ class GuiApp:
         self.root.config(menu=menu)
 
     def _mount_tabs(self) -> None:
-        self._add_tab(
-            title="Навигация",
-            module_name="gui_base",
-            class_name="NavigationTab",
-            fallback_message_missing="Модуль gui_base.py не найден. Вкладка навигации недоступна.",
-            fallback_message_contract="В gui_base.py не найден класс NavigationTab(parent, app).",
-        )
-        self._add_tab(
-            title="Память",
-            module_name="gui_memory",
-            class_name="MemoryTab",
-            fallback_message_missing="Модуль gui_memory.py не найден. Вкладка памяти недоступна.",
-            fallback_message_contract="В gui_memory.py не найден класс MemoryTab(parent, app).",
-        )
-        self._add_tab(
-            title="Фарм",
-            module_name="gui_farm",
-            class_name="FarmTab",
-            fallback_message_missing="Модуль gui_farm.py не найден. Вкладка фарма недоступна.",
-            fallback_message_contract="В gui_farm.py не найден класс FarmTab(parent, app).",
-        )
-        self.notebook.add(BotTab(self.notebook, self), text="Бот")
+        self.control_tab = ControlTab(self.notebook, self)
+        self.settings_tab = SettingsTab(self.notebook, self)
+        self.memory_tab = MemoryTab(self.notebook, self)
+        self.bot_tab = BotTab(self.notebook, self)
 
-    def _add_tab(
-        self,
-        *,
-        title: str,
-        module_name: str,
-        class_name: str,
-        fallback_message_missing: str,
-        fallback_message_contract: str,
-    ) -> None:
-        tab: ttk.Frame
-        try:
-            module = __import__(module_name, fromlist=[class_name])
-        except ModuleNotFoundError:
-            tab = MissingTab(self.notebook, title, fallback_message_missing)
-        except ImportError as exc:
-            tab = MissingTab(self.notebook, title, f"Не удалось импортировать {class_name} из {module_name}.py: {exc}")
-        else:
-            tab_class = getattr(module, class_name, None)
-            if tab_class is None:
-                tab = PlaceholderTab(self.notebook, title, fallback_message_contract)
-            else:
-                try:
-                    tab = tab_class(self.notebook, self)
-                except Exception as exc:
-                    tab = MissingTab(self.notebook, title, f"Ошибка создания {class_name}(parent, app): {exc}")
-        self.notebook.add(tab, text=title)
+        self.notebook.add(self.control_tab, text="Управление")
+        self.notebook.add(self.settings_tab, text="Настройки")
+        self.notebook.add(self.memory_tab, text="Память")
+        self.notebook.add(self.bot_tab, text="Бот")
 
     def reload_profiles(self) -> None:
-        profiles_root = self.project_dir / "data" / "profiles"
         profiles = sorted(
             item.name
-            for item in profiles_root.iterdir()
+            for item in self.data_root.iterdir()
             if item.is_dir() and item.name != "base"
-        ) if profiles_root.exists() else []
+        ) if self.data_root.exists() else []
 
         if not profiles:
             profiles = ["loc1"]
@@ -222,29 +160,23 @@ class GuiApp:
         if current not in profiles:
             self.profile_var.set(profiles[0])
 
-        self.log(f"[GUI] Профили обновлены: {', '.join(profiles)}")
+        self.app_log(f"[GUI] Профили обновлены: {', '.join(profiles)}")
 
     def open_profile_picker(self) -> None:
         if self.notebook.tabs():
-            self.notebook.select(self.notebook.tabs()[-1])
+            self.notebook.select(self.bot_tab)
         if self.profile_combo is not None:
             self.profile_combo.focus_set()
-        self.log("[GUI] Открыт выбор профиля.")
+        self.app_log("[GUI] Открыт выбор профиля.")
 
     def on_profile_selected(self, _event: object | None = None) -> None:
         del _event
-        self.log(f"[GUI] Выбран профиль: {self.profile_var.get().strip()}")
-
-    def log(self, text: str) -> None:
-        self.log_queue.put(text)
-
-    def _append_log(self, text: str) -> None:
-        if self.log_text is None:
-            return
-        self.log_text.configure(state=tk.NORMAL)
-        self.log_text.insert(tk.END, text + "\n")
-        self.log_text.see(tk.END)
-        self.log_text.configure(state=tk.DISABLED)
+        self.app_log(f"[GUI] Выбран профиль: {self.profile_var.get().strip()}")
+        if self.memory_tab is not None:
+            try:
+                self.memory_tab.reload()
+            except Exception:
+                pass
 
     def run_main(self, args: list[str], *, with_profile: bool = True) -> None:
         if self.current_process is not None:
@@ -271,15 +203,15 @@ class GuiApp:
         self.stop_requested = False
         self._set_running_state(True)
         self.status_var.set(f"Запуск: {title}")
-        self.log(f"[GUI] cwd={self.project_dir}")
-        self.log(f"[GUI] cmd={' '.join(command)}")
+        self.app_log(f"[GUI] cwd={self.project_dir}")
+        self.app_log(f"[GUI] cmd={' '.join(command)}")
 
         try:
             process = subprocess.Popen(
                 command,
                 cwd=str(self.project_dir),
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.PIPE,
                 stdin=subprocess.DEVNULL,
                 text=True,
                 encoding="utf-8",
@@ -290,42 +222,46 @@ class GuiApp:
         except OSError as exc:
             self._set_running_state(False)
             self.status_var.set("Ошибка запуска")
-            self.log(f"[GUI] Не удалось запустить процесс: {exc}")
+            self.app_log(f"[GUI] Не удалось запустить процесс: {exc}")
             return
 
         self.current_process = process
         self.current_thread = threading.Thread(target=self._reader_thread, args=(process,), daemon=True)
         self.current_thread.start()
+        self.root.after(100, self._poll_process_state)
 
     def _reader_thread(self, process: subprocess.Popen[str]) -> None:
-        try:
-            if process.stdout is not None:
-                for line in process.stdout:
-                    self.log_queue.put(line.rstrip("\n"))
-            code = process.wait()
-            self.log_queue.put(f"[GUI] Процесс завершён с кодом {code}")
-        except Exception as exc:
-            self.log_queue.put(f"[GUI] Ошибка чтения вывода: {exc}")
-        finally:
-            self.log_queue.put("__PROCESS_DONE__")
+        def pump(stream) -> None:
+            if stream is None:
+                return
+            for line in stream:
+                self.app_log(line.rstrip("\n"))
 
-    def _poll_log_queue(self) -> None:
-        try:
-            while True:
-                item = self.log_queue.get_nowait()
-                if item == "__PROCESS_DONE__":
-                    self.current_process = None
-                    self.current_thread = None
-                    self._set_running_state(False)
-                    self.status_var.set("Процесс остановлен" if self.stop_requested else "Готово")
-                    if self._closing:
-                        self.root.after(0, self.root.destroy)
-                    continue
-                self._append_log(item)
-        except queue.Empty:
-            pass
-        if not self._closing or self.current_process is not None:
-            self.root.after(100, self._poll_log_queue)
+        threads: list[threading.Thread] = []
+        for stream in (process.stdout, process.stderr):
+            thread = threading.Thread(target=pump, args=(stream,), daemon=True)
+            thread.start()
+            threads.append(thread)
+        for thread in threads:
+            thread.join()
+        process.wait()
+
+    def _poll_process_state(self) -> None:
+        process = self.current_process
+        if process is None:
+            return
+        if process.poll() is None:
+            if not self._closing:
+                self.root.after(100, self._poll_process_state)
+            return
+        code = process.returncode
+        self.current_process = None
+        self.current_thread = None
+        self._set_running_state(False)
+        self.status_var.set("Процесс остановлен" if self.stop_requested else "Готово")
+        self.app_log(f"[GUI] Процесс завершён с кодом {code}")
+        if self._closing:
+            self.root.after(0, self.root.destroy)
 
     def stop_process(self) -> None:
         process = self.current_process
@@ -333,15 +269,15 @@ class GuiApp:
             return
         self.stop_requested = True
         self.status_var.set("Остановка процесса...")
-        self.log("[GUI] Остановка процесса...")
+        self.app_log("[GUI] Остановка процесса...")
         try:
             process.terminate()
         except Exception as exc:
-            self.log(f"[GUI] terminate() не удался: {exc}")
+            self.app_log(f"[GUI] terminate() не удался: {exc}")
             try:
                 process.kill()
             except Exception as kill_exc:
-                self.log(f"[GUI] kill() не удался: {kill_exc}")
+                self.app_log(f"[GUI] kill() не удался: {kill_exc}")
 
     def _set_running_state(self, running: bool) -> None:
         state = tk.DISABLED if running else tk.NORMAL
@@ -352,7 +288,24 @@ class GuiApp:
         if self.profile_combo is not None:
             self.profile_combo.configure(state=(tk.DISABLED if running else "readonly"))
 
+    def is_bot_running(self) -> bool:
+        control = self.control_tab
+        if control is not None and getattr(control, "running", False):
+            return True
+        process = self.current_process
+        return process is not None and process.poll() is None
+
+    bot_running = is_bot_running
+
     def on_close(self) -> None:
+        control = self.control_tab
+        if control is not None:
+            listener = getattr(control, "hotkey_listener", None)
+            if listener is not None:
+                try:
+                    listener.stop()
+                except Exception:
+                    pass
         if self.current_process is not None:
             if not messagebox.askyesno(
                 "Выход",
@@ -368,21 +321,6 @@ class GuiApp:
     def run(self) -> int:
         self.root.mainloop()
         return self.exit_code
-
-
-def start_farm_navigation(location_id: str, floor_number: int, stop_event: threading.Event | None = None) -> Any:
-    """Delegate farm navigation to nav.go_to_dungeon using the real nav.py API."""
-    import nav
-
-    actual_stop_event = stop_event if stop_event is not None else threading.Event()
-    ok, reason = nav.go_to_dungeon(
-        Path(__file__).resolve().parent,
-        location_id,
-        str(floor_number),
-        log=print,
-        stop_event=actual_stop_event,
-    )
-    return ok, reason
 
 
 def launch_gui(profile: str | None = None) -> int:
