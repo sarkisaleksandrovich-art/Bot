@@ -207,6 +207,7 @@ class FloorExplorer:
     def _wait_battle_end(self, templates: list["TemplateRecord"]) -> "Frame":
         started = time.monotonic()
         last_frame = self.screenshot.capture()
+        consecutive_non_battle_frames = 0
         while True:
             self._handle_pause_in_wait_loop(last_frame)
             stable_frame = self._stable_capture_or_teach("unknown_stable_prompt", templates)
@@ -214,8 +215,14 @@ class FloorExplorer:
             self.safety.ensure_safe_frame(stable_frame, self.vision, templates)
             auto_matches = self.vision.find_category(stable_frame, templates, "auto_battle")
             room_name = self._classify_room_or_passage(stable_frame, templates)
-            if room_name in {"room_screen", "event_screen", "passage_screen"} and not auto_matches:
+            if room_name in {"passage_screen", "event_screen"}:
                 return stable_frame
+            if room_name == "room_screen" and not auto_matches:
+                consecutive_non_battle_frames += 1
+                if consecutive_non_battle_frames >= 2:
+                    return stable_frame
+            else:
+                consecutive_non_battle_frames = 0
             if time.monotonic() - started >= self._battle_finish_timeout_s:
                 return stable_frame
             last_frame = stable_frame
