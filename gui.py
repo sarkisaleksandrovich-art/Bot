@@ -65,6 +65,7 @@ class BotTab(ttk.Frame):
                     [current_flag],
                     with_profile=current_needs_profile,
                 ),
+                state=tk.DISABLED,
             )
             button.pack(side=tk.LEFT, padx=(0, 8), pady=2)
             self.app.start_buttons.append(button)
