@@ -1,4 +1,4 @@
-from __future__ import annotations
+from __future__
 
 import argparse
 import json
@@ -275,15 +275,7 @@ def find_known_objects(project_dir: str | Path, frame: Any) -> list[tuple[str, s
         if match is None:
             continue
         x1, y1, x2, y2 = match.rect
-        found.append((
-            str(item.get("action", "unknown")),
-            str(item.get("name", png.stem)),
-            int(x1),
-            int(y1),
-            int(x2 - x1),
-            int(y2 - y1),
-            float(match.score),
-        ))
+        found.append((str(item.get("action", "unknown")), str(item.get("name", png.stem)), int(x1), int(y1), int(x2 - x1), int(y2 - y1), float(match.score)))
     found.sort(key=lambda row: row[6], reverse=True)
     return found
 
@@ -491,10 +483,9 @@ def approach_target(project_dir: str | Path, template: Any, log: Callable[..., A
         release(project_dir=project_dir, log=log)
         _log(log, f"approach timeout approach_timeout_s={timeout_s}")
         return False, "approach timeout"
-    except Exception as exc:
+    except Exception:
         release(project_dir=project_dir, log=log)
-        _log(log, f"approach exception: {exc}")
-        return False, str(exc)
+        raise
     finally:
         release(project_dir=project_dir, log=log)
 
@@ -655,33 +646,11 @@ def nav_status(project_dir: str | Path) -> dict[str, Any]:
     except Exception as exc:
         nav_notes.append(f"nav_status runtime note: {exc}")
     return {
-        "ready": bool(nav),
-        "screen": screen,
-        "screen_score": screen_score,
-        "notes": nav_notes + action_notes,
-        "match_threshold": settings["match_threshold"],
-        "nav_json_present": _nav_path(project_dir).exists(),
-        "actions_json_present": _actions_path(project_dir).exists(),
-        "locations_count": len([x for x in locations if isinstance(x, dict)]),
-        "known_actions_count": len(_load_actions_list(project_dir)),
-        "last_screenshot": shot_path,
-        "nav_format": {
-            "base_screenshot": nav.get("base_screenshot"),
-            "base_to_locations": nav.get("base_to_locations"),
-            "locations_map": nav.get("locations_map"),
-            "locations": locations,
-            "farm_floor_button": nav.get("farm_floor_button"),
-            "enter_dungeon": nav.get("enter_dungeon"),
-            "autobattle_on": nav.get("autobattle_on"),
-            "joystick": nav.get("joystick"),
-            "settings": {
-                "click_radius_px": settings["click_radius_px"],
-                "approach_timeout_s": settings["approach_timeout_s"],
-                "hold_chunk_ms": settings["hold_chunk_ms"],
-                "frame_interval_ms": settings["frame_interval_ms"],
-                "match_threshold": settings["match_threshold"],
-            },
-        },
+        "ready": bool(nav), "screen": screen, "screen_score": screen_score, "notes": nav_notes + action_notes,
+        "match_threshold": settings["match_threshold"], "nav_json_present": _nav_path(project_dir).exists(),
+        "actions_json_present": _actions_path(project_dir).exists(), "locations_count": len([x for x in locations if isinstance(x, dict)]),
+        "known_actions_count": len(_load_actions_list(project_dir)), "last_screenshot": shot_path,
+        "nav_format": {"base_screenshot": nav.get("base_screenshot"), "base_to_locations": nav.get("base_to_locations"), "locations": locations, "farm_floor_button": nav.get("farm_floor_button"), "enter_dungeon": nav.get("enter_dungeon"), "autobattle_on": nav.get("autobattle_on"), "joystick": nav.get("joystick"), "settings": {"click_radius_px": settings["click_radius_px"], "approach_timeout_s": settings["approach_timeout_s"], "hold_chunk_ms": settings["hold_chunk_ms"], "frame_interval_ms": settings["frame_interval_ms"], "match_threshold": settings["match_threshold"]}},
         "actions_format": actions or {"objects": [{"name": "...", "png": "...", "action": "loot|mob|event_choice|event_skip|skip"}]},
     }
 
@@ -718,6 +687,20 @@ def _run_known_objects(project_dir: str | Path, frame: Any, log: Callable[..., A
     return True, "known objects handled"
 
 
+def _verified_tap(runtime: NavigationRuntime, project_dir: str | Path, template: Optional[str], transition: str, log: Callable[..., Any], stop_event: Any, timeout_s: float = 4.0) -> tuple[bool, str]:
+    if not template:
+        return False, f"template missing: {transition}"
+    frame, _ = _stable_wait(runtime, timeout_s, log)
+    found, x, y, dx, score = find_template(project_dir, template, frame=frame)
+    _log(log, f"{transition} score={score:.3f} found={found}")
+    if not found:
+        return False, f"{transition} not found"
+    if stop_event is not None and stop_event.is_set():
+        return False, "stopped"
+    runtime.adb.tap(x, y)
+    return True, f"{transition} tapped"
+
+
 def _go_path(project_dir: str | Path, location_name: str, log: Callable[..., Any], stop_event: Any, launch: bool) -> tuple[bool, str]:
     runtime = _build_runtime(project_dir, log=log)
     nav, _ = _read_nav(project_dir)
@@ -733,48 +716,30 @@ def _go_path(project_dir: str | Path, location_name: str, log: Callable[..., Any
         ok, reason = _go_home(project_dir, log, stop_event)
         if not ok:
             return False, reason
+        if stop_event is not None and stop_event.is_set():
+            return False, "stopped"
         base_tpl = chain["base_to_locations"]
-        map_tpl = chain["locations_map"]
-        icon_tpl = chain["location_icon"]
-        floor_tpl = chain["farm_floor_button"]
-        enter_tpl = chain["enter_dungeon"]
-        if stop_event is not None and stop_event.is_set():
-            return False, "stopped"
-        frame, _ = _stable_wait(runtime, 4.0, log)
         if base_tpl:
-            found, x, y, dx, score = find_template(project_dir, base_tpl, frame=frame)
-            _log(log, f"base->locations score={score:.3f} found={found}")
-            if found:
-                runtime.adb.tap(x, y)
-                time.sleep(1.0)
+            ok, reason = _verified_tap(runtime, project_dir, base_tpl, "base->locations", log, stop_event)
+            if not ok:
+                return False, reason
         if stop_event is not None and stop_event.is_set():
             return False, "stopped"
-        frame, _ = _stable_wait(runtime, 4.0, log)
+        map_tpl = chain["locations_map"]
         if map_tpl:
+            frame, _ = _stable_wait(runtime, 4.0, log)
             found, x, y, dx, score = find_template(project_dir, map_tpl, frame=frame)
             _log(log, f"locations_map score={score:.3f} found={found}")
-        if stop_event is not None and stop_event.is_set():
-            return False, "stopped"
+            if not found:
+                return False, "locations map not found"
+        ok, reason = _verified_tap(runtime, project_dir, chain["location_icon"], "location_icon", log, stop_event)
+        if not ok:
+            return False, reason
+        ok, reason = _verified_tap(runtime, project_dir, chain["farm_floor_button"], "farm_floor_button", log, stop_event)
+        if not ok:
+            return False, reason
         frame, _ = _stable_wait(runtime, 4.0, log)
-        found, x, y, dx, score = find_template(project_dir, icon_tpl, frame=frame)
-        _log(log, f"location_icon score={score:.3f} found={found}")
-        if not found:
-            return False, "location icon not found"
-        runtime.adb.tap(x, y)
-        time.sleep(1.0)
-        if stop_event is not None and stop_event.is_set():
-            return False, "stopped"
-        frame, _ = _stable_wait(runtime, 4.0, log)
-        found, x, y, dx, score = find_template(project_dir, floor_tpl, frame=frame)
-        _log(log, f"farm_floor_button score={score:.3f} found={found}")
-        if not found:
-            return False, "farm floor button not found"
-        runtime.adb.tap(x, y)
-        time.sleep(1.0)
-        if stop_event is not None and stop_event.is_set():
-            return False, "stopped"
-        frame, _ = _stable_wait(runtime, 4.0, log)
-        found, x, y, dx, score = find_template(project_dir, enter_tpl, frame=frame)
+        found, x, y, dx, score = find_template(project_dir, chain["enter_dungeon"], frame=frame)
         _log(log, f"enter_dungeon score={score:.3f} found={found}")
         if not found:
             return False, "hero/start menu not found"
