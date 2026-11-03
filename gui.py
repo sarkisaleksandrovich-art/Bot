@@ -57,14 +57,11 @@ class BotTab(ttk.Frame):
 
         row = ttk.Frame(actions)
         row.pack(fill=tk.X)
-        for title, flag, needs_profile in BOT_ACTIONS:
+        for title, _flag, _needs_profile in BOT_ACTIONS:
             button = ttk.Button(
                 row,
                 text=title,
-                command=lambda current_flag=flag, current_needs_profile=needs_profile: self.app.run_main(
-                    [current_flag],
-                    with_profile=current_needs_profile,
-                ),
+                state=tk.DISABLED,
             )
             button.pack(side=tk.LEFT, padx=(0, 8), pady=2)
             self.app.start_buttons.append(button)
