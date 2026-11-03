@@ -271,7 +271,7 @@ def main(argv: list[str] | None = None) -> int:
     # FIX-D: проверка режимов — до резолва профиля, иначе --list-profiles/--gui/--navigate падают на отсутствии профиля
     mode_count = sum([args.check, args.capture, args.teach_only, args.list_profiles, args.reset_knowledge, args.gui, args.teach, args.navigate])
     if mode_count > 1: _print_error("Выберите только один режим..."); return 1
-    needs_profile = any([args.check, args.capture, args.teach_only, args.reset_knowledge, args.teach])
+    needs_profile = not (args.navigate or args.gui or args.list_profiles)
     profile, floor_from, floor_to = "loc1", 1, None
     if needs_profile:
         try: profile_manager, profile, floor_from, floor_to = _resolve_profile_and_range(config=config, logger=logger, cli_profile=args.profile, cli_floor_from=args.floor_from, cli_floor_to=args.floor_to)
