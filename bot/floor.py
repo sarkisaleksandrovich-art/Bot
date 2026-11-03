@@ -1,4 +1,4 @@
-from __future__ import annotations
+from __future__
 
 import logging
 import time
@@ -141,6 +141,7 @@ class FloorExplorer:
 
         if screen_name == "passage_screen":
             state = self.floor_state.mark_door_status(state, door_id, "passage", note="passage_screen")
+            state = self.floor_state.record_passage_target(state, door_id, frame_rect=None)
             self.floor_state.save(state)
             return state
 
