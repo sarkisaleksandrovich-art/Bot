@@ -105,6 +105,7 @@ class GuiApp:
         self.memory_tab: MemoryTab | None = None
         self.bot_tab: BotTab | None = None
         self.full_stop_button = None
+        self.log_text: tk.Text | None = None
 
         self.current_process = None
         self.current_thread = None
@@ -115,6 +116,7 @@ class GuiApp:
         self._build_ui()
         self._mount_tabs()
         self.reload_profiles()
+        self._poll_log_queue()
 
     def log(self, text: str) -> None:
         self.log_queue.put(str(text))
@@ -124,6 +126,13 @@ class GuiApp:
         container.pack(fill=tk.BOTH, expand=True)
         self.notebook = ttk.Notebook(container)
         self.notebook.pack(fill=tk.BOTH, expand=True)
+        log_box = ttk.LabelFrame(container, text="Лог приложения", padding=8)
+        log_box.pack(fill=tk.BOTH, expand=False, pady=(10, 0))
+        self.log_text = tk.Text(log_box, wrap=tk.WORD, state=tk.DISABLED, height=8)
+        scrollbar = ttk.Scrollbar(log_box, orient=tk.VERTICAL, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=scrollbar.set)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
     def _mount_tabs(self) -> None:
         self.control_tab = ControlTab(self.notebook, self)
@@ -135,6 +144,19 @@ class GuiApp:
         self.notebook.add(self.settings_tab, text="Настройки")
         self.notebook.add(self.memory_tab, text="Память")
         self.notebook.add(self.bot_tab, text="Бот")
+
+    def _poll_log_queue(self) -> None:
+        try:
+            while True:
+                msg = self.log_queue.get_nowait()
+                if self.log_text is not None:
+                    self.log_text.configure(state=tk.NORMAL)
+                    self.log_text.insert(tk.END, f"{msg}\n")
+                    self.log_text.see(tk.END)
+                    self.log_text.configure(state=tk.DISABLED)
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_log_queue)
 
     def reload_profiles(self) -> None:
         profiles = list_profiles(self.data_root)
