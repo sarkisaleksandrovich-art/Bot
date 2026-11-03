@@ -5,7 +5,7 @@ import logging
 from .config import BotConfig
 
 
-_CONFIGURED = False
+_LOGGING_CONFIGURED = False
 
 
 def setup_logging(config: "BotConfig") -> logging.Logger:
@@ -16,7 +16,10 @@ def setup_logging(config: "BotConfig") -> logging.Logger:
     :return: logging.Logger
     :raises OSError: если нельзя создать каталог/файл лога
     """
-    global _CONFIGURED
+    global _LOGGING_CONFIGURED
+    if _LOGGING_CONFIGURED:
+        return logging.getLogger("bot")
+
     log_dir = config.log_dir
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -34,12 +37,6 @@ def setup_logging(config: "BotConfig") -> logging.Logger:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    app_logger = logging.getLogger("bot")
-    app_logger.setLevel(level)
-    app_logger.propagate = True
-    if _CONFIGURED:
-        return app_logger
-
     console_handler = logging.StreamHandler()
     console_handler.setLevel(level)
     console_handler.setFormatter(formatter)
@@ -50,6 +47,10 @@ def setup_logging(config: "BotConfig") -> logging.Logger:
 
     root_logger.addHandler(console_handler)
     root_logger.addHandler(file_handler)
-    _CONFIGURED = True
+    _LOGGING_CONFIGURED = True
+
+    app_logger = logging.getLogger("bot")
+    app_logger.setLevel(level)
+    app_logger.propagate = True
     app_logger.debug("Logging initialized: level=%s, file=%s", level_name, log_file)
     return app_logger
