@@ -262,8 +262,7 @@ class FloorExplorer:
             raise FloorError("vision.wait_until_stable не вернул кадр")
         self.teacher_ui.notify(str(self._teacher_cfg.get("unknown_unstable_prompt", "Экран не стабилизировался. Если это безопасно, разметьте вручную.")))
         self._pause_and_label(last_frame)
-        self._handle_pause_on_step()
-        frame, stable = self.vision.wait_until_stable(
+        _, stable = self.vision.wait_until_stable(
             self.screenshot.capture,
             stable_frames=self._stable_frames,
             stable_diff_threshold=self._stable_diff_threshold,
@@ -273,6 +272,14 @@ class FloorExplorer:
         )
         if not stable:
             raise FloorError("Экран не стабилизировался после разметки")
+        frame, _ = self.vision.wait_until_stable(
+            self.screenshot.capture,
+            stable_frames=self._stable_frames,
+            stable_diff_threshold=self._stable_diff_threshold,
+            stable_poll_ms=self._stable_poll_ms,
+            stable_timeout_s=self._stable_timeout_s,
+            downscale_size=self._downscale_size,
+        )
         return frame
 
     def _wait_after_motion(self, reason: str) -> "Frame":
@@ -385,4 +392,3 @@ class FloorExplorer:
         raw = getattr(self.config, "raw", {})
         section = raw.get(name, {}) if isinstance(raw, dict) else {}
         return section if isinstance(section, dict) else {}
-
