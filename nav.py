@@ -1,4 +1,4 @@
-from __future__ import annotations
+from __future__
 
 import argparse
 import json
@@ -539,10 +539,27 @@ def handle_event(project_dir: str | Path, template: Any, log: Callable[..., Any]
     return clicked, ("event opened" if clicked else "event target missing after approach")
 
 
+def _find_verified_autobattle_control(
+    project_dir: str | Path,
+    nav: dict[str, Any],
+    frame: Any,
+    log: Callable[..., Any],
+) -> tuple[Optional[str], Optional[tuple[bool, int, int, int, float]]]:
+    for key in ("autobattle_off", "autobattle_button", "autobattle"):
+        template = _resolve_path(project_dir, _extract_png(nav.get(key)))
+        if template is None:
+            continue
+        match = find_template(project_dir, str(template), frame=frame)
+        _log(log, f"autobattle control key={key} found={match[0]} score={match[4]:.3f}")
+        if match[0]:
+            return key, match
+    return None, None
+
+
 def start_battle(project_dir: str | Path, log: Callable[..., Any] = print, stop_event: Any = None) -> tuple[bool, str]:
     runtime = _build_runtime(project_dir, log=log)
     nav, _ = _read_nav(project_dir)
-    autobattle_png = _resolve_path(project_dir, _extract_png(nav.get("autobattle_on")))
+    autobattle_on_png = _resolve_path(project_dir, _extract_png(nav.get("autobattle_on")))
     enter_png = _resolve_path(project_dir, _extract_png(nav.get("enter_dungeon")))
     if stop_event is not None and stop_event.is_set():
         return False, "stopped"
@@ -552,20 +569,31 @@ def start_battle(project_dir: str | Path, log: Callable[..., Any] = print, stop_
     started = _click_center(runtime, find_template(project_dir, str(enter_png), frame=frame), log)
     if not started:
         return False, "failed to start battle"
-    time.sleep(1.0)
-    if stop_event is not None and stop_event.is_set():
-        return False, "stopped"
-    if autobattle_png is not None:
-        battle_frame = runtime.screenshot.capture()
-        found, x, y, dx, score = find_template(project_dir, str(autobattle_png), frame=battle_frame)
-        _log(log, f"autobattle state found={found} score={score:.3f}")
-        if not found:
-            width, height = _frame_shape(battle_frame)
-            tx, ty = width // 2, height // 2
-            _log(log, f"autobattle is OFF; enabling autobattle via fallback tap x={tx} y={ty}")
-            runtime.adb.tap(int(tx), int(ty))
-            time.sleep(0.5)
-    return True, "battle started"
+    deadline = time.monotonic() + 4.0
+    while time.monotonic() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            return False, "stopped"
+        battle_frame, _ = _stable_wait(runtime, 1.0, log)
+        if autobattle_on_png is not None:
+            enabled = find_template(project_dir, str(autobattle_on_png), frame=battle_frame)
+            _log(log, f"autobattle enabled found={enabled[0]} score={enabled[4]:.3f}")
+            if enabled[0]:
+                return True, "battle started"
+        control_key, control = _find_verified_autobattle_control(project_dir, nav, battle_frame, log)
+        if control is None:
+            continue
+        _log(log, f"autobattle disabled; enabling via verified control={control_key}")
+        runtime.adb.tap(int(control[1]), int(control[2]))
+        confirm_deadline = time.monotonic() + 2.0
+        while time.monotonic() < confirm_deadline:
+            confirmed_frame, _ = _stable_wait(runtime, 0.5, log)
+            if autobattle_on_png is not None and find_template(project_dir, str(autobattle_on_png), frame=confirmed_frame)[0]:
+                return True, "battle started"
+            _, confirmed_control = _find_verified_autobattle_control(project_dir, nav, confirmed_frame, log)
+            if confirmed_control is None:
+                return True, "battle started"
+        return False, "autobattle enable not confirmed"
+    return False, "battle entry or autobattle state not confirmed"
 
 
 def run_event(project_dir: str | Path, template: Any, action: str = "event_choice", log: Callable[..., Any] = print, stop_event: Any = None) -> tuple[bool, str]:
@@ -697,116 +725,5 @@ def _run_known_objects(project_dir: str | Path, frame: Any, log: Callable[..., A
         action_template = None
         for item in _load_actions_list(project_dir):
             if str(item.get("name", "")).strip() == name and str(item.get("action", "")).strip() == kind:
-                action_template = item.get("png") or item.get("template") or item.get("file")
-                break
-        if kind == "loot" and action_template:
-            ok, reason = click_loot(project_dir, action_template, log=log, stop_event=stop_event)
-            if not ok:
-                return False, reason
-        elif kind == "mob" and action_template:
-            ok, reason = attack_mob(project_dir, action_template, log=log, stop_event=stop_event)
-            if not ok:
-                return False, reason
-        elif kind in {"event_choice", "event_skip"} and action_template:
-            ok, reason = run_event(project_dir, action_template, action=kind, log=log, stop_event=stop_event)
-            if not ok:
-                return False, reason
-        elif kind == "skip":
-            _log(log, f"known skip object ignored name={name} score={score:.3f}")
-        else:
-            _log(log, f"Пропущен неизвестный объект на x={x}")
-    return True, "known objects handled"
-
-
-def _go_path(project_dir: str | Path, location_name: str, log: Callable[..., Any], stop_event: Any, launch: bool) -> tuple[bool, str]:
-    runtime = _build_runtime(project_dir, log=log)
-    nav, _ = _read_nav(project_dir)
-    try:
-        floor_number = int(nav.get("selected_floor", DEFAULT_FLOOR_NUMBER) or DEFAULT_FLOOR_NUMBER)
-    except (TypeError, ValueError):
-        floor_number = DEFAULT_FLOOR_NUMBER
-    chain = _nav_chain_templates(project_dir, location_name, floor_number=floor_number)
-    for key, value in chain.items():
-        if value is None and key not in {"base", "locations_map"}:
-            return False, f"template missing: {key}"
-    try:
-        ok, reason = _go_home(project_dir, log, stop_event)
-        if not ok:
-            return False, reason
-        base_tpl = chain["base_to_locations"]
-        map_tpl = chain["locations_map"]
-        icon_tpl = chain["location_icon"]
-        floor_tpl = chain["farm_floor_button"]
-        enter_tpl = chain["enter_dungeon"]
-        if stop_event is not None and stop_event.is_set():
-            return False, "stopped"
-        frame, _ = _stable_wait(runtime, 4.0, log)
-        if base_tpl:
-            found, x, y, dx, score = find_template(project_dir, base_tpl, frame=frame)
-            _log(log, f"base->locations score={score:.3f} found={found}")
-            if found:
-                runtime.adb.tap(x, y)
-                time.sleep(1.0)
-        if stop_event is not None and stop_event.is_set():
-            return False, "stopped"
-        frame, _ = _stable_wait(runtime, 4.0, log)
-        if map_tpl:
-            found, x, y, dx, score = find_template(project_dir, map_tpl, frame=frame)
-            _log(log, f"locations_map score={score:.3f} found={found}")
-        if stop_event is not None and stop_event.is_set():
-            return False, "stopped"
-        frame, _ = _stable_wait(runtime, 4.0, log)
-        found, x, y, dx, score = find_template(project_dir, icon_tpl, frame=frame)
-        _log(log, f"location_icon score={score:.3f} found={found}")
-        if not found:
-            return False, "location icon not found"
-        runtime.adb.tap(x, y)
-        time.sleep(1.0)
-        if stop_event is not None and stop_event.is_set():
-            return False, "stopped"
-        frame, _ = _stable_wait(runtime, 4.0, log)
-        found, x, y, dx, score = find_template(project_dir, floor_tpl, frame=frame)
-        _log(log, f"farm_floor_button score={score:.3f} found={found}")
-        if not found:
-            return False, "farm floor button not found"
-        runtime.adb.tap(x, y)
-        time.sleep(1.0)
-        if stop_event is not None and stop_event.is_set():
-            return False, "stopped"
-        frame, _ = _stable_wait(runtime, 4.0, log)
-        found, x, y, dx, score = find_template(project_dir, enter_tpl, frame=frame)
-        _log(log, f"enter_dungeon score={score:.3f} found={found}")
-        if not found:
-            return False, "hero/start menu not found"
-        if not launch:
-            return True, "chain verified"
-        frame = runtime.screenshot.capture()
-        ok, reason = _run_known_objects(project_dir, frame, log, stop_event)
-        if not ok:
-            return False, reason
-        ok, reason = start_battle(project_dir, log=log, stop_event=stop_event)
-        if not ok:
-            return False, reason
-        return True, "navigation complete"
-    finally:
-        release(project_dir=project_dir, log=log)
-
-
-def go_to_dungeon(project_dir: str | Path, location_name: str, log: Callable[..., Any] = print, stop_event: Any = None) -> tuple[bool, str]:
-    return _go_path(project_dir, location_name, log, stop_event, True)
-
-
-def verify_chain(project_dir: str | Path, location_name: str, log: Callable[..., Any] = print, stop_event: Any = None) -> tuple[bool, str]:
-    return _go_path(project_dir, location_name, log, stop_event, False)
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--go", nargs=1, metavar=("LOCATION",))
-    parser.add_argument("--project-dir", default=".")
-    args = parser.parse_args()
-    if args.go:
-        ok, reason = go_to_dungeon(args.project_dir, args.go[0])
-        print(reason)
-        print("Не проверено запуском на устройстве.")
-        raise SystemExit(0 if ok else 1)
-    print(json.dumps(nav_status(args.project_dir), ensure_ascii=False, indent=2))
+        
+        
