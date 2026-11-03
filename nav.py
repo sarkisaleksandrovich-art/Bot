@@ -220,6 +220,13 @@ def _build_runtime(project_dir: str | Path, log: Callable[..., Any] = print) -> 
 def take_screenshot(project_dir: str | Path) -> tuple[str, Any]:
     runtime = _build_runtime(project_dir)
     frame = runtime.screenshot.capture()
+    if frame is None:
+        raise RuntimeError("navigation screenshot capture failed: received no frame")
+    try:
+        if not hasattr(frame, "shape") or getattr(frame, "size", 0) == 0:
+            raise ValueError("captured frame is empty or invalid")
+    except TypeError as exc:
+        raise RuntimeError("navigation screenshot capture returned an invalid frame") from exc
     logs_dir = Path(project_dir).resolve() / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -240,7 +247,8 @@ def find_template(project_dir: str | Path, template: Any, frame: Any = None) -> 
     width, height = _frame_shape(work_frame)
     try:
         match = runtime.vision.find(work_frame, image, (0, 0, width, height), threshold)
-    except Exception:
+    except (RuntimeError, ValueError, TypeError, OSError) as exc:
+        _log(print, f"find_template vision failure template={template_path}: {exc}")
         return False, 0, 0, 0, 0.0
     if match is None:
         return False, 0, 0, 0, 0.0
