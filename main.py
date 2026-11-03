@@ -115,11 +115,13 @@ def _run_navigation(config: BotConfig, location_id: str, floor_number: int) -> i
         from nav import go_to_dungeon
         adb.connect()
         stop_event = threading.Event()
+        # FIX-A: --floor доходит до навигации
         ok, reason = go_to_dungeon(
             config.base_dir,
             location_id,
             log=print,
             stop_event=stop_event,
+            floor_number=floor_number,
         )
         print(reason)
         return 0 if ok else 1
@@ -129,8 +131,7 @@ def _run_navigation(config: BotConfig, location_id: str, floor_number: int) -> i
 
 
 def _run_check(config: BotConfig, logger: Any, profile: str) -> int:
-    print("[1/8] adb.exe: " + ("OK" if _adb_executable_status(config)[0] else _adb_executable_status(config)[1]))
-    print(f"[2/8] serial: {get_path(config, 'adb', 'device_serial')}")
+    # FIX-A: убраны дублирующие print [1/8] и [2/8] — ниже они печатаются один раз с актуальными данными
     objects = _make_core_objects(config, logger, profile)
     adb = objects["adb"]
     screenshot = objects["screenshot"]
@@ -267,10 +268,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.floor < 1: parser.error("--floor must be >= 1")
     try: config = load_config(args.config); logger = setup_logging(config)
     except (FileNotFoundError, ConfigError, OSError) as exc: _print_error(f"Не удалось загрузить конфигурацию {args.config}: {exc}"); return 1
-    try: profile_manager, profile, floor_from, floor_to = _resolve_profile_and_range(config=config, logger=logger, cli_profile=args.profile, cli_floor_from=args.floor_from, cli_floor_to=args.floor_to)
-    except ProfileError as exc: _print_error(str(exc)); return 1
+    # FIX-D: проверка режимов — до резолва профиля, иначе --list-profiles/--gui/--navigate падают на отсутствии профиля
     mode_count = sum([args.check, args.capture, args.teach_only, args.list_profiles, args.reset_knowledge, args.gui, args.teach, args.navigate])
     if mode_count > 1: _print_error("Выберите только один режим..."); return 1
+    needs_profile = any([args.check, args.capture, args.teach_only, args.reset_knowledge, args.teach])
+    profile, floor_from, floor_to = "loc1", 1, None
+    if needs_profile:
+        try: profile_manager, profile, floor_from, floor_to = _resolve_profile_and_range(config=config, logger=logger, cli_profile=args.profile, cli_floor_from=args.floor_from, cli_floor_to=args.floor_to)
+        except ProfileError as exc: _print_error(str(exc)); return 1
     try:
         if args.navigate: return _run_navigation(config, args.location, args.floor)
         if args.gui:

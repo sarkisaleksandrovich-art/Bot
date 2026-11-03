@@ -309,11 +309,12 @@ def memory_summary(project_dir: str | Path) -> str:
     return f"В памяти: лут {counts['loot']}, мобы {counts['mob']}, события {events}"
 
 
-def match_known(project_dir: str | Path, crop: Any) -> Optional[str]:
+def match_known(project_dir: str | Path, crop: Any) -> Optional[tuple[str, str, str, float]]:
+    """FIX-F: возвращает (action, name, png, score) совпавшего объекта, чтобы GUI мог его заменить."""
     runtime = _build_runtime(project_dir)
     settings = _settings(project_dir)
     threshold = settings["match_threshold"]
-    best_action: Optional[str] = None
+    best: Optional[tuple[str, str, str, float]] = None
     best_score = 0.0
     for item in _load_actions_list(project_dir):
         png = _resolve_path(project_dir, item.get("png") or item.get("template") or item.get("file"))
@@ -329,8 +330,15 @@ def match_known(project_dir: str | Path, crop: Any) -> Optional[str]:
             continue
         if float(match.score) > best_score:
             best_score = float(match.score)
-            best_action = str(item.get("action", "")).strip() or None
-    return best_action if best_score >= threshold else None
+            best = (
+                str(item.get("action", "")).strip(),
+                str(item.get("name", png.stem)).strip(),
+                str(item.get("png") or item.get("template") or item.get("file") or "").strip(),
+                float(match.score),
+            )
+    if best is not None and best_score >= threshold:
+        return best
+    return None
 
 
 def _joystick(project_dir: str | Path) -> dict[str, tuple[int, int]]:
@@ -593,10 +601,11 @@ def _nav_chain_templates(project_dir: str | Path, location_name: str, floor_numb
                 floor_specific = farm_floor.get(key)
                 break
         farm_floor = floor_specific if floor_specific is not None else _extract_png(farm_floor)
+    # FIX-E: base_screenshot и locations_map хранятся как {"png": ...}, читаем через _extract_png
     return {
-        "base": str(_resolve_path(project_dir, nav.get("base_screenshot")) or "") or None,
+        "base": str(_resolve_path(project_dir, _extract_png(nav.get("base_screenshot"))) or "") or None,
         "base_to_locations": str(_resolve_path(project_dir, _extract_png(nav.get("base_to_locations"))) or "") or None,
-        "locations_map": str(_resolve_path(project_dir, nav.get("locations_map")) or "") or None,
+        "locations_map": str(_resolve_path(project_dir, _extract_png(nav.get("locations_map"))) or "") or None,
         "location_icon": str(_resolve_path(project_dir, (location_item or {}).get("png")) or "") or None,
         "farm_floor_button": str(_resolve_path(project_dir, farm_floor) or "") or None,
         "enter_dungeon": str(_resolve_path(project_dir, _extract_png(nav.get("enter_dungeon"))) or "") or None,
@@ -641,8 +650,8 @@ def nav_status(project_dir: str | Path) -> dict[str, Any]:
     try:
         shot_path, frame = take_screenshot(project_dir)
         candidates = {
-            "base": nav.get("base_screenshot"),
-            "locations_map": nav.get("locations_map"),
+            "base": _extract_png(nav.get("base_screenshot")),
+            "locations_map": _extract_png(nav.get("locations_map")),
             "base_to_locations": _extract_png(nav.get("base_to_locations")),
             "enter_dungeon": _extract_png(nav.get("enter_dungeon")),
         }
@@ -718,13 +727,15 @@ def _run_known_objects(project_dir: str | Path, frame: Any, log: Callable[..., A
     return True, "known objects handled"
 
 
-def _go_path(project_dir: str | Path, location_name: str, log: Callable[..., Any], stop_event: Any, launch: bool) -> tuple[bool, str]:
+def _go_path(project_dir: str | Path, location_name: str, log: Callable[..., Any], stop_event: Any, launch: bool, floor_number: int | None = None) -> tuple[bool, str]:
     runtime = _build_runtime(project_dir, log=log)
     nav, _ = _read_nav(project_dir)
-    try:
-        floor_number = int(nav.get("selected_floor", DEFAULT_FLOOR_NUMBER) or DEFAULT_FLOOR_NUMBER)
-    except (TypeError, ValueError):
-        floor_number = DEFAULT_FLOOR_NUMBER
+    # FIX-A: если этаж передан вызывающим кодом, используем его, иначе selected_floor из nav.json
+    if floor_number is None:
+        try:
+            floor_number = int(nav.get("selected_floor", DEFAULT_FLOOR_NUMBER) or DEFAULT_FLOOR_NUMBER)
+        except (TypeError, ValueError):
+            floor_number = DEFAULT_FLOOR_NUMBER
     chain = _nav_chain_templates(project_dir, location_name, floor_number=floor_number)
     for key, value in chain.items():
         if value is None and key not in {"base", "locations_map"}:
@@ -792,12 +803,13 @@ def _go_path(project_dir: str | Path, location_name: str, log: Callable[..., Any
         release(project_dir=project_dir, log=log)
 
 
-def go_to_dungeon(project_dir: str | Path, location_name: str, log: Callable[..., Any] = print, stop_event: Any = None) -> tuple[bool, str]:
-    return _go_path(project_dir, location_name, log, stop_event, True)
+def go_to_dungeon(project_dir: str | Path, location_name: str, log: Callable[..., Any] = print, stop_event: Any = None, floor_number: int | None = None) -> tuple[bool, str]:
+    # FIX-A: floor_number приходит из main.py --floor (None = взять selected_floor из nav.json)
+    return _go_path(project_dir, location_name, log, stop_event, True, floor_number=floor_number)
 
 
-def verify_chain(project_dir: str | Path, location_name: str, log: Callable[..., Any] = print, stop_event: Any = None) -> tuple[bool, str]:
-    return _go_path(project_dir, location_name, log, stop_event, False)
+def verify_chain(project_dir: str | Path, location_name: str, log: Callable[..., Any] = print, stop_event: Any = None, floor_number: int | None = None) -> tuple[bool, str]:
+    return _go_path(project_dir, location_name, log, stop_event, False, floor_number=floor_number)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

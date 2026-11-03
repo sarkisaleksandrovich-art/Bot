@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -52,6 +53,7 @@ class ControlTab(ttk.Frame):
         self._matched_score: float | None = None
         self._matched_name: str | None = None
         self._matched_png: str | None = None
+        self._last_match_decision: str = "none"  # none | keep | replace | cancel
 
         self.location_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Готово")
@@ -289,12 +291,13 @@ class ControlTab(ttk.Frame):
         actions_path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(prefix=".actions-", suffix=".tmp", dir=str(actions_path.parent))
         try:
-            with open(fd, "w", encoding="utf-8", newline="\n", closefd=False) as fh:
+            # FIX-B: временный файл закрывается через with (os.fdopen), иначе на Windows
+            # replace падает с PermissionError, и действия не сохраняются.
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
                 json.dump(data, fh, ensure_ascii=False, indent=2)
                 fh.write("\n")
                 fh.flush()
                 try:
-                    import os
                     os.fsync(fh.fileno())
                 except Exception:
                     pass
@@ -358,40 +361,59 @@ class ControlTab(ttk.Frame):
         self._matched_score = None
         self._matched_name = None
         self._matched_png = None
+        self._last_match_decision = "none"
         try:
             result = capture_region(self, "Выделите рамкой объект. Объекты без рамки на предыдущем скриншоте считаются новыми.")
             if not result:
                 return
             crop, _bbox = result
             remembered_action = self._match_known_action(crop)
-            self._ask_action_dialog(crop, remembered_action, replace_known=False)
+            # FIX-G: Keep и Отмена завершают диалог, меню действий открывается только дальше
+            if self._last_match_decision in {"keep", "cancel"}:
+                return
+            self._ask_action_dialog(crop, remembered_action, replace_known=self._last_match_decision == "replace")
         finally:
             self._manual_dialog_open = False
 
     def _match_known_action(self, crop: Any) -> str | None:
+        self._last_match_decision = "none"
+        self._matched_action = None
+        self._matched_score = None
+        self._matched_name = None
+        self._matched_png = None
         try:
             import nav
             matched = nav.match_known(self.project_dir, crop)
         except Exception as exc:
             self.log(f"match_known ошибка: {exc}")
             matched = None
-        if isinstance(matched, str):
+        # FIX-F: nav.match_known возвращает (action, name, png, score)
+        if isinstance(matched, tuple) and len(matched) >= 3:
+            matched_action = str(matched[0]).strip() or None
+            self._matched_name = str(matched[1]).strip() or None
+            self._matched_png = str(matched[2]).strip() or None
+            if len(matched) > 3:
+                try:
+                    self._matched_score = float(matched[3])
+                except (TypeError, ValueError):
+                    self._matched_score = None
+        elif isinstance(matched, str):
             matched_action = matched.strip() or None
         else:
             matched_action = None
+        if not matched_action:
+            return None
         self._matched_action = matched_action
-        self._matched_score = None
-        self._matched_name = None
-        self._matched_png = None
-        if matched_action:
-            decision = self._ask_known_match(ACTION_LABELS.get(matched_action, matched_action), None)
-            if decision == "cancel":
-                return None
-            if decision == "keep":
-                self.log(f"Это уже в памяти как {ACTION_LABELS.get(matched_action, matched_action)}")
-                return None
-            if decision == "replace":
-                return matched_action
+        decision = self._ask_known_match(ACTION_LABELS.get(matched_action, matched_action), self._matched_score)
+        if decision == "cancel":
+            self._last_match_decision = "cancel"
+            self._matched_action = None
+            return None
+        if decision == "keep":
+            self._last_match_decision = "keep"
+            self.log(f"Это уже в памяти как {ACTION_LABELS.get(matched_action, matched_action)}")
+            return None
+        self._last_match_decision = "replace"
         return matched_action
 
     def _ask_known_match(self, known_name: str, score: float | None) -> str:
@@ -423,12 +445,17 @@ class ControlTab(ttk.Frame):
             self.do_start()
             return
         if choice in VALID_ACTIONS:
+            template: str | None = None
             try:
-                self._save_action_memory(crop, choice, replace=replace_known)
+                # FIX-C: сохраняем выделение как png и дальше передаём в nav путь, а не numpy-массив
+                template = self._save_action_memory(crop, choice, replace=replace_known)
             except Exception as exc:
                 self.log(f"Не удалось сохранить действие: {exc}")
             if choice != "skip":
-                self._manual_execute_action(choice, crop)
+                if template is None:
+                    self.log("Ручное действие не выполнено: шаблон не сохранён.")
+                else:
+                    self._manual_execute_action(choice, template)
 
     def _show_action_choice_dialog(self, remembered_action: str | None) -> str | None:
         win = tk.Toplevel(self)
@@ -462,18 +489,19 @@ class ControlTab(ttk.Frame):
         self.wait_window(win)
         return result["value"]
 
-    def _manual_execute_action(self, action: str, crop: Any) -> None:
+    def _manual_execute_action(self, action: str, template: str) -> None:
+        # FIX-C: nav.click_loot/attack_mob/handle_event ждут путь к шаблону, а не numpy-массив
         self.log("Подхожу к цели")
 
         def worker() -> None:
             try:
                 import nav
                 if action == "loot":
-                    ok, reason = nav.click_loot(self.project_dir, crop, log=self.log, stop_event=self.stop_event)
+                    ok, reason = nav.click_loot(self.project_dir, template, log=self.log, stop_event=self.stop_event)
                 elif action == "mob":
-                    ok, reason = nav.attack_mob(self.project_dir, crop, log=self.log, stop_event=self.stop_event)
+                    ok, reason = nav.attack_mob(self.project_dir, template, log=self.log, stop_event=self.stop_event)
                 else:
-                    ok, reason = nav.handle_event(self.project_dir, crop, log=self.log, stop_event=self.stop_event)
+                    ok, reason = nav.handle_event(self.project_dir, template, log=self.log, stop_event=self.stop_event)
                 self.log(f"Ручное действие: ok={ok}, reason={reason}")
             except Exception as exc:
                 self.log(f"Ошибка ручного действия: {exc}")
@@ -494,7 +522,8 @@ class ControlTab(ttk.Frame):
         data["objects"] = [item for item in objects if isinstance(item, dict)]
         return data
 
-    def _save_action_memory(self, crop: Any, action: str, replace: bool = False) -> None:
+    def _save_action_memory(self, crop: Any, action: str, replace: bool = False) -> str:
+        # FIX-C: возвращает имя сохранённого png (для передачи в nav как путь к шаблону)
         if action not in VALID_ACTIONS:
             raise ValueError(f"Недопустимое действие: {action}")
         base_dir = self.project_dir / "data" / "base"
@@ -518,19 +547,20 @@ class ControlTab(ttk.Frame):
                     if cv2 is None or not cv2.imwrite(str(base_dir / png_name), crop):
                         raise RuntimeError("Не удалось сохранить шаблон объекта")
                     self._write_actions_data(actions_path, data)
-                    return
+                    return png_name
                 if self._matched_png and item_png == self._matched_png:
                     png_name = item_png or png_name
                     objects[index] = {"name": record_name, "png": png_name, "action": action}
                     if cv2 is None or not cv2.imwrite(str(base_dir / png_name), crop):
                         raise RuntimeError("Не удалось сохранить шаблон объекта")
                     self._write_actions_data(actions_path, data)
-                    return
+                    return png_name
 
         if cv2 is None or not cv2.imwrite(str(base_dir / png_name), crop):
             raise RuntimeError("Не удалось сохранить шаблон объекта")
         objects.append({"name": record_name, "png": png_name, "action": action})
         self._write_actions_data(actions_path, data)
+        return png_name
 
     def on_loot(self) -> None:
         self._manual_target_action("loot")
@@ -549,10 +579,10 @@ class ControlTab(ttk.Frame):
             return
         crop, _bbox = result
         remembered_action = self._match_known_action(crop)
-        if remembered_action is None and self._matched_action:
+        # FIX-G: Keep и Отмена завершают диалог
+        if self._last_match_decision in {"keep", "cancel"}:
             return
-        replace_known = bool(self._matched_action and remembered_action == self._matched_action)
-        self._ask_action_dialog(crop, remembered_action or action, replace_known=replace_known)
+        self._ask_action_dialog(crop, remembered_action or action, replace_known=self._last_match_decision == "replace")
 
     def do_full_stop(self) -> None:
         self.stop_event.set()
