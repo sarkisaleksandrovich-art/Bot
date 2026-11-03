@@ -277,6 +277,7 @@ def validate_config(data: dict[str, Any]) -> None:
 
     _require_non_empty_string(data, "profiles", "default_profile")
     _require_non_empty_string(data, "profiles", "root_dir")
+    _validate_profiles_items(data["profiles"])
 
     _require_int(data, "game", "party_size", minimum=1)
     _require_int(data, "game", "locations_count", minimum=1)
@@ -306,6 +307,51 @@ def validate_config(data: dict[str, Any]) -> None:
 
     _require_bool(data, "debug", "save_last_frame_on_error")
     _require_bool(data, "debug", "verbose_vision")
+
+
+def _validate_profiles_items(profiles: dict[str, Any]) -> None:
+    entries = profiles.get("items")
+    if entries is None:
+        return
+    if not isinstance(entries, list):
+        raise ConfigError("profiles.items must be a list")
+    if len(entries) != 7:
+        raise ConfigError("profiles.items must contain exactly 7 profiles")
+
+    seen: set[str] = set()
+    floors_per_level = profiles.get("floors_per_level")
+    for index, item in enumerate(entries):
+        if not isinstance(item, dict):
+            raise ConfigError(f"profiles.items[{index}] must be a mapping")
+        profile_id = item.get("id", f"loc{index + 1}")
+        if not isinstance(profile_id, str) or not profile_id.strip():
+            raise ConfigError(f"profiles.items[{index}].id must be a non-empty string")
+        profile_id = profile_id.strip()
+        if profile_id in seen:
+            raise ConfigError(f"Duplicate profile id '{profile_id}' in profiles.items")
+        seen.add(profile_id)
+
+        name = item.get("name", profile_id)
+        if not isinstance(name, str) or not name.strip():
+            raise ConfigError(f"profiles.items[{index}].name must be a non-empty string")
+
+        floor_from = item.get("floor_from", 1)
+        floor_to = item.get("floor_to")
+        run_all_floors = item.get("run_all_floors", False)
+        if isinstance(floor_from, bool) or not isinstance(floor_from, int) or floor_from < 1:
+            raise ConfigError(f"profiles.items[{index}].floor_from must be int >= 1")
+        if floor_to is not None and (isinstance(floor_to, bool) or not isinstance(floor_to, int) or floor_to < 1):
+            raise ConfigError(f"profiles.items[{index}].floor_to must be int >= 1")
+        if not isinstance(run_all_floors, bool):
+            raise ConfigError(f"profiles.items[{index}].run_all_floors must be bool")
+        if floor_to is not None:
+            if floor_from > floor_to:
+                raise ConfigError(f"profiles.items[{index}] floor_from must be <= floor_to")
+            if isinstance(floors_per_level, int) and not isinstance(floors_per_level, bool):
+                if floor_from > floors_per_level or floor_to > floors_per_level:
+                    raise ConfigError(
+                        f"profiles.items[{index}] floor range must be within 1..{floors_per_level}"
+                    )
 
 
 def get_path(config: BotConfig, *keys: str) -> Any:
