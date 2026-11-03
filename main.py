@@ -103,11 +103,10 @@ def _make_core_objects(config: BotConfig, logger: Any, profile: str) -> dict[str
     return {"adb": adb, "screenshot": screenshot, "vision": vision, "knowledge": knowledge, "safety": safety, "teacher_ui": teacher_ui}
 
 
-def _run_navigation(config: BotConfig, location_id: str, floor_number: int) -> int:
+def _run_navigation(config: BotConfig, location_id: str, floor_number: int, logger: Any) -> int:
     if not location_id or floor_number is None or floor_number < 1:
         return 2
     try:
-        logger = setup_logging(config)
         objects = _make_core_objects(config, logger, "base")
         adb = objects["adb"]
         screenshot = objects["screenshot"]
@@ -118,7 +117,7 @@ def _run_navigation(config: BotConfig, location_id: str, floor_number: int) -> i
         ok, reason = go_to_dungeon(
             config.base_dir,
             location_id,
-            log=print,
+            log=logger.info,
             stop_event=stop_event,
         )
         print(reason)
@@ -272,7 +271,7 @@ def main(argv: list[str] | None = None) -> int:
     mode_count = sum([args.check, args.capture, args.teach_only, args.list_profiles, args.reset_knowledge, args.gui, args.teach, args.navigate])
     if mode_count > 1: _print_error("Выберите только один режим..."); return 1
     try:
-        if args.navigate: return _run_navigation(config, args.location, args.floor)
+        if args.navigate: return _run_navigation(config, args.location, args.floor, logger)
         if args.gui:
             from gui import launch_gui
             return launch_gui(profile=args.profile)
