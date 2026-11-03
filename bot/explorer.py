@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -285,7 +286,7 @@ class DungeonExplorer:
         raise ExplorerError(f"Не удалось запустить этаж {floor_number}")
 
     def _pause_checkpoint(self, note: str = "") -> None:
-        if not self.teacher_ui.pause_requested():
+        if not self._consume_pause_request():
             return
         frame = self._capture_stable_frame_for_pause(note=note)
         self._last_frame = frame
@@ -321,12 +322,18 @@ class DungeonExplorer:
         return frame
 
     def _check_pause_during_wait(self, note: str = "") -> None:
-        if not self.teacher_ui.pause_requested():
+        if not self._consume_pause_request():
             return
         frame = self._safe_capture_last_frame() or self.screenshot.capture()
         self._last_frame = frame
         self.teacher_ui.notify(note or "Пауза во время ожидания")
         self.teacher_ui.show_and_label(frame, self.knowledge)
+
+    def _consume_pause_request(self) -> bool:
+        consume = getattr(self.teacher_ui, "consume_pause_request", None)
+        if callable(consume):
+            return bool(consume())
+        return bool(self.teacher_ui.pause_requested())
 
     def _ensure_safe_known_frame(self, frame: Frame) -> None:
         templates = self._reload_templates_merged()
@@ -440,11 +447,10 @@ class DungeonExplorer:
 
     def _frame_signature(self, frame: Frame) -> str:
         import cv2
-        import numpy as np
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
         small = cv2.resize(gray, self._downscale_size, interpolation=cv2.INTER_AREA)
-        return str(hash(np.ascontiguousarray(small).tobytes()))
+        return hashlib.sha256(memoryview(small).tobytes()).hexdigest()
 
     def _guard_runtime_limit(self, floor_number: int) -> None:
         if self._max_total_runtime_s <= 0 or self._run_context is None:
