@@ -1,4 +1,4 @@
-from __future__ import annotations
+from __future__
 
 import logging
 import time
@@ -141,6 +141,7 @@ class FloorExplorer:
 
         if screen_name == "passage_screen":
             state = self.floor_state.mark_door_status(state, door_id, "passage", note="passage_screen")
+            self.floor_state.record_passage_target(state, door_id, frame_rect=None)
             self.floor_state.save(state)
             return state
 
@@ -274,7 +275,9 @@ class FloorExplorer:
 
     def _handle_pause_on_step(self) -> None:
         if self.teacher_ui.pause_requested():
-            frame = self.screenshot.capture()
+            templates = self._reload_templates()
+            frame = self._stable_capture_or_teach("unknown_stable_prompt", templates)
+            self.safety.ensure_safe_frame(frame, self.vision, self._reload_templates())
             self._pause_and_label(frame)
 
     def _handle_pause_in_wait_loop(self, frame: "Frame") -> None:
