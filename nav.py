@@ -240,7 +240,8 @@ def find_template(project_dir: str | Path, template: Any, frame: Any = None) -> 
     width, height = _frame_shape(work_frame)
     try:
         match = runtime.vision.find(work_frame, image, (0, 0, width, height), threshold)
-    except Exception:
+    except (ValueError, TypeError, RuntimeError) as exc:
+        _log(print, f"template match failed template={template_path} category=vision error={exc}")
         return False, 0, 0, 0, 0.0
     if match is None:
         return False, 0, 0, 0, 0.0
@@ -270,7 +271,8 @@ def find_known_objects(project_dir: str | Path, frame: Any) -> list[tuple[str, s
             image = _load_image(png)
             width, height = _frame_shape(frame)
             match = runtime.vision.find(frame, image, (0, 0, width, height), threshold)
-        except Exception:
+        except (ValueError, TypeError, RuntimeError) as exc:
+            _log(print, f"known object match failed template={png} category=vision error={exc}")
             continue
         if match is None:
             continue
@@ -323,7 +325,8 @@ def match_known(project_dir: str | Path, crop: Any) -> Optional[str]:
             image = _load_image(png)
             ch, cw = crop.shape[:2]
             match = runtime.vision.find(crop, image, (0, 0, cw, ch), threshold)
-        except Exception:
+        except (ValueError, TypeError, RuntimeError) as exc:
+            _log(print, f"known template match failed template={png} category=vision error={exc}")
             continue
         if match is None:
             continue
