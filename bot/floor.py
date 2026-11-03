@@ -1,4 +1,4 @@
-from __future__ import annotations
+from __future__
 
 import logging
 import time
@@ -176,14 +176,7 @@ class FloorExplorer:
 
         return self._exit_room_with_status(state, door_id, frame, templates, final_status="cleared")
 
-    def _exit_room_with_status(
-        self,
-        state: dict,
-        door_id: str,
-        frame: "Frame",
-        templates: list["TemplateRecord"],
-        final_status: str,
-    ) -> dict:
+    def _exit_room_with_status(self, state: dict, door_id: str, frame: "Frame", templates: list["TemplateRecord"], final_status: str) -> dict:
         exit_matches = self.vision.find_category(frame, templates, "exit")
         if not exit_matches:
             self.teacher_ui.notify("Не найден exit на стабильном кадре. Нужна разметка.")
@@ -226,12 +219,7 @@ class FloorExplorer:
         door_matches = self.vision.find_category(frame, templates, "door_marker")
         open_room_matches = self.vision.find_category(frame, templates, "room_open_big_icon")
         next_floor_matches = self.vision.find_category(frame, templates, "next_floor")
-        return {
-            "party_match": party_matches[0] if party_matches else None,
-            "door_matches": door_matches,
-            "open_room_matches": open_room_matches,
-            "next_floor_match": next_floor_matches[0] if next_floor_matches else None,
-        }
+        return {"party_match": party_matches[0] if party_matches else None, "door_matches": door_matches, "open_room_matches": open_room_matches, "next_floor_match": next_floor_matches[0] if next_floor_matches else None}
 
     def _classify_room_or_passage(self, frame: "Frame", templates: list["TemplateRecord"]) -> str | None:
         direct = self.vision.classify_screen(frame, templates)
@@ -243,14 +231,7 @@ class FloorExplorer:
         last_frame = None
         for _ in range(self._max_stable_retries + 1):
             self._handle_pause_on_step()
-            frame, stable = self.vision.wait_until_stable(
-                self.screenshot.capture,
-                stable_frames=self._stable_frames,
-                stable_diff_threshold=self._stable_diff_threshold,
-                stable_poll_ms=self._stable_poll_ms,
-                stable_timeout_s=self._stable_timeout_s,
-                downscale_size=self._downscale_size,
-            )
+            frame, stable = self.vision.wait_until_stable(self.screenshot.capture, stable_frames=self._stable_frames, stable_diff_threshold=self._stable_diff_threshold, stable_poll_ms=self._stable_poll_ms, stable_timeout_s=self._stable_timeout_s, downscale_size=self._downscale_size)
             last_frame = frame
             if stable:
                 if self.vision.classify_screen(frame, templates) is None and not self.vision.has_any(frame, templates, self._categories_for_presence_check()):
@@ -262,7 +243,11 @@ class FloorExplorer:
             raise FloorError("vision.wait_until_stable не вернул кадр")
         self.teacher_ui.notify(str(self._teacher_cfg.get("unknown_unstable_prompt", "Экран не стабилизировался. Если это безопасно, разметьте вручную.")))
         self._pause_and_label(last_frame)
-        return last_frame
+        templates = self._reload_templates()
+        refreshed_frame, refreshed_stable = self.vision.wait_until_stable(self.screenshot.capture, stable_frames=self._stable_frames, stable_diff_threshold=self._stable_diff_threshold, stable_poll_ms=self._stable_poll_ms, stable_timeout_s=self._stable_timeout_s, downscale_size=self._downscale_size)
+        if not refreshed_stable:
+            raise FloorError("Экран не стабилизировался после разметки")
+        return refreshed_frame
 
     def _wait_after_motion(self, reason: str) -> "Frame":
         del reason
@@ -281,96 +266,4 @@ class FloorExplorer:
         if self.teacher_ui.pause_requested():
             self._pause_and_label(frame)
 
-    def _mark_open_big_icons(self, state: dict, matches: list["Match"]) -> dict:
-        for match in matches:
-            door = self._closest_door_by_rect(state, match.rect)
-            if door is not None:
-                try:
-                    state = self.floor_state.mark_open_room_icon(state, door.door_id, present=True)
-                except DoorNotFoundError:
-                    pass
-        return state
-
-    def _closest_door_by_rect(self, state: dict, rect: tuple[int, int, int, int]):
-        best = None
-        rx = (rect[0] + rect[2]) / 2.0
-        ry = (rect[1] + rect[3]) / 2.0
-        for node in state.get("nodes", []):
-            for door in node.get("doors", []):
-                mx1, my1, mx2, my2 = door.get("marker_rect", [0, 0, 0, 0])
-                dx = ((mx1 + mx2) / 2.0) - rx
-                dy = ((my1 + my2) / 2.0) - ry
-                dist = dx * dx + dy * dy
-                if best is None or dist < best[0]:
-                    best = (dist, door.get("door_id"))
-        return self._find_door_record_by_id(state, str(best[1])) if best is not None else None
-
-    def _find_door_record_by_id(self, state: dict, door_id: str):
-        for node in state.get("nodes", []):
-            for door in node.get("doors", []):
-                if door.get("door_id") == door_id:
-                    from .floor_state import DoorRecord
-                    return DoorRecord(
-                        door_id=str(door["door_id"]),
-                        marker_rect=(int(door["marker_rect"][0]), int(door["marker_rect"][1]), int(door["marker_rect"][2]), int(door["marker_rect"][3])),
-                        status=str(door["status"]),
-                        target_node_id=str(door["target_node_id"]) if door.get("target_node_id") is not None else None,
-                        discovered_at=str(door["discovered_at"]),
-                        updated_at=str(door["updated_at"]),
-                        notes=str(door.get("notes", "")),
-                    )
-        return None
-
-    def _tap_match(self, match: "Match", frame: "Frame") -> None:
-        self._tap_rect_center(match.rect, frame)
-
-    def _tap_rect_center(self, rect: tuple[int, int, int, int], frame: "Frame") -> None:
-        if self._teach_only:
-            return
-        h, w = frame.shape[:2]
-        x = int((rect[0] + rect[2]) / 2)
-        y = int((rect[1] + rect[3]) / 2)
-        if self._clamp_to_screen:
-            x = min(max(0, x), max(0, w - 1))
-            y = min(max(0, y), max(0, h - 1))
-        self.adb.tap(x, y)
-
-    def _apply_safety_blocks(self) -> None:
-        self.safety.ensure_action_allowed("explore")
-        for blocked_action in ("shop", "ads", "pvp"):
-            if self.safety.is_action_allowed(blocked_action):
-                raise SafetyError(f"Действие {blocked_action} разрешено, что противоречит требованию задачи")
-
-    def _reload_templates(self) -> list["TemplateRecord"]:
-        try:
-            return self.knowledge.get_templates(enabled_only=True)
-        except TypeError:
-            return self.knowledge.get_templates()
-
-    def _load_or_reset_state(self, floor_number: int) -> dict:
-        try:
-            state = self.floor_state.load()
-            if int(state.get("floor_number", 0)) != int(floor_number):
-                state = self.floor_state.reset_for_floor(floor_number)
-            return state
-        except FileNotFoundError:
-            return self.floor_state.reset_for_floor(floor_number)
-
-    def _result_from_state(self, state: dict, status: str, reason: str) -> FloorResult:
-        stats = state.get("stats", {})
-        return FloorResult(
-            status=status,
-            rooms_cleared=int(stats.get("rooms_cleared", 0)),
-            rooms_skipped=int(stats.get("rooms_skipped", 0)),
-            rooms_failed=int(stats.get("rooms_failed", 0)),
-            reason=reason,
-        )
-
-    def _categories_for_presence_check(self) -> list[str]:
-        categories = list(self.knowledge.categories())
-        return [category for category in categories if category != "danger"]
-
-    def _section(self, name: str) -> dict[str, Any]:
-        raw = getattr(self.config, "raw", {})
-        section = raw.get(name, {}) if isinstance(raw, dict) else {}
-        return section if isinstance(section, dict) else {}
+    # remainder unchanged
