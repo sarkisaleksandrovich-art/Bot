@@ -419,17 +419,42 @@ class SettingsTab(ttk.Frame):
         self.frame_interval_var = tk.StringVar(value=str(settings.get("frame_interval_ms", DEFAULT_SETTINGS["frame_interval_ms"])))
 
     def _build_ui(self) -> None:
-        ttk.Label(self, text="Настройки", font=("TkDefaultFont", 14, "bold")).pack(anchor="w")
+        # Прокручиваемый контейнер: Canvas + вертикальный ползунок,
+        # чтобы вкладка "Настройки" помещалась на небольших экранах.
+        canvas = tk.Canvas(self, highlightthickness=0)
+        vscroll = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+        vscroll.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        inner = ttk.Frame(canvas)
+        canvas.create_window((0, 0), window=inner, anchor="nw", tags="inner")
+
+        def _on_inner_configure(_event=None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event) -> None:
+            canvas.itemconfigure("inner", width=event.width)
+
+        def _on_mousewheel(event) -> None:
+            canvas.yview_scroll(-1 * (event.delta // 120), "units")
+
+        inner.bind("<Configure>", _on_inner_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+
+        ttk.Label(inner, text="Настройки", font=("TkDefaultFont", 14, "bold")).pack(anchor="w")
         ttk.Label(
-            self,
+            inner,
             text="Эта вкладка нужна для однократной настройки. Здесь вы привязываете скриншоты кнопок и задаёте понятные числовые параметры. Сам фарм при открытии вкладки не запускается.",
             wraplength=1080,
             justify=tk.LEFT,
         ).pack(anchor="w", pady=(4, 8))
-        ttk.Label(self, textvariable=self.busy_var, foreground="blue").pack(anchor="w", pady=(0, 6))
+        ttk.Label(inner, textvariable=self.busy_var, foreground="blue").pack(anchor="w", pady=(0, 6))
 
-        top = ttk.Frame(self)
-        top.pack(fill="both", expand=True)
+        top = ttk.Frame(inner)
+        top.pack(fill="x", expand=False)
 
         nav_box = ttk.LabelFrame(top, text="Навигация", padding=10)
         nav_box.pack(fill="x", expand=False)
@@ -440,7 +465,7 @@ class SettingsTab(ttk.Frame):
             training_box.pack(fill="x", pady=(10, 0))
             self._build_training_block(training_box)
 
-        console_box = ttk.LabelFrame(self, text="Консоль", padding=8)
+        console_box = ttk.LabelFrame(inner, text="Консоль", padding=8)
         console_box.pack(fill="both", expand=True, pady=(10, 0))
         self._build_console(console_box)
 
@@ -460,10 +485,16 @@ class SettingsTab(ttk.Frame):
 
         base_row = 4 + LOCATION_SLOTS
         self._capture_row(parent, "Кнопка Фарм текущего этажа", "farm_floor_button", "Откройте экран нужного этажа и выделите кнопку, которая запускает фарм текущего этажа.", base_row)
-        self._capture_row(parent, "Кнопка Запуск данжа", "enter_dungeon", "Выделите кнопку запуска данжа после выбора этажа.", base_row + 1)
-        self._capture_row(parent, "Шаблон включённого автобоя", "autobattle_on", "Когда автобой уже включён, выделите его заметный участок, чтобы бот понимал, что режим активен.", base_row + 2)
 
-        joy_row = base_row + 3
+        start_row = base_row + 1
+        ttk.Label(parent, text="Кнопка старт").grid(row=start_row, column=0, sticky="w", padx=(0, 6), pady=2)
+        ttk.Button(parent, text="Сделать скриншот", command=self._screenshot_button_clicked).grid(row=start_row, column=1, sticky="w", padx=(0, 6), pady=2)
+        ttk.Label(parent, text="Снимает весь экран устройства через ADB и сохраняет PNG в папку logs/, путь появится в консоли.", wraplength=650, justify=tk.LEFT).grid(row=start_row, column=3, columnspan=2, sticky="w", pady=2)
+
+        self._capture_row(parent, "Кнопка Запуск данжа", "enter_dungeon", "Выделите кнопку запуска данжа после выбора этажа.", base_row + 2)
+        self._capture_row(parent, "Шаблон включённого автобоя", "autobattle_on", "Когда автобой уже включён, выделите его заметный участок, чтобы бот понимал, что режим активен.", base_row + 3)
+
+        joy_row = base_row + 4
         joy_frame = ttk.LabelFrame(parent, text="Края джойстика", padding=8)
         joy_frame.grid(row=joy_row, column=0, columnspan=5, sticky="we", pady=(8, 0))
         ttk.Label(joy_frame, text="Нужно указать две точки: левый и правый край джойстика. Это не прямоугольник, а просто координаты точек на экране.", wraplength=950, justify=tk.LEFT).grid(row=0, column=0, columnspan=10, sticky="w", pady=(0, 6))
@@ -957,6 +988,31 @@ class SettingsTab(ttk.Frame):
             return
         for line in list(self._tail_buffer)[-count:]:
             self._console_queue.put(("log", line))
+
+    def _screenshot_button_clicked(self) -> None:
+        if getattr(self.app, "current_process", None) is not None:
+            self._console_queue.put(("log", "Сейчас бот уже запущен. Скриншот заблокирован, чтобы не мешать работе."))
+            return
+        self._console_queue.put(("log", "Скриншот устройства через ADB, подождите..."))
+
+        def run() -> None:
+            try:
+                import nav
+            except Exception as exc:
+                self._console_queue.put(("log", str(exc)))
+                return
+            func = getattr(nav, "take_screenshot", None)
+            if func is None:
+                self._console_queue.put(("log", "В nav.py нет функции take_screenshot."))
+                return
+            try:
+                result = func(getattr(self.app, "project_dir", "."))
+                path = result[0] if isinstance(result, tuple) else result
+                self._console_queue.put(("log", f"Скриншот сохранён: {path}"))
+            except Exception as exc:
+                self._console_queue.put(("log", f"Скриншот не удался: {exc}"))
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _cmd_screenshot(self, args: list[str]) -> None:
         del args
