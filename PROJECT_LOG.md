@@ -84,3 +84,34 @@
 - Продолжать короткими циклами по `5-7` задач с лимитом запуска `1200` секунд.
 - Сначала собирать логи реального запуска: `logs/bot_live.log`, трейсбеки; потом делать правки.
 - Следующие шаги: `main.py --check`, `verify_chain`, проверка `hold` и `release` на устройстве, подбор порога, тест сохранения памяти.
+
+### Запуск 2026-11-04
+
+#### Что сделано в сессии
+- Аудит по находкам (Этап 1, только чтение): `gui_farm.py` (score — исправлено ранее, показывает score в диалоге), `selected_floor` (GUI не пишет), `--navigate` (формат имени совпадает), остановка (в `bot/floor.py`/`bot/explorer.py` нет `stop_event`), `gui_memory.py` (PNG без отката), блокировки Tk (намеренные модалки), кнопка «Список профилей» (заглушка), новый код боя, устаревший `HANDOFF.md`.
+- `gui_memory.py::delete_one_feature`: изменён порядок — сначала `_atomic_write_json` + `_validate_json`, затем `png.unlink()`; при сбое записи JSON откатывается из `.bak`, PNG не трогается; при сбое unlink после успешной записи — предупреждение в лог, без отката.
+- `gui.py::BOT_ACTIONS`: убран пункт («Список профилей», `--list-profiles`) — кнопка была заглушкой и не запускала процесс; команда в `main.py` оставлена.
+- `HANDOFF.md`: обновлён контракт `nav.json` (`confirm_start`, `inside_dungeon`, семантика `autobattle_on`/`autobattle_active`, `selected_floor`), список функций `nav.py` (`_battle_state`, `wait_battle_end`, `_wait_and_click_confirm_start`, `_run_known_objects`, `_go_path`, `_go_home`), константы боя, актуальные SHA, риски (убраны исправленные score и `--navigate`).
+- Старые записи журнала не тронуты.
+
+#### Коммиты и файлы
+- Коммиты сессии (ветка `feature/new-branch`): `33a38f6`, `01b06c8`, `a711b5e`, `3c72a05` — отправлены на GitHub.
+- Изменённые файлы в этой записи: `gui_memory.py`, `gui.py`, `HANDOFF.md`, `PROJECT_LOG.md`.
+- `nav.py` в этой записи не менялся (логика боя заморожена до отдельного решения).
+
+#### Что исправлено в этом запуске
+- Устранён возможный висячий PNG при сбое записи `features.json` (порядок: JSON → PNG).
+- Убрана неработающая кнопка «Список профилей» из вкладки «Бот».
+- Документация (`HANDOFF.md`, `PROJECT_LOG.md`) приведена к актуальному коду.
+
+#### Ключевые факты о бое (из кода, для продолжения)
+- `nav.py`: `_battle_state` — `"off"` (найден `autobattle_on`: бой идёт, нажать) / `"on"` (найден `autobattle_active`: бой идёт, не нажимать) / `"none"`; приоритет у `"off"`.
+- `wait_battle_end`: лимит `DEFAULT_BATTLE_TIMEOUT_S = 120.0`; серия `"none"` дольше `DEFAULT_STABLE_TIMEOUT_S = 3.0` → `battle finished`.
+- `attack_mob`: `approach_target` → ожидание входа в бой (`approach_timeout_s`) → включение автобоя по найденным координатам → `wait_battle_end`; слепых тапов нет.
+
+#### Открытые задачи и риски
+- Возможное ложное `battle finished` при пропаже кнопок автобоя на анимациях дольше 3 c — проверить на LDPlayer по логам.
+- В `bot/floor.py` и `bot/explorer.py` нет `stop_event` — остановка фарма только через terminate процесса; разобрать отдельно.
+- `selected_floor` не пишется GUI (приоритет: `--floor` → `selected_floor` → 1).
+- Перенести разметку из `data/profiles/knowledge/` в `loc1` (разметка велась с выбранным профилем knowledge).
+- `data/base/nav.json`, шаблоны и `icon.ico` — вне git; синхронизация на другие машины вручную.

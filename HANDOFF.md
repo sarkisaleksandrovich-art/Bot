@@ -4,7 +4,7 @@
 
 ## Файлы
 - `main.py` — CLI, флаги `--check`, `--capture`, `--teach`, `--teach-only`, `--list-profiles`, `--reset-knowledge`, `--gui`, `--navigate`, `--location`, `--floor`, `--profile`, `--floor-from`, `--floor-to`.
-- `nav.py` — `nav_status`, `go_to_dungeon`, `verify_chain`, `take_screenshot`, `find_template`, `hold`, `release`, `approach_target`, `click_loot`, `attack_mob`, `handle_event`, `start_battle`, `find_known_objects`, `annotate_known`, `match_known`, `memory_summary`.
+- `nav.py` — `nav_status`, `go_to_dungeon`, `verify_chain`, `take_screenshot`, `find_template`, `hold`, `release`, `approach_target`, `click_loot`, `attack_mob`, `handle_event`, `start_battle`, `find_known_objects`, `annotate_known`, `match_known`, `memory_summary`, `wait_battle_end`, `_battle_state`, `_wait_and_click_confirm_start`, `_run_known_objects`, `_go_path`, `_go_home`.
 - `gui.py` — главное окно, вкладки `Управление`, `Настройки`, `Память`, `Бот`.
 - `gui_base.py` — `SettingsTab`, захват области, консоль, ползунок.
 - `gui_farm.py` — `ControlTab`, alias `FarmTab`, горячие клавиши `Num1` старт, `Num2` стоп, `Num3` событие, `Num0` полная остановка.
@@ -19,9 +19,14 @@
 - `locations` — элементы с `slot`, `name`, `png`
 - `farm_floor_button`
 - `enter_dungeon`
-- `autobattle_on`
+- `confirm_start` — кнопка подтверждения старта данжа (после «Войти в данж»)
+- `inside_dungeon` — якорь «бот уже внутри локации» (опциональный; пропускает возврат на базу)
+- `autobattle_on` — кнопка ВЫКЛЮЧЕННОГО автобоя; найдена — бот в бою и нажимает её
+- `autobattle_active` — кнопка ВКЛЮЧЁННОГО автобоя; найдена — бот в бою и ничего не нажимает
+- `selected_floor` — опциональный; GUI его не пишет; приоритет: `--floor`, затем `selected_floor`, затем 1
 - `joystick` — вложенные `left` и `right` с `x` и `y`
 - `settings` — `click_radius_px`, `approach_timeout_s`, `hold_chunk_ms`, `frame_interval_ms`, `match_threshold`
+- Видна любая из кнопок `autobattle_on`/`autobattle_active` — бой идёт. Вне боя они не видны.
 
 ## Контракт `data/base/actions.json`
 Объект с ключом `objects`, элементы содержат:
@@ -37,14 +42,18 @@
 - Ползунок `1-10` соответствует значениям: `0.05`, `0.15`, `0.26`, `0.36`, `0.47`, `0.57`, `0.68`, `0.78`, `0.89`, `0.99`.
 - Команды консоли: `set match_level` и `set match_threshold`.
 
+## Константы боя (`nav.py`)
+- `DEFAULT_BATTLE_TIMEOUT_S = 120.0` — общий лимит боя в `wait_battle_end`.
+- `DEFAULT_STABLE_TIMEOUT_S = 3.0` — пауза «кнопок автобоя не видно», после которой бой считается оконченным.
+- Таймаут входа в бой после подхода — `settings.approach_timeout_s`.
+
 ## Последние SHA коммитов
-Из задания и прошлых отчётов:
-- `nav.py` — `02ed95595d0e3c3346aed16668996b93cb81537a`
-- `gui_base.py` — `d843135e2753cb2804de4ec38eb2593f0d6dfff4`
-- `gui_farm.py` — `8be858936baed96a20e5547d8d71deb4e7ad5d31`
-- `main.py` — `ff43ea8f7019152d4b3217d06c9d53fb6d677acd`
-- `nav.py` — `d8757c2f26e68fb18bccd51a9be66138c94e2358`
-- `gui_farm.py` — `e934e8ece1a69f8a9a5eec2008c77f87f0914bef`
+- `3c72a05` — бой по кнопкам автобоя (`_battle_state`/`wait_battle_end`/`attack_mob` без слепых тапов), ключ `autobattle_active`, `confirm_start`/`inside_dungeon`, кнопка «Локация»
+- `a711b5e` — FIX-D регрессия (профиль резолвится во всех режимах кроме --navigate/--gui/--list-profiles)
+- `01b06c8` — FIX A-G
+- `33a38f6` — GUI: ползунок прокрутки и кнопка скриншота ADB
+- `9e33c08` — docs: project log 2026-11-02
+- `5d53415` — docs: HANDOFF 2026-11-02
 
 ## Что исправлено в этом запуске
 - Создана новая версия `HANDOFF.md` в корне репозитория.
@@ -67,9 +76,15 @@
 - `tkinter` `Toplevel` и `wait_window` на Windows — не проверено запуском.
 - Глобальные клавиши `pynput` — не проверено запуском.
 - Кодировка Windows — не проверено запуском.
-- В `gui_farm` show score не отображается, потому что `nav.match_known` возвращает только строку действия — не проверено запуском.
-- `main.py --navigate` принимает `location` строкой вместо `loc1..loc7`, а GUI передаёт имя локации — не проверено запуском.
-- `nav.py` читает `selected_floor` из `nav.json`, а GUI его не пишет — не проверено запуском.
+- Возможное ложное `battle finished` в `nav.wait_battle_end`, если кнопки автобоя пропадают с экрана на анимациях дольше `DEFAULT_STABLE_TIMEOUT_S` (3 c) — не проверено запуском.
+- В `bot/floor.py` и `bot/explorer.py` нет `stop_event`: остановка фарма только через terminate процесса из GUI или Space в OpenCV-окне разметки — не проверено запуском.
+- `nav.py` читает `selected_floor` из `nav.json`, а GUI его не пишет (приоритет: `--floor` → `selected_floor` → 1) — не проверено запуском.
+- `motionevent` на Android 9 и fallback через `swipe` — не проверено запуском.
+- `approach_target`: проскок, упор в край — не проверено запуском.
+- Подбор порога — не проверено запуском.
+- `tkinter` `Toplevel` и `wait_window` на Windows — не проверено запуском.
+- Глобальные клавиши `pynput` — не проверено запуском.
+- Кодировка Windows — не проверено запуском.
 
 ## Как продолжать
 - Работать короткими циклами по `5-7` задач, лимит запуска `1200` секунд.

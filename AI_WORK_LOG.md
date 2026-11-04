@@ -1,4 +1,5 @@
 # Лог работы ИИ-ассистента над проектом Bot
+<!-- Дополнение 2026-11-04 (после коммита 3c72a05) — см. раздел 15 в конце файла -->
 
 Репозиторий: `https://github.com/sarkisaleksandrovich-art/Bot`, ветка `feature/new-branch`.
 Все даты — 2026-11-03/04. Все правки минимальные, формат кода и кириллические строки сохранены.
@@ -75,8 +76,39 @@
 ## НЕ закоммичено (актуально на момент записи лога)
 `nav.py` (confirm_start/inside_dungeon), `gui_base.py` (строки confirm_start/inside_dungeon, кнопка старт), `gui_farm.py` (кнопка «Локация», CREATE_NO_WINDOW, фоновая проверка готовности), `gui.py` (иконка), `bot/explorer.py` (не сдаётся), `bot/adb_controller.py` (CREATE_NO_WINDOW), `gui_memory.py` (фикс списка профилей), `start_gui.bat` (pyw), `data/base/nav.json` (confirm_start/inside_dungeon), `icon.ico`.
 
-## Незакрытые вопросы
-1. Перенести разметку из `data/profiles/knowledge/` в `loc1/` (пользователь размечал с выбранным knowledge).
-2. Проверить фарм «Старт» внутри локации после выбора loc1.
-3. При остановках FloorExplorer (лимиты комнат) — применить тот же принцип «спрашивать, а не сдаваться».
-4. git push накопленных изменений (п. «НЕ закоммичено»).
+## Незакрытые вопросы (статус на 2026-11-04)
+1. Перенести разметку из `data/profiles/knowledge/` в `loc1/` — ОТКРЫТО.
+2. Проверить фарм «Старт» внутри локации после выбора loc1 — ОТКРЫТО.
+3. При остановках FloorExplorer (лимиты комнат) — применить принцип «спрашивать, а не сдаваться» — ОТКРЫТО (floor.py/explorer.py вне правок).
+4. git push накопленных изменений — ЗАКРЫТО коммитом `3c72a05`.
+
+## 15. Дополнение 2026-11-04 (после коммита `3c72a05`)
+
+### Аудит по находкам (Этап 1, только чтение) — вердикты
+| Находка | Вердикт |
+|---|---|
+| `gui_farm.py`: score не показывается | НЕ ВОСПРОИЗВОДИТСЯ — `_match_known_action` парсит score из `match_known` (строки 419–422) и показывает в диалоге `_ask_known_match` |
+| `selected_floor` читается nav.py, GUI не пишет | ПОДТВЕРЖДЕНО (низкая) — nav.py:865–868, дефолт 1 |
+| `--navigate`/`--location` формат | НЕ ВОСПРОИЗВОДИТСЯ — `_nav_chain_templates` ищет по `name` регистронезависимо, GUI передаёт то же имя |
+| `bot/floor.py`/`bot/explorer.py` без `stop_event` | ПОДТВЕРЖДЕНО (средняя) — остановка только terminate процесса или Space в OpenCV-окне |
+| `gui_memory.py`: PNG без отката при сбое записи | ПОДТВЕРЖДЕНО (средне-низкая) |
+| `gui_base.py`: блокировки Tk | НЕ ВОСПРОИЗВОДИТСЯ — тяжёлое в фоне; блокируют только намеренные модалки `capture_region` |
+| Кнопка «Список профилей» в GUI | ПОДТВЕРЖДЕНО (низкая) — заглушка в `run_main` |
+| Новый код боя: ложное `battle finished` | ПОДТВЕРЖДЕНО (средняя) — серия "none" > 3 c трактуется как конец боя |
+| HANDOFF.md устарел | ПОДТВЕРЖДЕНО |
+
+### Этап 2 — правки (по одному файлу, py_compile после каждого)
+1. **`gui_memory.py::delete_one_feature`**: порядок изменён — сначала `_atomic_write_json` + `_validate_json`, затем `png.unlink()`; сбой записи → откат JSON из `.bak` без удаления PNG; сбой unlink после успешной записи → предупреждение `logging` без отката. Добавлен `import logging`.
+2. **`gui.py::BOT_ACTIONS`**: убрана заглушка («Список профилей», `--list-profiles`); команда в `main.py` сохранена.
+3. **`HANDOFF.md`**: контракт nav.json (+`confirm_start`, `inside_dungeon`, семантика `autobattle_on`/`autobattle_active`, `selected_floor`), функции nav.py (+`wait_battle_end`, `_battle_state`, `_wait_and_click_confirm_start`, `_run_known_objects`, `_go_path`, `_go_home`), константы боя, актуальные SHA (`3c72a05`, `a711b5e`, `01b06c8`, `33a38f6`), риски обновлены (убраны исправленные score и `--navigate`).
+4. **`PROJECT_LOG.md`**: запись «Запуск 2026-11-04»; старые записи не тронуты.
+
+### Проверки Этапа 2
+- `py -m py_compile gui_memory.py gui.py` — OK.
+- `py main.py --check` — шаги 1–6 OK; упал только на `ADB: no adb devices found` (эмулятор выключен — окружение, не код).
+- `git diff --stat`: `HANDOFF.md 39`, `PROJECT_LOG.md 31`, `gui.py 1`, `gui_memory.py 11` (не закоммичено на момент записи).
+
+### Состояние git на момент дополнения
+- Отправлено: `33a38f6`, `01b06c8`, `a711b5e`, `3c72a05` (ветка `feature/new-branch`).
+- Локально не закоммичено: `gui_memory.py`, `gui.py`, `HANDOFF.md`, `PROJECT_LOG.md` (Этап 2 аудита).
+- Вне git: `data/` (nav.json + шаблоны), `icon.ico`.

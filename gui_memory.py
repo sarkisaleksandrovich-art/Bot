@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -184,7 +185,7 @@ def delete_one_feature(
 
     backup = _backup(path)
     try:
-        png.unlink()
+        # Сначала атомарно обновляем JSON: так при сбое записи PNG остаётся на месте.
         _atomic_write_json(path, updated)
         _validate_json(path)
     except Exception:
@@ -195,6 +196,14 @@ def delete_one_feature(
         except Exception as restore_error:
             raise RuntimeError(f"Deletion failed and JSON rollback failed: {restore_error}") from restore_error
         raise
+    try:
+        png.unlink()
+    except Exception as unlink_error:
+        # JSON уже успешно обновлён (запись удалена) — откат не нужен и вреден.
+        # Остался висячий PNG-файл: только предупреждение.
+        logging.getLogger(__name__).warning(
+            "Deletion succeeded in JSON but PNG removal failed: %s (%s)", png, unlink_error
+        )
 
 
 class MemoryTab(ttk.Frame):

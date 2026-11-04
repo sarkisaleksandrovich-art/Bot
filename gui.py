@@ -15,7 +15,6 @@ BOT_ACTIONS: tuple[tuple[str, str, bool], ...] = (
     ("Скриншот", "--capture", True),
     ("Обучение", "--teach", True),
     ("Обучение без кликов", "--teach-only", True),
-    ("Список профилей", "--list-profiles", False),
     ("Сброс памяти", "--reset-knowledge", True),
 )
 
