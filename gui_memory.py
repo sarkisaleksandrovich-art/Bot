@@ -120,11 +120,20 @@ def _record_label(record: dict[str, Any]) -> str:
     return feature_id
 
 
+_RESERVED_PROFILE_DIRS = {"base", "knowledge", "common"}
+
+
 def list_profiles(data_root: Path | str = DEFAULT_DATA_ROOT) -> list[str]:
     root = _profiles_root(data_root)
     if not root.exists():
         return []
-    return sorted(item.name for item in root.iterdir() if item.is_dir() and item.name != "base")
+    # knowledge/ и common/ — служебные каталоги памяти, а не профили:
+    # ProfileManager принимает только профили из config.yaml (loc1..loc7).
+    return sorted(
+        item.name
+        for item in root.iterdir()
+        if item.is_dir() and item.name not in _RESERVED_PROFILE_DIRS
+    )
 
 
 def list_feature_ids(

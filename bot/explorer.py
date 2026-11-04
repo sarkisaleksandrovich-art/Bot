@@ -345,12 +345,15 @@ class DungeonExplorer:
             self._unknown_stable_count = 0
             return
 
+        # Бот больше не сдаётся на неизвестных экранах: вместо ошибки всегда
+        # просит пользователя разметить экран с пояснением.
         self._unknown_stable_count += 1
-        if self._unknown_stable_count > self._max_unknown_stable_screens:
-            raise ExplorerError("Слишком много подряд неизвестных стабильных экранов")
-
-        self.teacher_ui.notify(str(self._teacher_cfg.get("unknown_stable_prompt", "Стабильный экран не распознан")))
+        self.teacher_ui.notify(
+            str(self._teacher_cfg.get("unknown_stable_prompt", "Стабильный экран не распознан"))
+            + f" (неизвестных подряд: {self._unknown_stable_count})"
+        )
         self.teacher_ui.show_and_label(frame, self.knowledge)
+        self._unknown_stable_count = 0
 
     def _reload_templates_merged(self) -> list[Any]:
         profile_templates = list(self.knowledge.get_templates(enabled_only=True))

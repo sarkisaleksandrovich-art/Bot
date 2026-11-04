@@ -29,6 +29,8 @@ DEFAULT_FRAME_INTERVAL_MS = 250
 DEFAULT_STABLE_TIMEOUT_S = 3.0
 DEFAULT_FLOOR_NUMBER = 1
 DEFAULT_ANIMATION_DIFF_THRESHOLD = 0.002
+# ЭТАП 2B: общий лимит боя (зеркало timeouts.battle_finish_timeout_s из config.yaml проекта)
+DEFAULT_BATTLE_TIMEOUT_S = 120.0
 
 ACTION_KIND_LABELS = {
     "loot": "Лут",
@@ -527,14 +529,101 @@ def click_loot(project_dir: str | Path, template: Any, log: Callable[..., Any] =
     return clicked, ("loot clicked" if clicked else "loot target missing after approach")
 
 
+def _battle_state(project_dir: str | Path, frame: Any, log: Callable[..., Any]) -> str:
+    """ЭТАП 2B: состояние боя по кадру.
+    "off" — найден autobattle_on (бой идёт, автобой выключен — нажать);
+    "on" — найден autobattle_active (бой идёт, автобой включён — ничего не нажимать);
+    "none" — кнопок не видно (вне боя). Приоритет у "off"."""
+    nav, _ = _read_nav(project_dir)
+    off_png = _resolve_path(project_dir, _extract_png(nav.get("autobattle_on")))
+    if off_png is not None:
+        found, _x, _y, _dx, score = find_template(project_dir, str(off_png), frame=frame)
+        if found:
+            _log(log, f"battle state=off (autobattle_on score={score:.3f})")
+            return "off"
+    on_png = _resolve_path(project_dir, _extract_png(nav.get("autobattle_active")))
+    if on_png is not None:
+        found, _x, _y, _dx, score = find_template(project_dir, str(on_png), frame=frame)
+        if found:
+            _log(log, f"battle state=on (autobattle_active score={score:.3f})")
+            return "on"
+    _log(log, "battle state=none (autobattle buttons not visible)")
+    return "none"
+
+
+def wait_battle_end(project_dir: str | Path, log: Callable[..., Any] = print, stop_event: Any = None) -> tuple[bool, str]:
+    """ЭТАП 2B: ждём окончания боя по кнопкам автобоя.
+    "off" — нажимаем autobattle_on по найденным координатам;
+    "on" — бой идёт, ничего не нажимаем;
+    серия "none" дольше DEFAULT_STABLE_TIMEOUT_S — бой окончен.
+    Общий лимит боя — DEFAULT_BATTLE_TIMEOUT_S."""
+    runtime = _build_runtime(project_dir, log=log)
+    settings = _settings(project_dir, log=log)
+    poll_s = max(0.05, int(settings["frame_interval_ms"]) / 1000.0)
+    none_limit_s = DEFAULT_STABLE_TIMEOUT_S
+    deadline = time.monotonic() + DEFAULT_BATTLE_TIMEOUT_S
+    none_started: Optional[float] = None
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            return False, "stopped"
+        if time.monotonic() >= deadline:
+            _log(log, f"battle timeout battle_timeout_s={DEFAULT_BATTLE_TIMEOUT_S}")
+            return False, "battle timeout"
+        frame = runtime.screenshot.capture()
+        state = _battle_state(project_dir, frame, log)
+        now = time.monotonic()
+        if state == "off":
+            nav, _ = _read_nav(project_dir)
+            off_png = _resolve_path(project_dir, _extract_png(nav.get("autobattle_on")))
+            if off_png is not None:
+                match = find_template(project_dir, str(off_png), frame=frame)
+                _click_center(runtime, match, log)
+            time.sleep(0.5)
+            none_started = None
+            continue
+        if state == "on":
+            none_started = None
+            time.sleep(poll_s)
+            continue
+        if none_started is None:
+            none_started = now
+            _log(log, "battle state=none; waiting to confirm battle end")
+        elif now - none_started >= none_limit_s:
+            _log(log, f"battle finished: no autobattle buttons for {none_limit_s:.1f}s")
+            return True, "battle finished"
+        time.sleep(poll_s)
+
+
 def attack_mob(project_dir: str | Path, template: Any, log: Callable[..., Any] = print, stop_event: Any = None) -> tuple[bool, str]:
+    """ЭТАП 2B: бой начинается от контакта персонажей с мобом, а не от тапа.
+    Подходим вплотную (approach_target), затем ждём вход в бой по кнопкам автобоя,
+    включаем автобой по найденным координатам и дожидаемся конца боя."""
     runtime = _build_runtime(project_dir, log=log)
     ok, reason = approach_target(project_dir, template, log=log, stop_event=stop_event)
     if not ok:
         return False, reason
-    frame = runtime.screenshot.capture()
-    clicked = _click_center(runtime, find_template(project_dir, template, frame=frame), log)
-    return clicked, ("mob attacked" if clicked else "mob target missing after approach")
+    settings = _settings(project_dir, log=log)
+    poll_s = max(0.05, int(settings["frame_interval_ms"]) / 1000.0)
+    deadline = time.monotonic() + float(settings["approach_timeout_s"])
+    while time.monotonic() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            return False, "stopped"
+        frame = runtime.screenshot.capture()
+        state = _battle_state(project_dir, frame, log)
+        if state == "off":
+            nav, _ = _read_nav(project_dir)
+            off_png = _resolve_path(project_dir, _extract_png(nav.get("autobattle_on")))
+            if off_png is not None:
+                match = find_template(project_dir, str(off_png), frame=frame)
+                _click_center(runtime, match, log)
+            return wait_battle_end(project_dir, log=log, stop_event=stop_event)
+        if state == "on":
+            _log(log, "battle already running (autobattle_active visible)")
+            return wait_battle_end(project_dir, log=log, stop_event=stop_event)
+        _log(log, "battle not started yet; waiting for aggro")
+        time.sleep(poll_s)
+    _log(log, "battle not started within approach_timeout_s")
+    return False, "battle not started"
 
 
 def handle_event(project_dir: str | Path, template: Any, log: Callable[..., Any] = print, stop_event: Any = None) -> tuple[bool, str]:
@@ -547,10 +636,44 @@ def handle_event(project_dir: str | Path, template: Any, log: Callable[..., Any]
     return clicked, ("event opened" if clicked else "event target missing after approach")
 
 
+def _wait_and_click_confirm_start(project_dir: str | Path, runtime: NavigationRuntime, log: Callable[..., Any], stop_event: Any) -> tuple[bool, str]:
+    """ШАГ 2: после клика «Войти в данж» ждём кнопку «Подтвердить старт», кликаем по центру
+    и убеждаемся, что экран сменился (кнопка исчезла). Повторный клик по исчезнувшей
+    кнопке не делается. Неуспех — (False, reason)."""
+    nav, _ = _read_nav(project_dir)
+    confirm_png = _resolve_path(project_dir, _extract_png(nav.get("confirm_start")))
+    if confirm_png is None:
+        _log(log, "confirm_start template missing; fallback to time.sleep(1.0)")
+        time.sleep(1.0)
+        return True, "confirm skipped"
+    settings = _settings(project_dir, log=log)
+    timeout_s = float(settings["approach_timeout_s"])
+    started = time.monotonic()
+    while time.monotonic() - started < timeout_s:
+        if stop_event is not None and stop_event.is_set():
+            return False, "stopped"
+        frame = runtime.screenshot.capture()
+        match = find_template(project_dir, str(confirm_png), frame=frame)
+        if not match[0]:
+            _log(log, "confirm_start button not visible; screen already changed")
+            return True, "confirm button absent"
+        clicked = _click_center(runtime, match, log)
+        if not clicked:
+            return False, "failed to click confirm_start"
+        time.sleep(0.5)
+        frame = runtime.screenshot.capture()
+        found, _x, _y, _dx, score = find_template(project_dir, str(confirm_png), frame=frame)
+        if not found:
+            _log(log, "confirm_start clicked; screen changed")
+            return True, "confirm clicked"
+        _log(log, f"confirm_start still visible after click score={score:.3f}; retrying")
+    _log(log, f"confirm_start timeout approach_timeout_s={timeout_s}")
+    return False, "confirm_start timeout"
+
+
 def start_battle(project_dir: str | Path, log: Callable[..., Any] = print, stop_event: Any = None) -> tuple[bool, str]:
     runtime = _build_runtime(project_dir, log=log)
     nav, _ = _read_nav(project_dir)
-    autobattle_png = _resolve_path(project_dir, _extract_png(nav.get("autobattle_on")))
     enter_png = _resolve_path(project_dir, _extract_png(nav.get("enter_dungeon")))
     if stop_event is not None and stop_event.is_set():
         return False, "stopped"
@@ -560,19 +683,25 @@ def start_battle(project_dir: str | Path, log: Callable[..., Any] = print, stop_
     started = _click_center(runtime, find_template(project_dir, str(enter_png), frame=frame), log)
     if not started:
         return False, "failed to start battle"
-    time.sleep(1.0)
+    ok, reason = _wait_and_click_confirm_start(project_dir, runtime, log, stop_event)
+    if not ok:
+        return False, reason
     if stop_event is not None and stop_event.is_set():
         return False, "stopped"
-    if autobattle_png is not None:
-        battle_frame = runtime.screenshot.capture()
-        found, x, y, dx, score = find_template(project_dir, str(autobattle_png), frame=battle_frame)
-        _log(log, f"autobattle state found={found} score={score:.3f}")
-        if not found:
-            width, height = _frame_shape(battle_frame)
-            tx, ty = width // 2, height // 2
-            _log(log, f"autobattle is OFF; enabling autobattle via fallback tap x={tx} y={ty}")
-            runtime.adb.tap(int(tx), int(ty))
-            time.sleep(0.5)
+    # ЭТАП 2B: включение автобоя без слепых тапов — только по найденным координатам шаблона
+    battle_frame = runtime.screenshot.capture()
+    state = _battle_state(project_dir, battle_frame, log)
+    if state == "off":
+        nav, _ = _read_nav(project_dir)
+        off_png = _resolve_path(project_dir, _extract_png(nav.get("autobattle_on")))
+        if off_png is not None:
+            match = find_template(project_dir, str(off_png), frame=battle_frame)
+            if _click_center(runtime, match, log):
+                time.sleep(0.5)
+    elif state == "on":
+        _log(log, "autobattle already active; nothing to press")
+    else:
+        _log(log, "autobattle buttons not visible; nothing to press")
     return True, "battle started"
 
 
@@ -609,6 +738,7 @@ def _nav_chain_templates(project_dir: str | Path, location_name: str, floor_numb
         "location_icon": str(_resolve_path(project_dir, (location_item or {}).get("png")) or "") or None,
         "farm_floor_button": str(_resolve_path(project_dir, farm_floor) or "") or None,
         "enter_dungeon": str(_resolve_path(project_dir, _extract_png(nav.get("enter_dungeon"))) or "") or None,
+        "inside_dungeon": str(_resolve_path(project_dir, _extract_png(nav.get("inside_dungeon"))) or "") or None,
     }
 
 
@@ -682,6 +812,7 @@ def nav_status(project_dir: str | Path) -> dict[str, Any]:
             "farm_floor_button": nav.get("farm_floor_button"),
             "enter_dungeon": nav.get("enter_dungeon"),
             "autobattle_on": nav.get("autobattle_on"),
+            "autobattle_active": nav.get("autobattle_active"),
             "joystick": nav.get("joystick"),
             "settings": {
                 "click_radius_px": settings["click_radius_px"],
@@ -738,9 +869,25 @@ def _go_path(project_dir: str | Path, location_name: str, log: Callable[..., Any
             floor_number = DEFAULT_FLOOR_NUMBER
     chain = _nav_chain_templates(project_dir, location_name, floor_number=floor_number)
     for key, value in chain.items():
-        if value is None and key not in {"base", "locations_map"}:
+        if value is None and key not in {"base", "locations_map", "inside_dungeon"}:
             return False, f"template missing: {key}"
     try:
+        # Если бот уже внутри локации (якорь inside_dungeon найден), навигация
+        # с возвратом на базу пропускается — сразу начинаем фарм.
+        inside_tpl = chain.get("inside_dungeon")
+        if inside_tpl and not (stop_event is not None and stop_event.is_set()):
+            frame, _ = _stable_wait(runtime, 4.0, log)
+            found, x, y, dx, score = find_template(project_dir, inside_tpl, frame=frame)
+            _log(log, f"inside_dungeon anchor score={score:.3f} found={found}")
+            if found:
+                _log(log, "уже внутри локации; навигация пропущена")
+                if not launch:
+                    return True, "chain verified (inside dungeon)"
+                frame = runtime.screenshot.capture()
+                ok, reason = _run_known_objects(project_dir, frame, log, stop_event)
+                if not ok:
+                    return False, reason
+                return True, "navigation complete (already inside dungeon)"
         ok, reason = _go_home(project_dir, log, stop_event)
         if not ok:
             return False, reason

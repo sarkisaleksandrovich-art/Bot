@@ -85,10 +85,30 @@ class GuiApp:
         self.project_dir = Path(__file__).resolve().parent
         self.data_root = self.project_dir / "data" / "profiles"
 
+        # Явный AppUserModelID до создания окна: иначе панель задач показывает
+        # иконку pythonw.exe вместо иконки окна
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("LDPlayerBot.GUI.1")
+        except Exception:
+            pass
         self.root = tk.Tk()
         self.root.title("LDPlayer Bot")
         self.root.geometry("1180x780")
         self.root.minsize(980, 680)
+        icon_path = self.project_dir / "icon.ico"
+        if icon_path.exists():
+            try:
+                self.root.iconbitmap(str(icon_path))
+            except Exception:
+                pass
+            # iconphoto дублирует иконку для панели задач (надёжнее при pythonw)
+            try:
+                from PIL import Image, ImageTk
+                self._icon_photo = ImageTk.PhotoImage(Image.open(icon_path))
+                self.root.iconphoto(True, self._icon_photo)
+            except Exception:
+                pass
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.status_var = tk.StringVar(value="Готово")

@@ -214,12 +214,16 @@ class ADBController:
         cmd.extend(args)
 
         try:
+            # Не открывать окно консоли для adb.exe: при запуске GUI через pythonw
+            # каждый вызов adb иначе вспыхивает отдельным окном консоли.
+            no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             return subprocess.run(
                 cmd,
                 capture_output=True,
                 text=text,
                 timeout=self._exec_timeout_s,
                 check=False,
+                creationflags=no_window,
             )
         except subprocess.TimeoutExpired as exc:
             raise ADBTimeoutError(f"adb command timed out: {' '.join(cmd)}") from exc

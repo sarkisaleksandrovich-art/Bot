@@ -48,6 +48,7 @@ class ControlTab(ttk.Frame):
         self.listener_started = False
         self.running = False
         self._stop_snapshot_busy = False
+        self._ready_check_busy = False
         self._manual_dialog_open = False
         self._matched_action: str | None = None
         self._matched_score: float | None = None
@@ -95,6 +96,8 @@ class ControlTab(ttk.Frame):
         self.loot_button.pack(side="left", padx=(8, 0))
         self.mob_button = ttk.Button(actions, text="Моб", command=self.on_mob)
         self.mob_button.pack(side="left", padx=(8, 0))
+        self.location_button = ttk.Button(actions, text="Локация", command=self.on_location_teach)
+        self.location_button.pack(side="left", padx=(8, 0))
 
         ttk.Label(self, textvariable=self.status_var).pack(anchor="w", pady=(0, 8))
 
@@ -106,10 +109,10 @@ class ControlTab(ttk.Frame):
                 bottom,
                 text="Полная остановка (Num0)",
                 command=self.do_full_stop,
-                bg="#b71c1c",
-                fg="white",
-                activebackground="#d32f2f",
-                activeforeground="white",
+                bg="#add8e6",
+                fg="black",
+                activebackground="#87ceeb",
+                activeforeground="black",
                 relief="raised",
                 padx=10,
                 pady=6,
@@ -179,12 +182,29 @@ class ControlTab(ttk.Frame):
         self.refresh_ready_state()
 
     def refresh_ready_state(self) -> None:
-        try:
-            import nav
-            status = nav.nav_status(self.project_dir)
-        except Exception as exc:
+        # Проверка готовности (ADB-скриншот + поиск шаблонов) идёт в фоне,
+        # чтобы окно GUI открывалось мгновенно.
+        if self._ready_check_busy:
+            return
+        self._ready_check_busy = True
+
+        def worker() -> None:
+            try:
+                import nav
+                status = nav.nav_status(self.project_dir)
+                error = None
+            except Exception as exc:
+                status = None
+                error = exc
+            self.after(0, lambda: self._apply_ready_state(status, error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_ready_state(self, status: dict[str, Any] | None, error: Exception | None) -> None:
+        self._ready_check_busy = False
+        if error is not None or status is None:
             self.start_button.configure(state=tk.DISABLED)
-            self.status_var.set(f"Ошибка nav.py: {exc}")
+            self.status_var.set(f"Ошибка nav.py: {error}")
             return
         nav_ok = bool(status.get("ready")) and bool(status.get("nav_json_present")) and int(status.get("locations_count") or 0) > 0
         ready = nav_ok and bool(self.location_var.get().strip())
@@ -239,6 +259,8 @@ class ControlTab(ttk.Frame):
     def _run_main_process(self) -> tuple[int, str]:
         command = [sys.executable, "main.py", "--profile", self._selected_profile()]
         self.log(f"[FARM] {' '.join(command)}")
+        # Не открывать окно консоли для дочернего процесса main.py (актуально при запуске GUI через pythonw)
+        no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         self.main_process = subprocess.Popen(
             command,
             cwd=str(self.project_dir),
@@ -248,6 +270,7 @@ class ControlTab(ttk.Frame):
             text=True,
             encoding="utf-8",
             errors="replace",
+            creationflags=no_window,
         )
         last_line = ""
         assert self.main_process.stdout is not None
@@ -567,6 +590,34 @@ class ControlTab(ttk.Frame):
 
     def on_mob(self) -> None:
         self._manual_target_action("mob")
+
+    def on_location_teach(self) -> None:
+        """Кнопка «Локация»: снимает текущий экран и открывает окно разметки,
+        чтобы обозначить, что это локация, по которой надо ходить. Выделите
+        устойчивый участок локации и нажмите r (экран комнаты)."""
+        self.log("Локация: снимаю экран и открываю окно разметки...")
+
+        def worker() -> None:
+            try:
+                from bot.config import load_config
+                from bot.logging_setup import setup_logging
+                from bot.knowledge import KnowledgeBase
+                from bot.teacher_ui import TeacherUI
+                from gui_base import _make_provider
+                config = load_config("config.yaml")
+                logger = setup_logging(config)
+                provider = _make_provider()
+                frame = provider.capture()
+                knowledge = KnowledgeBase(config, self._selected_profile(), logger)
+                teacher = TeacherUI(config, logger)
+                teacher.notify("Выделите устойчивый участок локации и нажмите r (экран комнаты). Enter/Space — сохранить и выйти.")
+                added = teacher.show_and_label(frame, knowledge)
+                self.log(f"Локация: размечено объектов {len(added)}")
+                teacher.close()
+            except Exception as exc:
+                self.log(f"Локация: ошибка разметки: {exc}")
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def do_event(self) -> None:
         self._manual_target_action("event_choice")
